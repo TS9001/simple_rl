@@ -1,0 +1,54 @@
+# Simple example configurations showing how to use custom optimizers
+
+# Example 1: Register your own optimizer at runtime
+# (See custom_optimizer_example.py)
+
+# Example 2: Use any optimizer from a pip package
+# Install: pip install lion-pytorch
+lion_example:
+  algorithm:
+    name: "supervised_learning"
+    task_type: "regression"
+  
+  training:
+    num_epochs: 30
+    learning_rate: 1e-4
+    
+    optimizer:
+      type: "custom"
+      import_path: "lion_pytorch.Lion"
+      betas: [0.9, 0.99]
+      weight_decay: 0.01
+
+# Example 3: Use Muon optimizer
+# Install: pip install muon
+muon_example:
+  algorithm:
+    name: "supervised_learning"
+    task_type: "classification"
+  
+  training:
+    num_epochs: 50
+    learning_rate: 2e-4
+    
+    optimizer:
+      type: "custom"
+      import_path: "muon.Muon"
+      momentum: 0.95
+      rankfactor: 2048
+
+# Example 4: Use any PyTorch optimizer via import
+pytorch_example:
+  algorithm:
+    name: "supervised_learning"
+    task_type: "regression"
+    
+  training:
+    num_epochs: 40
+    learning_rate: 1e-3
+    
+    optimizer:
+      type: "custom" 
+      import_path: "torch.optim.AdamW"
+      betas: [0.9, 0.999]
+      amsgrad: true

@@ -1,0 +1,77 @@
+# Configuration for model finetuning
+
+# Basic finetuning setup
+basic_finetuning:
+  algorithm:
+    name: "supervised_learning"
+    task_type: "classification"
+  
+  training:
+    num_epochs: 10
+    learning_rate: 2e-5  # Typical for transformer finetuning
+    weight_decay: 0.01
+    
+    optimizer:
+      type: "adamw"
+      betas: [0.9, 0.999]
+      eps: 1e-8
+    
+    scheduler:
+      enabled: true
+      type: "cosine"
+      T_max: 10
+
+  model:
+    hf_model_name: "distilbert-base-uncased"
+    num_classes: 2
+    dropout: 0.1
+
+  logging:
+    log_interval: 10
+    eval_interval: 50
+
+# Overfitting setup for small dataset
+overfitting_setup:
+  algorithm:
+    name: "supervised_learning" 
+    task_type: "classification"
+  
+  training:
+    num_epochs: 20  # More epochs for overfitting
+    learning_rate: 2e-5
+    
+    optimizer:
+      type: "adamw"
+      betas: [0.9, 0.999]
+    
+    # No early stopping - we want to overfit
+    early_stopping:
+      enabled: false
+
+  model:
+    hf_model_name: "distilbert-base-uncased"
+    num_classes: 2
+    dropout: 0.0  # No dropout when overfitting
+
+  logging:
+    log_interval: 5
+    eval_interval: 25
+
+# Frozen backbone finetuning (only train classifier)
+frozen_backbone:
+  algorithm:
+    name: "supervised_learning"
+    task_type: "classification"
+    
+  training:
+    num_epochs: 15
+    learning_rate: 1e-3  # Higher LR for classifier only
+    
+    optimizer:
+      type: "adamw"
+      betas: [0.9, 0.999]
+
+  model:
+    hf_model_name: "distilbert-base-uncased"
+    num_classes: 2
+    freeze_backbone: true  # Custom parameter

@@ -1,0 +1,151 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs and databases
+*.log
+*.sqlite
+*.db
+
+# Model checkpoints and cache
+checkpoints/
+models/
+.cache/
+cache/
+
+# HuggingFace cache
+.cache/huggingface/
+transformers_cache/
+
+# Wandb
+wandb/
+*.wandb
+
+# Data files
+data/
+datasets/
+*.csv
+*.json
+*.pkl
+*.pickle
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Documentation
+docs/_build/
+site/
+
+# Examples and experiments
+examples/outputs/
+examples/checkpoints/
+examples/logs/
+examples/wandb/
+examples/data/
+examples/*.pt
+examples/*.pth
+examples/*.log
+
+# Claude Code specific
+CLAUDE.md
+.claude/
+claude_context.json
+
+# Environment variables
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Local configuration overrides
+config/local/
+local_config.yaml
+local.yaml
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Large files that shouldn't be committed
+*.tar.gz
+*.zip
+*.rar
+*.7z
+
+# Generated reports
+reports/
+*.html
+*.xml
+
+# Profiling
+*.prof
+*.lprof
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
