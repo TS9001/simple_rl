@@ -1,0 +1,43 @@
+# GRPO (Group Relative Policy Optimization) Configuration
+
+algorithm:
+  name: grpo
+  group_size: 8          # Number of completions per prompt for relative reward
+  kl_coef: 0.1          # KL divergence penalty coefficient
+  clip_range: null      # Optional PPO-style clipping (set to 0.2 for clipping)
+  normalize_rewards: true  # Whether to normalize rewards to unit variance
+
+model:
+  type: policy
+  hf_model_name: "gpt2"  # HuggingFace model to use as base
+  max_length: 512       # Maximum sequence length
+  
+training:
+  batch_size: 32        # Total batch size (must be divisible by group_size)
+  learning_rate: 1e-5   # Learning rate for policy model
+  num_episodes: 100     # Number of training episodes
+  temperature: 1.0      # Sampling temperature for generation
+  max_new_tokens: 128   # Maximum new tokens to generate
+  top_k: 50            # Top-k sampling (null to disable)
+  top_p: 0.95          # Top-p nucleus sampling (null to disable)
+  
+  # Optimizer settings
+  optimizer: "adam"
+  adam_eps: 1e-8
+  gradient_clip: 1.0    # Gradient clipping value
+  
+evaluation:
+  num_episodes: 10      # Number of evaluation episodes
+  temperature: 0.7      # Lower temperature for eval (more deterministic)
+  
+logging:
+  project_name: "simple-rl-grpo"
+  log_interval: 10      # Log metrics every N episodes
+  save_interval: 100    # Save checkpoint every N episodes
+  
+# Data configuration
+data:
+  dataset_name: null    # HuggingFace dataset name (e.g., "imdb", "openai/summarize_from_feedback")
+  dataset_path: null    # Or local path to dataset
+  prompt_column: "text" # Column name containing prompts
+  max_prompt_length: 256  # Maximum prompt length in tokens
