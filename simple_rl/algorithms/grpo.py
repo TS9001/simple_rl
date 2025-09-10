@@ -175,38 +175,36 @@ class GRPO(BaseAlgorithm):
     def compute_policy_loss(
         self,
         log_probs: torch.Tensor,
-        old_log_probs: torch.Tensor,
+        old_log_probs: torch.Tensor, 
         ref_log_probs: torch.Tensor,
         rewards: torch.Tensor,
-        action_mask: Optional[torch.Tensor] = None
+        completion_mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute GRPO policy gradient loss with KL penalty.
+        Compute GRPO policy gradient loss with per-token KL penalty.
         
         Args:
             log_probs: Log probabilities from current policy [batch_size, seq_len]
             old_log_probs: Log probabilities from old policy (behavioral) [batch_size, seq_len]
             ref_log_probs: Log probabilities from reference policy [batch_size, seq_len]
             rewards: Normalized rewards [batch_size]
-            action_mask: Mask for valid actions [batch_size, seq_len]
+            completion_mask: Mask for completion tokens [batch_size, seq_len]
             
         Returns:
             Tuple of (loss, metrics_dict)
         """
-        if action_mask is not None:
-            # Mask out padding tokens
-            log_probs = log_probs * action_mask
-            old_log_probs = old_log_probs * action_mask
-            ref_log_probs = ref_log_probs * action_mask
+        # For policy gradient, we still sum log probs to get sequence-level values
+        if completion_mask is not None:
+            # Mask out non-completion tokens
+            log_probs_masked = log_probs * completion_mask
+            old_log_probs_masked = old_log_probs * completion_mask
             
-            # Sum over sequence length, mean over batch
-            log_probs_sum = log_probs.sum(dim=1)
-            old_log_probs_sum = old_log_probs.sum(dim=1)
-            ref_log_probs_sum = ref_log_probs.sum(dim=1)
+            # Sum over sequence length for policy gradient
+            log_probs_sum = log_probs_masked.sum(dim=1)
+            old_log_probs_sum = old_log_probs_masked.sum(dim=1)
         else:
             log_probs_sum = log_probs.sum(dim=1)
             old_log_probs_sum = old_log_probs.sum(dim=1)
-            ref_log_probs_sum = ref_log_probs.sum(dim=1)
         
         # Compute policy ratio π_θ/π_θ_old for importance sampling
         ratio = torch.exp(log_probs_sum - old_log_probs_sum.detach())
@@ -222,8 +220,9 @@ class GRPO(BaseAlgorithm):
             # Standard policy gradient with importance sampling
             pg_loss = -(ratio * rewards).mean()
         
-        # KL divergence penalty between current policy and reference
-        kl_div = self.compute_kl_divergence(log_probs_sum, ref_log_probs_sum)
+        # Per-token KL divergence penalty between current policy and reference
+        # Use per-token log probs for KL computation
+        kl_div = self.compute_kl_divergence(log_probs, ref_log_probs, mask=completion_mask)
         
         # Total loss
         total_loss = pg_loss + self.kl_coef * kl_div
@@ -350,7 +349,8 @@ class GRPO(BaseAlgorithm):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         prompt_lengths: List[int],
-        model: nn.Module
+        model: nn.Module,
+        return_per_token: bool = False
     ) -> torch.Tensor:
         """
         Compute log probabilities for generated sequences.
@@ -360,9 +360,11 @@ class GRPO(BaseAlgorithm):
             attention_mask: Attention mask [batch_size, seq_len]
             prompt_lengths: List of prompt lengths for each sequence
             model: Model to use for computation
+            return_per_token: If True, return per-token log probs; if False, return sum
             
         Returns:
-            Log probabilities for completion tokens [batch_size]
+            Log probabilities [batch_size] if return_per_token=False
+            Log probabilities [batch_size, seq_len-1] if return_per_token=True
         """
         batch_size, seq_len = input_ids.shape
         
@@ -387,12 +389,16 @@ class GRPO(BaseAlgorithm):
             target_mask=completion_mask
         )
         
-        # Sum log probs over sequence length (only for completion tokens)
         # log_probs shape is [batch_size, seq_len-1] after compute_log_probs
         # because it's for next-token prediction
-        log_probs_sum = log_probs.sum(dim=1)
         
-        return log_probs_sum
+        if return_per_token:
+            # Return per-token log probs (already masked for completion tokens)
+            return log_probs, completion_mask[:, 1:]  # Return shifted mask too
+        else:
+            # Sum log probs over sequence length (only for completion tokens)
+            log_probs_sum = log_probs.sum(dim=1)
+            return log_probs_sum
     
     def train_step(self, batch_data: Dict[str, Any]) -> Dict[str, float]:
         """
@@ -418,16 +424,27 @@ class GRPO(BaseAlgorithm):
         # Normalize rewards within groups
         normalized_rewards = self.compute_relative_rewards(rewards, self.group_size)
         
-        # Get log probs from generation time (stored in trajectories)
-        old_log_probs = trajectories["generation_log_probs"].detach()
+        # Get log probs from generation time (stored in trajectories) - these are summed
+        old_log_probs_sum = trajectories["generation_log_probs"].detach()
         
-        # Compute reference log probs once (they don't change)
+        # Also compute per-token old log probs for the policy loss
         with torch.no_grad():
-            ref_log_probs = self.compute_log_probs_for_sequences(
+            old_log_probs_per_token, completion_mask = self.compute_log_probs_for_sequences(
                 trajectories["generated_ids"],
                 trajectories["attention_masks"],
                 trajectories["prompt_lengths"],
-                model=self.reference_model
+                model=self.model,
+                return_per_token=True
+            )
+        
+        # Compute reference log probs once (per-token for KL)
+        with torch.no_grad():
+            ref_log_probs_per_token, _ = self.compute_log_probs_for_sequences(
+                trajectories["generated_ids"],
+                trajectories["attention_masks"],
+                trajectories["prompt_lengths"],
+                model=self.reference_model,
+                return_per_token=True
             )
         
         # Multi-step updates
@@ -450,25 +467,28 @@ class GRPO(BaseAlgorithm):
                 mb_generated_ids = trajectories["generated_ids"][mb_indices]
                 mb_attention_masks = trajectories["attention_masks"][mb_indices]
                 mb_prompt_lengths = [trajectories["prompt_lengths"][int(i)] for i in mb_indices]
-                mb_old_log_probs = old_log_probs[mb_indices]
-                mb_ref_log_probs = ref_log_probs[mb_indices]
+                mb_old_log_probs_per_token = old_log_probs_per_token[mb_indices]
+                mb_ref_log_probs_per_token = ref_log_probs_per_token[mb_indices]
+                mb_completion_mask = completion_mask[mb_indices]
                 mb_rewards = normalized_rewards[mb_indices]
                 
-                # Compute current log probabilities (with gradients)
+                # Compute current log probabilities per-token (with gradients)
                 self.model.train()
-                mb_log_probs = self.compute_log_probs_for_sequences(
+                mb_log_probs_per_token, _ = self.compute_log_probs_for_sequences(
                     mb_generated_ids,
                     mb_attention_masks,
                     mb_prompt_lengths,
-                    model=self.model
+                    model=self.model,
+                    return_per_token=True
                 )
                 
-                # Compute loss
+                # Compute loss with per-token log probs
                 loss, metrics = self.compute_policy_loss(
-                    mb_log_probs.unsqueeze(1),  # Add seq dimension for compatibility
-                    mb_old_log_probs.unsqueeze(1),
-                    mb_ref_log_probs.unsqueeze(1),
-                    mb_rewards
+                    mb_log_probs_per_token,
+                    mb_old_log_probs_per_token,
+                    mb_ref_log_probs_per_token,
+                    mb_rewards,
+                    completion_mask=mb_completion_mask
                 )
                 
                 # Backward pass
@@ -597,22 +617,31 @@ class GRPO(BaseAlgorithm):
     def compute_kl_divergence(
         self,
         log_probs: torch.Tensor,
-        ref_log_probs: torch.Tensor
+        ref_log_probs: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Compute approximate KL divergence between policy and reference distributions.
+        Compute per-token approximate KL divergence between policy and reference distributions.
         Uses the PPO-style approximate KL as in the paper.
         
         Args:
-            log_probs: Log probabilities from current policy
-            ref_log_probs: Log probabilities from reference policy
+            log_probs: Log probabilities from current policy [batch_size, seq_len] or [batch_size]
+            ref_log_probs: Log probabilities from reference policy [batch_size, seq_len] or [batch_size]
+            mask: Optional mask for valid tokens [batch_size, seq_len]
             
         Returns:
-            KL divergence value
+            Average KL divergence value
         """
         # Paper's formula: KL = π_ref/π_θ - log(π_ref/π_θ) - 1
         # Which is equivalent to: exp(log_ref - log_policy) - (log_ref - log_policy) - 1
         log_ratio = ref_log_probs - log_probs
         ratio = torch.exp(log_ratio)
         kl = ratio - log_ratio - 1
-        return kl.mean()
+        
+        if mask is not None:
+            # Apply mask and compute mean only over valid tokens
+            kl = kl * mask
+            # Average over valid tokens
+            return kl.sum() / mask.sum().clamp(min=1)
+        else:
+            return kl.mean()
