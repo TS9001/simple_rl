@@ -4,8 +4,10 @@ algorithm:
   name: grpo
   group_size: 8          # Number of completions per prompt for relative reward
   kl_coef: 0.1          # KL divergence penalty coefficient
-  clip_range: null      # Optional PPO-style clipping (set to 0.2 for clipping)
+  clip_range: 0.2        # PPO-style clipping range (set to null to disable)
   normalize_rewards: true  # Whether to normalize rewards to unit variance
+  update_epochs: 4       # Number of epochs to train on each batch
+  minibatch_size: 8      # Size of minibatches (null to use full batch)
 
 model:
   type: policy
