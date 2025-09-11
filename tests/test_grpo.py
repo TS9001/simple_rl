@@ -68,9 +68,10 @@ class TestGRPO:
         assert abs(group1.mean().item()) < 1e-5
         assert abs(group2.mean().item()) < 1e-5
         
-        # Std should be 1 within each group (if normalize_rewards=True)
-        assert abs(group1.std().item() - 1.0) < 0.1
-        assert abs(group2.std().item() - 1.0) < 0.1
+        # Std should be close to 1 within each group (if normalize_rewards=True)
+        # Using unbiased=False in the algorithm, so std will be slightly different
+        assert abs(group1.std(unbiased=False).item() - 1.0) < 0.01
+        assert abs(group2.std(unbiased=False).item() - 1.0) < 0.01
     
     def test_kl_divergence(self, config):
         """Test KL divergence computation."""
@@ -97,13 +98,14 @@ class TestGRPO:
         batch_size = 8
         seq_len = 10
         
-        # Create dummy inputs
-        log_probs = torch.randn(batch_size, seq_len) * 0.1 - 2.0
+        # Create dummy inputs - log_probs needs requires_grad for backprop
+        log_probs = torch.randn(batch_size, seq_len, requires_grad=True) * 0.1 - 2.0
+        old_log_probs = torch.randn(batch_size, seq_len) * 0.1 - 2.0
         ref_log_probs = torch.randn(batch_size, seq_len) * 0.1 - 2.0
         rewards = torch.randn(batch_size)
         
         loss, metrics = grpo.compute_policy_loss(
-            log_probs, ref_log_probs, rewards
+            log_probs, old_log_probs, ref_log_probs, rewards
         )
         
         assert isinstance(loss, torch.Tensor)
@@ -125,7 +127,7 @@ class TestGRPO:
         
         assert trajectories["generated_ids"].shape[0] == expected_batch_size
         assert trajectories["attention_masks"].shape[0] == expected_batch_size
-        assert len(trajectories["texts"]) == expected_batch_size
+        assert len(trajectories["completion_texts"]) == expected_batch_size
         assert len(trajectories["prompt_lengths"]) == expected_batch_size
         
         # Check all sequences have same length (padded)

@@ -52,12 +52,12 @@ def test_grpo():
     
     print(f"Generated IDs shape: {trajectories['generated_ids'].shape}")
     print(f"Attention masks shape: {trajectories['attention_masks'].shape}")
-    print(f"Number of texts: {len(trajectories['texts'])}")
-    print(f"Sample text: {trajectories['texts'][0][:100]}...")
+    print(f"Number of texts: {len(trajectories['completion_texts'])}")
+    print(f"Sample text: {trajectories['completion_texts'][0][:100] if trajectories['completion_texts'][0] else 'Empty'}...")
     
     # Test reward computation
     print("\n2. Testing reward computation...")
-    rewards = grpo.compute_rewards(prompts * 2, trajectories['texts'])
+    rewards = grpo.compute_rewards(prompts * 2, trajectories['completion_texts'])
     print(f"Rewards shape: {rewards.shape}")
     print(f"Rewards: {rewards}")
     

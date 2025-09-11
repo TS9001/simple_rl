@@ -184,27 +184,19 @@ class GRPO(BaseAlgorithm):
         Compute GRPO policy gradient loss with per-token KL penalty.
         
         Args:
-            log_probs: Log probabilities from current policy [batch_size, seq_len]
-            old_log_probs: Log probabilities from old policy (behavioral) [batch_size, seq_len]
-            ref_log_probs: Log probabilities from reference policy [batch_size, seq_len]
+            log_probs: Log probabilities from current policy [batch_size, seq_len] (already masked)
+            old_log_probs: Log probabilities from old policy [batch_size, seq_len] (already masked)
+            ref_log_probs: Log probabilities from reference policy [batch_size, seq_len] (already masked)
             rewards: Normalized rewards [batch_size]
-            completion_mask: Mask for completion tokens [batch_size, seq_len]
+            completion_mask: Mask for completion tokens [batch_size, seq_len] (for KL computation)
             
         Returns:
             Tuple of (loss, metrics_dict)
         """
-        # For policy gradient, we still sum log probs to get sequence-level values
-        if completion_mask is not None:
-            # Mask out non-completion tokens
-            log_probs_masked = log_probs * completion_mask
-            old_log_probs_masked = old_log_probs * completion_mask
-            
-            # Sum over sequence length for policy gradient
-            log_probs_sum = log_probs_masked.sum(dim=1)
-            old_log_probs_sum = old_log_probs_masked.sum(dim=1)
-        else:
-            log_probs_sum = log_probs.sum(dim=1)
-            old_log_probs_sum = old_log_probs.sum(dim=1)
+        # Log probs are already masked from compute_log_probs_for_sequences
+        # Just sum them directly - they already have zeros for non-completion tokens
+        log_probs_sum = log_probs.sum(dim=1)
+        old_log_probs_sum = old_log_probs.sum(dim=1)
         
         # Compute policy ratio π_θ/π_θ_old for importance sampling
         ratio = torch.exp(log_probs_sum - old_log_probs_sum.detach())
@@ -221,8 +213,9 @@ class GRPO(BaseAlgorithm):
             pg_loss = -(ratio * rewards).mean()
         
         # Per-token KL divergence penalty between current policy and reference
-        # Use per-token log probs for KL computation
-        kl_div = self.compute_kl_divergence(log_probs, ref_log_probs, mask=completion_mask)
+        # Note: log_probs and ref_log_probs are already masked, so we pass None for mask
+        # to avoid double masking in compute_kl_divergence
+        kl_div = self.compute_kl_divergence(log_probs, ref_log_probs, mask=None)
         
         # Total loss
         total_loss = pg_loss + self.kl_coef * kl_div
