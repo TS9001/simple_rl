@@ -87,6 +87,12 @@ class GRPO(BaseAlgorithm):
         self.top_k = training_config.get("top_k", None)
         self.top_p = training_config.get("top_p", None)
         
+        # Generation prompt configuration
+        generation_config = config.get("generation", {})
+        self.generation_prompt_template = generation_config.get("prompt_template", None)
+        self.system_prompt = generation_config.get("system_prompt", None)
+        self.response_prefix = generation_config.get("response_prefix", None)
+        
     def _create_reference_model(self) -> nn.Module:
         """Create a frozen copy of the policy model to use as reference."""
         reference_model = copy.deepcopy(self.model)
@@ -94,6 +100,68 @@ class GRPO(BaseAlgorithm):
         for param in reference_model.parameters():
             param.requires_grad = False
         return reference_model
+    
+    def format_prompt(self, prompt: str) -> str:
+        """
+        Format a prompt with system prompt and template if configured.
+        
+        Args:
+            prompt: Raw prompt string
+            
+        Returns:
+            Formatted prompt string
+        """
+        formatted = prompt
+        
+        # Apply prompt template first if configured
+        if self.generation_prompt_template:
+            # Template can use {prompt} placeholder
+            formatted = self.generation_prompt_template.replace("{prompt}", formatted)
+        
+        # Then prepend system prompt if configured
+        if self.system_prompt:
+            formatted = f"{self.system_prompt}\n\n{formatted}"
+        
+        # Add response prefix if configured
+        if self.response_prefix:
+            formatted = f"{formatted}{self.response_prefix}"
+        
+        return formatted
+    
+    def set_generation_prompt(
+        self,
+        system_prompt: Optional[str] = "keep",
+        prompt_template: Optional[str] = "keep",
+        response_prefix: Optional[str] = "keep",
+        reset: bool = False
+    ):
+        """
+        Set or update generation prompt configuration.
+        
+        Args:
+            system_prompt: System prompt to prepend to all prompts (None to clear, "keep" to keep current)
+            prompt_template: Template string with {prompt} placeholder (None to clear, "keep" to keep current)
+            response_prefix: Prefix to add before model response (None to clear, "keep" to keep current)
+            reset: If True, reset all prompt settings to None
+        
+        Example:
+            grpo.set_generation_prompt(
+                system_prompt="You are a helpful assistant.",
+                prompt_template="User: {prompt}\nAssistant:",
+                response_prefix=" "
+            )
+        """
+        if reset:
+            self.system_prompt = None
+            self.generation_prompt_template = None
+            self.response_prefix = None
+        else:
+            if system_prompt != "keep":
+                self.system_prompt = system_prompt
+            if prompt_template != "keep":
+                self.generation_prompt_template = prompt_template
+            if response_prefix != "keep":
+                self.response_prefix = response_prefix
     
     def compute_relative_rewards(
         self,
@@ -233,7 +301,8 @@ class GRPO(BaseAlgorithm):
     def generate_trajectories(
         self,
         prompts: List[str],
-        num_samples_per_prompt: int
+        num_samples_per_prompt: int,
+        use_formatting: bool = True
     ) -> Dict[str, Any]:
         """
         Generate multiple trajectories for each prompt.
@@ -242,6 +311,7 @@ class GRPO(BaseAlgorithm):
         Args:
             prompts: List of prompt strings
             num_samples_per_prompt: Number of completions per prompt
+            use_formatting: Whether to apply prompt formatting (system prompt, template, etc.)
             
         Returns:
             Dictionary containing trajectories and metadata including generation-time log probs
@@ -250,14 +320,23 @@ class GRPO(BaseAlgorithm):
         all_attention_masks = []
         all_prompt_lengths = []
         all_generated_texts = []
+        all_original_prompts = []  # Store original prompts
+        all_formatted_prompts = []  # Store formatted prompts
         
         self.model.eval()
         
         with torch.no_grad():
             for prompt in prompts:
-                # Tokenize prompt
+                # Format prompt if configured
+                formatted_prompt = self.format_prompt(prompt) if use_formatting else prompt
+                
+                # Store both original and formatted prompts
+                all_original_prompts.extend([prompt] * num_samples_per_prompt)
+                all_formatted_prompts.extend([formatted_prompt] * num_samples_per_prompt)
+                
+                # Tokenize formatted prompt
                 prompt_encoding = self.model.tokenize(
-                    [prompt],
+                    [formatted_prompt],
                     truncation=True,
                     padding=False,
                     return_tensors="pt"
@@ -333,7 +412,9 @@ class GRPO(BaseAlgorithm):
             "attention_masks": attention_masks,
             "prompt_lengths": all_prompt_lengths,
             "completion_texts": all_generated_texts,  # Only completion parts
-            "prompts": prompts,
+            "prompts": prompts,  # Original prompts
+            "original_prompts": all_original_prompts,  # Original prompts expanded
+            "formatted_prompts": all_formatted_prompts,  # Formatted prompts used for generation
             "generation_log_probs": generation_log_probs  # Log probs at generation time
         }
     
