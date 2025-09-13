@@ -56,7 +56,7 @@ A standard, pure GRPO algorithm implementation that performs relative reward com
 
 ### Phase 2: Policy Model
 **File: `simple_rl/models/policy_model.py`**
-- Class `PolicyModel(BaseModel)`:
+- Class `LanguageModel(BaseModel)`:
   - Support for HuggingFace transformers
   - `forward()`: Generate logits for next token
   - `generate()`: Text generation method

@@ -8,7 +8,6 @@ import torch.nn as nn
 import numpy as np
 from unittest.mock import Mock, patch, MagicMock
 from simple_rl.algorithms.grpo import GRPO
-from simple_rl.models.policy_model import PolicyModel
 
 
 class TestGRPOMasking:

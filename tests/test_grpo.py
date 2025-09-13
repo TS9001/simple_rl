@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn as nn
 from simple_rl.algorithms.grpo import GRPO
-from simple_rl.models.policy_model import PolicyModel
+from simple_rl.models.language_model import LanguageModel
 
 
 class TestGRPO:
@@ -38,7 +38,7 @@ class TestGRPO:
         """Test GRPO initialization."""
         grpo = GRPO(model=None, config=config, use_wandb=False)
         
-        assert isinstance(grpo.model, PolicyModel)
+        assert isinstance(grpo.model, LanguageModel)
         assert isinstance(grpo.reference_model, nn.Module)
         assert grpo.group_size == 4
         assert grpo.kl_coef == 0.1
