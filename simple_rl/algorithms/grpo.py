@@ -11,9 +11,10 @@ import torch.nn.functional as F
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 import copy
+from pathlib import Path
 
 from simple_rl.algorithms.base import BaseAlgorithm
-from simple_rl.models.policy_model import PolicyModel
+from simple_rl.models.language_model import LanguageModel
 
 
 class GRPO(BaseAlgorithm):
@@ -46,14 +47,14 @@ class GRPO(BaseAlgorithm):
         """
         # Initialize model if not provided
         if model is None:
-            model = PolicyModel(config)
+            model = LanguageModel(config)
         
         super().__init__(model, config, use_wandb)
         
-        # Ensure model is PolicyModel for text generation
-        if not isinstance(self.model, PolicyModel):
-            # Wrap the model if it's not already a PolicyModel
-            self.model = PolicyModel(config)
+        # Ensure model is LanguageModel for text generation
+        if not isinstance(self.model, LanguageModel):
+            # Wrap the model if it's not already a LanguageModel
+            self.model = LanguageModel(config)
         
         # GRPO-specific parameters
         algo_config = config.get("algorithm", {})
@@ -666,6 +667,25 @@ class GRPO(BaseAlgorithm):
         # Placeholder implementation
         # Will be implemented in later phases
         return {"eval_placeholder": 0.0}
+    
+    def save_checkpoint(self, path: str):
+        """Save model checkpoint."""
+        checkpoint = {
+            'policy_state_dict': self.policy.state_dict(),
+            'ref_policy_state_dict': self.ref_policy.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'config': self.config,
+        }
+        
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save(checkpoint, path)
+    
+    def load_checkpoint(self, path: str):
+        """Load model checkpoint."""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.policy.load_state_dict(checkpoint['policy_state_dict'])
+        self.ref_policy.load_state_dict(checkpoint['ref_policy_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     
     def generate_completion(
         self,
