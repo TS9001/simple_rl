@@ -1,59 +1,52 @@
 # Simple RL
 
-A Python package for implementing simple, educational versions of reinforcement learning algorithms with HuggingFace model integration, dataset support, and Weights & Biases tracking.
+Educational reinforcement learning implementations with GRPO focus.
 
-## Features
-
-- 🤖 **Simple RL Algorithms**: Clean, educational implementations of common RL algorithms
-- 🤗 **HuggingFace Integration**: Load pretrained models and datasets from HuggingFace Hub
-- 📊 **Experiment Tracking**: Built-in Weights & Biases integration for experiment tracking
-- 🔧 **Flexible Configuration**: YAML-based configuration with easy overrides
-- 🐍 **PyTorch Backend**: Built on PyTorch for GPU acceleration and modern ML workflows
-
-## Quick Start
-
-### Installation
+## Setup
 
 ```bash
-# Clone the repository
-git clone <your-repo-url>
-cd simple_rl
-
-# Install in development mode
-pip install -e ".[dev]"
-
-# Or use the setup script
-chmod +x scripts/setup_env.sh
-./scripts/setup_env.sh
+./scripts/setup.sh  # Installs uv, creates venv, installs deps
 ```
 
-### Basic Usage
+## Usage
+
+### Run GRPO Training
+```bash
+./scripts/run_jupyter.sh  # Opens notebook for training
+```
+
+### Run Tests
+```bash
+./scripts/run_tests.sh grpo  # Test GRPO implementation
+```
+
+## GRPO Quick Start
 
 ```python
-from simple_rl.utils.config import get_default_config
-from simple_rl.algorithms.base import BaseAlgorithm
+from simple_rl.algorithms.grpo import GRPO
 
-# Load configuration
-config = get_default_config()
+config = {
+    "algorithm": {
+        "group_size": 4,  # Completions per prompt
+        "kl_coef": 0.05,  # KL penalty
+    },
+    "training": {
+        "batch_size": 8,
+        "learning_rate": 1e-5,
+        "num_episodes": 100,
+    }
+}
 
-# Initialize algorithm
-algorithm = BaseAlgorithm(config)
+def reward_fn(prompt: str, completion: str) -> float:
+    # Your reward logic
+    return 1.0 if correct else -0.5
 
-# Train (placeholder - implement specific algorithms)
-# results = algorithm.train(num_episodes=1000)
-```
+grpo = GRPO(config=config, reward_fn=reward_fn)
 
-### Command Line Training
-
-```bash
-# Train with default configuration
-simple-rl-train
-
-# Train with custom config
-simple-rl-train --config my_config.yaml
-
-# Override specific parameters
-simple-rl-train --override training.num_episodes=2000 model.hidden_dim=512
+# Train
+for episode in range(100):
+    batch = {"prompts": your_prompts}
+    grpo.train_step(batch)
 ```
 
 ## Project Structure
@@ -61,103 +54,33 @@ simple-rl-train --override training.num_episodes=2000 model.hidden_dim=512
 ```
 simple_rl/
 ├── simple_rl/
-│   ├── algorithms/       # RL algorithm implementations
-│   │   ├── base.py      # Base algorithm class
-│   │   └── __init__.py
+│   ├── algorithms/       # RL algorithms (GRPO, etc.)
 │   ├── models/          # Model definitions
-│   │   ├── base.py      # Base model with HF integration
-│   │   └── __init__.py
 │   ├── utils/           # Utilities
-│   │   ├── config.py    # Configuration management
-│   │   ├── logging.py   # Logging utilities
-│   │   ├── data.py      # Data loading utilities
-│   │   └── __init__.py
-│   ├── config/          # Configuration files
-│   │   └── default.yaml # Default configuration
-│   └── scripts/         # Training scripts
-│       └── train.py     # Main training script
-├── examples/            # Usage examples
-├── tests/              # Unit tests
-├── scripts/            # Setup scripts
-└── requirements.txt    # Dependencies
+│   └── config/          # Config files
+├── notebooks/           # Training notebooks
+├── tests/              # Test suite
+├── scripts/            # Setup & run scripts
+└── how_to/             # Quick guides
 ```
 
-## Configuration
+## Notebooks
 
-The package uses YAML configuration files with OmegaConf. See `simple_rl/config/default.yaml` for all available options.
+- `notebooks/grpo_qwen_training.ipynb` - Full GRPO training with Qwen 0.5B on GSM8K
 
-Key configuration sections:
-- `model`: Model architecture and HuggingFace integration
-- `training`: Training hyperparameters and algorithm settings  
-- `data`: Dataset loading and preprocessing
-- `wandb`: Experiment tracking configuration
-- `environment`: Gym environment settings
+## Documentation
+
+See `how_to/` folder for:
+- Dataset loading patterns
+- Reward function examples
+- Prompt customization
 
 ## Development
 
-### Code Quality
-
 ```bash
-# Format code
-black simple_rl/ tests/ examples/
-
-# Sort imports
-isort simple_rl/ tests/ examples/
-
-# Lint code
-flake8 simple_rl/ tests/ examples/
-
-# Run all checks
+# Format & lint
 black . && isort . && flake8 .
-```
 
-### Testing
-
-```bash
-# Run all tests
+# Run tests
 pytest
-
-# Run with coverage
-pytest --cov=simple_rl
 ```
-
-## Extending Simple RL
-
-### Adding New Algorithms
-
-1. Create a new file in `simple_rl/algorithms/`
-2. Inherit from `BaseAlgorithm`
-3. Implement `train()` and `evaluate()` methods
-4. Register in `algorithms/__init__.py`
-
-### Adding New Models
-
-1. Create a new file in `simple_rl/models/`  
-2. Inherit from `BaseModel`
-3. Implement `forward()` method
-4. Register in `models/__init__.py`
-
-## Dependencies
-
-Core dependencies:
-- PyTorch 2.0+
-- HuggingFace Transformers & Datasets
-- Weights & Biases
-- OpenAI Gym
-- OmegaConf
-
-Development dependencies:
-- pytest, black, flake8, isort
-
-## License
-
-MIT License - see LICENSE file for details.
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Run code quality checks
-6. Submit a pull request
