@@ -88,4 +88,3 @@ pytest
 # Disclaimer
 - AI tools like claude code or GPT5 were used to generate parts of the code, It makes development faster
   documentation easier and basic building blocks can be implemented really quickly.
-- 
