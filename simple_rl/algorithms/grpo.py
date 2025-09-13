@@ -14,7 +14,7 @@ import copy
 from pathlib import Path
 
 from simple_rl.algorithms.base import BaseAlgorithm
-from simple_rl.models.language_model import LanguageModel
+from simple_rl.utils.huggingface_wrappers import LanguageModel
 
 
 class GRPO(BaseAlgorithm):
