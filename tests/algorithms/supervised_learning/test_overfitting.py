@@ -1,10 +1,8 @@
 """
-Overfitting test with real small model and tiny dataset.
+Tests for overfitting scenarios with supervised learning.
 
-Tests ability to overfit on a few examples using:
-- Small HuggingFace model (distilbert-base-uncased)
-- Tiny dataset (10 examples)
-- Should achieve near-perfect training accuracy
+Tests ability to overfit on small datasets to verify
+that the training pipeline is working correctly.
 """
 
 import pytest
@@ -12,7 +10,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel
-from datasets import Dataset as HFDataset
+from pathlib import Path
 
 from simple_rl.algorithms import SupervisedLearning
 from simple_rl.utils import create_supervised_config
@@ -308,8 +306,8 @@ class TestOverfitting:
         # Should still be able to learn something, even with frozen backbone
         assert eval_results['accuracy'] > 0.6, f"Expected >60% accuracy with frozen backbone, got {eval_results['accuracy']:.2%}"
     
-    def test_save_and_load_finetuned_model(self, tiny_dataset, overfitting_config, tmp_path):
-        """Test saving and loading a finetuned model."""
+    def test_save_and_load_overfitted_model(self, tiny_dataset, overfitting_config):
+        """Test saving and loading an overfitted model."""
         texts, labels = tiny_dataset
         
         # Create and train model
@@ -335,33 +333,35 @@ class TestOverfitting:
         algorithm1.train(train_loader)
         
         # Save checkpoint
-        checkpoint_path = tmp_path / "finetuned_model.pt"
-        algorithm1.save_checkpoint(str(checkpoint_path))
-        
-        # Load into new model
-        model2 = TextClassificationModel(model_config)
-        algorithm2 = SupervisedLearning(model2, quick_config, use_wandb=False)
-        algorithm2.load_checkpoint(str(checkpoint_path))
-        
-        # Test that both models give same predictions
-        test_text = "This is a test sentence."
-        
-        encoding = model1.tokenizer(
-            test_text,
-            truncation=True,
-            padding="max_length",
-            max_length=64,
-            return_tensors="pt"
-        )
-        
-        # Set both models to eval mode
-        model1.eval()
-        model2.eval()
-        
-        with torch.no_grad():
-            # Move encoding to device
-            device_encoding = {k: v.to(algorithm1.device) for k, v in encoding.items()}
-            logits1 = model1(device_encoding)
-            logits2 = model2(device_encoding)
-        
-        torch.testing.assert_close(logits1, logits2, msg="Loaded model gives different predictions")
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_path:
+            checkpoint_path = Path(tmp_path) / "finetuned_model.pt"
+            algorithm1.save_checkpoint(str(checkpoint_path))
+            
+            # Load into new model
+            model2 = TextClassificationModel(model_config)
+            algorithm2 = SupervisedLearning(model2, quick_config, use_wandb=False)
+            algorithm2.load_checkpoint(str(checkpoint_path))
+            
+            # Test that both models give same predictions
+            test_text = "This is a test sentence."
+            
+            encoding = model1.tokenizer(
+                test_text,
+                truncation=True,
+                padding="max_length",
+                max_length=64,
+                return_tensors="pt"
+            )
+            
+            # Set both models to eval mode
+            model1.eval()
+            model2.eval()
+            
+            with torch.no_grad():
+                # Move encoding to device
+                device_encoding = {k: v.to(algorithm1.device) for k, v in encoding.items()}
+                logits1 = model1(device_encoding)
+                logits2 = model2(device_encoding)
+            
+            torch.testing.assert_close(logits1, logits2, msg="Loaded model gives different predictions")

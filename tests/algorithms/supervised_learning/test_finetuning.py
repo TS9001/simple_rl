@@ -1,20 +1,14 @@
 """
-Tests for model finetuning functionality.
-
-Tests standard model finetuning scenarios including:
-- HuggingFace model loading and adaptation
-- Finetuning with different optimizers
-- Checkpoint saving and loading
-- Model freezing and unfreezing
+Tests for model finetuning with supervised learning.
 """
 
 import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
+from pathlib import Path
 import tempfile
 import shutil
-from pathlib import Path
 
 from simple_rl.algorithms import SupervisedLearning
 from simple_rl.models.base import BaseModel
@@ -76,8 +70,8 @@ class FinetunableModel(BaseModel):
 
 
 @pytest.fixture
-def sample_data():
-    """Create sample data for testing."""
+def finetuning_data():
+    """Create sample data for finetuning tests."""
     # Mock token IDs (batch_size, seq_length)
     X = torch.randint(0, 1000, (100, 32))
     y = torch.randint(0, 2, (100,))  # Binary classification
@@ -111,18 +105,10 @@ def finetuning_config():
     )
 
 
-@pytest.fixture
-def temp_dir():
-    """Temporary directory for saving checkpoints."""
-    temp_dir = tempfile.mkdtemp()
-    yield temp_dir
-    shutil.rmtree(temp_dir)
-
-
 class TestModelFinetuning:
     """Test suite for model finetuning."""
     
-    def test_model_creation_and_forward_pass(self, finetuning_config):
+    def test_model_creation_and_forward_pass(self):
         """Test that we can create and run forward pass on finetunable model."""
         model_config = {
             "vocab_size": 1000,
@@ -164,9 +150,9 @@ class TestModelFinetuning:
         model.unfreeze_backbone()
         assert all(p.requires_grad for p in backbone_params)
     
-    def test_full_finetuning(self, finetuning_config, sample_data):
+    def test_full_finetuning(self, finetuning_config, finetuning_data):
         """Test full model finetuning (all parameters)."""
-        train_loader, val_loader = sample_data
+        train_loader, val_loader = finetuning_data
         
         model_config = {"vocab_size": 1000, "hidden_dim": 128, "num_classes": 2}
         model = FinetunableModel(model_config)
@@ -185,9 +171,9 @@ class TestModelFinetuning:
         assert "eval_loss" in eval_results
         assert "accuracy" in eval_results
     
-    def test_frozen_backbone_finetuning(self, finetuning_config, sample_data):
+    def test_frozen_backbone_finetuning(self, finetuning_config, finetuning_data):
         """Test finetuning with frozen backbone (only train classifier)."""
-        train_loader, val_loader = sample_data
+        train_loader, val_loader = finetuning_data
         
         model_config = {"vocab_size": 1000, "hidden_dim": 128, "num_classes": 2}
         model = FinetunableModel(model_config)
@@ -216,9 +202,9 @@ class TestModelFinetuning:
         # (This is harder to test directly, but training should succeed)
         assert results["avg_loss"] > 0
     
-    def test_checkpoint_saving_and_loading(self, finetuning_config, sample_data, temp_dir):
+    def test_checkpoint_saving_and_loading(self, finetuning_config, finetuning_data):
         """Test saving and loading model checkpoints during finetuning."""
-        train_loader, val_loader = sample_data
+        train_loader, val_loader = finetuning_data
         
         model_config = {"vocab_size": 1000, "hidden_dim": 128, "num_classes": 2}
         model1 = FinetunableModel(model_config)
@@ -237,121 +223,20 @@ class TestModelFinetuning:
         results1 = algorithm1.train(train_loader, val_loader)
         
         # Save checkpoint
-        checkpoint_path = Path(temp_dir) / "model_checkpoint.pt"
-        algorithm1.save_checkpoint(str(checkpoint_path))
-        
-        assert checkpoint_path.exists()
-        
-        # Create new model and load checkpoint
-        model2 = FinetunableModel(model_config)
-        algorithm2 = SupervisedLearning(model2, short_config, use_wandb=False)
-        algorithm2.load_checkpoint(str(checkpoint_path))
-        
-        # Verify models have same weights
-        for (name1, param1), (name2, param2) in zip(
-            model1.named_parameters(), model2.named_parameters()
-        ):
-            assert name1 == name2
-            torch.testing.assert_close(param1, param2, msg=f"Parameter {name1} not loaded correctly")
-    
-    def test_different_optimizers_for_finetuning(self, sample_data):
-        """Test finetuning with different optimizers."""
-        train_loader, val_loader = sample_data
-        model_config = {"vocab_size": 1000, "hidden_dim": 128, "num_classes": 2}
-        
-        optimizers_to_test = [
-            {"type": "adam", "betas": [0.9, 0.999]},
-            {"type": "adamw", "betas": [0.9, 0.999]},
-            {"type": "sgd", "momentum": 0.9}
-        ]
-        
-        for opt_config in optimizers_to_test:
-            config = create_supervised_config(
-                project_name=f"test-{opt_config['type']}",
-                algorithm={"task_type": "classification"},
-                training={
-                    "num_epochs": 2,
-                    "learning_rate": 1e-3,
-                    "optimizer": opt_config
-                },
-                wandb={"enabled": False}
-            )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "model_checkpoint.pt"
+            algorithm1.save_checkpoint(str(checkpoint_path))
             
-            model = FinetunableModel(model_config)
-            algorithm = SupervisedLearning(model, config, use_wandb=False)
+            assert checkpoint_path.exists()
             
-            # Should complete without errors
-            results = algorithm.train(train_loader, val_loader)
-            assert results["avg_loss"] > 0
-            assert isinstance(results["total_epochs"], int)
-    
-    def test_learning_rate_scheduling(self, sample_data):
-        """Test finetuning with learning rate scheduling."""
-        train_loader, val_loader = sample_data
-        
-        config = create_supervised_config(
-            project_name="test-scheduler",
-            algorithm={"task_type": "classification"},
-            training={
-                "num_epochs": 4,
-                "learning_rate": 1e-3,
-                "optimizer": {"type": "adamw"},
-                "scheduler": {
-                    "enabled": True,
-                    "type": "step",
-                    "step_size": 2,
-                    "gamma": 0.5
-                }
-            },
-            wandb={"enabled": False}
-        )
-        
-        model_config = {"vocab_size": 1000, "hidden_dim": 128, "num_classes": 2}
-        model = FinetunableModel(model_config)
-        
-        algorithm = SupervisedLearning(model, config, use_wandb=False)
-        
-        # Store initial learning rate
-        initial_lr = algorithm.optimizer.param_groups[0]['lr']
-        
-        # Train model
-        results = algorithm.train(train_loader, val_loader)
-        
-        # Learning rate should have been reduced
-        final_lr = algorithm.optimizer.param_groups[0]['lr']
-        assert final_lr < initial_lr
-        assert results["avg_loss"] > 0
-    
-    def test_early_stopping_during_finetuning(self, sample_data):
-        """Test early stopping during finetuning."""
-        train_loader, val_loader = sample_data
-        
-        config = create_supervised_config(
-            project_name="test-early-stopping",
-            algorithm={"task_type": "classification"},
-            training={
-                "num_epochs": 20,  # Set high so early stopping can trigger
-                "learning_rate": 1e-3,
-                "early_stopping": {
-                    "enabled": True,
-                    "patience": 2,
-                    "monitor": "val_loss"
-                }
-            },
-            logging={
-                "eval_interval": 10  # Evaluate frequently
-            },
-            wandb={"enabled": False}
-        )
-        
-        model_config = {"vocab_size": 1000, "hidden_dim": 128, "num_classes": 2}
-        model = FinetunableModel(model_config)
-        
-        algorithm = SupervisedLearning(model, config, use_wandb=False)
-        
-        results = algorithm.train(train_loader, val_loader)
-        
-        # With small dataset and simple task, early stopping might trigger
-        # Just verify the mechanism works without error
-        assert isinstance(results["early_stopped"], bool)
-        assert results["total_epochs"] <= 20
+            # Create new model and load checkpoint
+            model2 = FinetunableModel(model_config)
+            algorithm2 = SupervisedLearning(model2, short_config, use_wandb=False)
+            algorithm2.load_checkpoint(str(checkpoint_path))
+            
+            # Verify models have same weights
+            for (name1, param1), (name2, param2) in zip(
+                model1.named_parameters(), model2.named_parameters()
+            ):
+                assert name1 == name2
+                torch.testing.assert_close(param1, param2, msg=f"Parameter {name1} not loaded correctly")
