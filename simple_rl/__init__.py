@@ -9,5 +9,4 @@ __version__ = "0.1.0"
 __author__ = "Your Name"
 
 from simple_rl.algorithms import *
-from simple_rl.models import *
 from simple_rl.utils import *

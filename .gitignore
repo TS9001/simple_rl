@@ -149,3 +149,4 @@ reports/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+./plans/*
