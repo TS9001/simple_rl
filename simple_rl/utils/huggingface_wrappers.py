@@ -41,7 +41,7 @@ class LanguageModel(nn.Module):
         # Get model config
         self.vocab_size = self.model.config.vocab_size
         self.hidden_size = self.model.config.hidden_size
-        
+    
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -147,24 +147,6 @@ class LanguageModel(nn.Module):
             dim=-1,
             index=shift_labels.unsqueeze(-1)
         ).squeeze(-1)
-        
-        # Apply masks
-        combined_mask = None
-        
-        if attention_mask is not None:
-            shift_attention = attention_mask[:, 1:].contiguous()
-            combined_mask = shift_attention
-        
-        if target_mask is not None:
-            shift_mask = target_mask[:, 1:].contiguous()
-            
-            if combined_mask is not None:
-                combined_mask = combined_mask * shift_mask
-            else:
-                combined_mask = shift_mask
-        
-        if combined_mask is not None:
-            log_probs = log_probs * combined_mask
             
         return log_probs
     
