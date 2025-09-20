@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 
 from simple_rl.algorithms import SupervisedLearning
-from simple_rl.utils import create_supervised_config
+# from simple_rl.utils import dict  # Function removed
 
 
 class SimpleModel(nn.Module):
@@ -58,7 +58,7 @@ class TestOptimization:
         ]
         
         for opt_config in optimizers_to_test:
-            config = create_supervised_config(
+            config = dict(
                 project_name=f"test-{opt_config['type']}",
                 algorithm={"task_type": "classification"},
                 training={
@@ -81,7 +81,7 @@ class TestOptimization:
         """Test training with learning rate scheduling."""
         train_loader, val_loader = optimization_data
         
-        config = create_supervised_config(
+        config = dict(
             project_name="test-scheduler",
             algorithm={"task_type": "classification"},
             training={
@@ -116,7 +116,7 @@ class TestOptimization:
         """Test cosine annealing learning rate scheduler."""
         train_loader, val_loader = optimization_data
         
-        config = create_supervised_config(
+        config = dict(
             project_name="test-cosine",
             algorithm={"task_type": "classification"},
             training={
@@ -143,7 +143,7 @@ class TestOptimization:
         """Test gradient clipping during training."""
         train_loader, val_loader = optimization_data
         
-        config = create_supervised_config(
+        config = dict(
             project_name="test-grad-clip",
             algorithm={"task_type": "classification"},
             training={
@@ -169,7 +169,7 @@ class TestOptimization:
         """Test weight decay regularization."""
         train_loader, val_loader = optimization_data
         
-        config = create_supervised_config(
+        config = dict(
             project_name="test-weight-decay",
             algorithm={"task_type": "classification"},
             training={
@@ -196,7 +196,7 @@ class TestOptimization:
         """Test early stopping during training."""
         train_loader, val_loader = optimization_data
         
-        config = create_supervised_config(
+        config = dict(
             project_name="test-early-stopping",
             algorithm={"task_type": "classification"},
             training={
@@ -238,7 +238,7 @@ class TestOptimization:
             train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
             val_loader = DataLoader(val_dataset, batch_size=batch_size)
             
-            config = create_supervised_config(
+            config = dict(
                 project_name=f"test-batch-{batch_size}",
                 algorithm={"task_type": "classification"},
                 training={

@@ -61,8 +61,14 @@ class TestGRPOBasics:
     def test_device_placement(self, config):
         """Test model is placed on correct device."""
         grpo = GRPO(config=config, use_wandb=False)
-        expected_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+        # Account for CUDA, MPS, or CPU
+        if torch.cuda.is_available():
+            expected_device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            expected_device = torch.device("mps")
+        else:
+            expected_device = torch.device("cpu")
+
         # Check if model is on correct device
         for param in grpo.policy.parameters():
             assert param.device.type == expected_device.type

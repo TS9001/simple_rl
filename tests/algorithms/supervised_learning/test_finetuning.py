@@ -11,8 +11,8 @@ import tempfile
 import shutil
 
 from simple_rl.algorithms import SupervisedLearning
-from simple_rl.models.base import BaseModel
-from simple_rl.utils import create_supervised_config
+# from simple_rl.models.base import BaseModel  # Module doesn't exist
+# from simple_rl.utils import create_supervised_config  # Function removed
 
 
 class MockHFModel(nn.Module):
@@ -35,11 +35,11 @@ class MockHFModel(nn.Module):
         return {"last_hidden_state": x, "pooler_output": pooled}
 
 
-class FinetunableModel(BaseModel):
+class FinetunableModel(nn.Module):
     """Model that can be finetuned with HF backbone."""
-    
+
     def __init__(self, config):
-        super().__init__(config)
+        super().__init__()
         
         # Mock HF model instead of real one for testing
         self.backbone = MockHFModel(
@@ -88,12 +88,12 @@ def finetuning_data():
 @pytest.fixture
 def finetuning_config():
     """Configuration for finetuning tests."""
-    return create_supervised_config(
-        project_name="test-finetuning",
-        algorithm={
+    return {
+        "project_name": "test-finetuning",
+        "algorithm": {
             "task_type": "classification"
         },
-        training={
+        "training": {
             "num_epochs": 3,
             "learning_rate": 2e-5,
             "optimizer": {
@@ -101,8 +101,8 @@ def finetuning_config():
                 "betas": [0.9, 0.999]
             }
         },
-        wandb={"enabled": False}
-    )
+        "wandb": {"enabled": False}
+    }
 
 
 class TestModelFinetuning:
@@ -212,12 +212,12 @@ class TestModelFinetuning:
         algorithm1 = SupervisedLearning(model1, finetuning_config, use_wandb=False)
         
         # Train for 1 epoch
-        short_config = create_supervised_config(
-            project_name="test-checkpoint",
-            algorithm={"task_type": "classification"},
-            training={"num_epochs": 1, "learning_rate": 2e-5},
-            wandb={"enabled": False}
-        )
+        short_config = {
+            "project_name": "test-checkpoint",
+            "algorithm": {"task_type": "classification"},
+            "training": {"num_epochs": 1, "learning_rate": 2e-5},
+            "wandb": {"enabled": False}
+        }
         
         algorithm1.config = short_config
         results1 = algorithm1.train(train_loader, val_loader)

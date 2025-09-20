@@ -13,7 +13,7 @@ from transformers import AutoTokenizer, AutoModel
 from pathlib import Path
 
 from simple_rl.algorithms import SupervisedLearning
-from simple_rl.utils import create_supervised_config
+# from simple_rl.utils import dict  # Function removed
 from simple_rl.utils.logging import setup_logging
 
 # Skip tests if transformers not available
@@ -140,7 +140,7 @@ def tiny_dataset():
 @pytest.fixture
 def overfitting_config():
     """Configuration optimized for overfitting."""
-    return create_supervised_config(
+    return dict(
         project_name="overfit-test",
         algorithm={
             "task_type": "classification"
@@ -283,7 +283,7 @@ class TestOverfitting:
         val_loader = DataLoader(train_dataset, batch_size=2, shuffle=False, collate_fn=collate_fn)
         
         # Use higher learning rate since only training classifier
-        frozen_config = create_supervised_config(
+        frozen_config = dict(
             project_name="frozen-overfit-test",
             algorithm={"task_type": "classification"},
             training={
@@ -319,7 +319,7 @@ class TestOverfitting:
         model1 = TextClassificationModel(model_config)
         
         # Quick training config
-        quick_config = create_supervised_config(
+        quick_config = dict(
             project_name="save-load-test",
             algorithm={"task_type": "classification"},
             training={"num_epochs": 3, "learning_rate": 2e-5},
