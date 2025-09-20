@@ -33,7 +33,7 @@ class GRPO(BaseAlgorithm):
         self,
         model: Optional[nn.Module] = None,
         config: Optional[Dict[str, Any]] = None,
-        reward_fn: Optional[Callable[[str, str], float]] = None,
+        reward_fn: Optional[Callable[[str, str, Optional[str]], float]] = None,
         use_wandb: bool = False
     ):
         """
@@ -42,7 +42,7 @@ class GRPO(BaseAlgorithm):
         Args:
             model: Language model for text generation (if None, creates from config)
             config: Configuration dictionary
-            reward_fn: Function to compute rewards (prompt, completion) -> float
+            reward_fn: Function to compute rewards (prompt, completion, answer) -> float
             use_wandb: Whether to use Weights & Biases logging
         """
         # Store config and setup device
@@ -132,7 +132,7 @@ class GRPO(BaseAlgorithm):
         self.total_steps = 0
         self.episode = 0
 
-    def _default_reward_fn(self, prompt: str, completion: str) -> float:
+    def _default_reward_fn(self, prompt: str, completion: str, answer: Optional[str] = None) -> float:
         """Default reward function based on completion length."""
         # Simple heuristic: longer completions get higher rewards
         # This should be replaced with actual reward logic
@@ -185,17 +185,19 @@ class GRPO(BaseAlgorithm):
     def generate_trajectories(
         self,
         prompts: List[str],
+        answers: Optional[List[str]] = None,
         use_formatting: bool = True
-    ) -> Tuple[List[str], List[str], torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[List[str], List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Generate trajectories for a batch of prompts.
         
         Args:
             prompts: List of prompt strings
+            answers: Optional list of correct answers for reward computation
             use_formatting: Whether to apply prompt formatting
             
         Returns:
-            Tuple of (prompts, completions, rewards, log_probs, ref_log_probs)
+            Tuple of (prompts, completions, rewards, log_probs, ref_log_probs, completion_mask)
         """
         all_prompts = []
         all_completions = []
@@ -204,7 +206,9 @@ class GRPO(BaseAlgorithm):
         all_ref_log_probs = []
         all_completion_mask = []
         # Process each prompt
-        for prompt in prompts:
+        for i, prompt in enumerate(prompts):
+            # Get answer if provided
+            answer = answers[i] if answers else None
             # Format prompt if configured
             formatted_prompt = self.format_prompt(prompt, use_formatting)
             
@@ -264,7 +268,7 @@ class GRPO(BaseAlgorithm):
             # Compute rewards for each completion
             rewards = []
             for completion in completions:
-                reward = self.reward_fn(prompt, completion)
+                reward = self.reward_fn(prompt, completion, answer)
                 rewards.append(reward)
             
             # Store results
@@ -410,18 +414,21 @@ class GRPO(BaseAlgorithm):
     def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
         """
         Perform a single training step.
-        
+
         Args:
-            batch: Dictionary with 'prompts' key containing list of prompts
-            
+            batch: Dictionary with 'prompts' and optionally 'answers' keys
+
         Returns:
             Dictionary of training metrics
         """
         self.policy.train()
         prompts = batch["prompts"]
-    
+        answers = batch.get("answers", None)  # Optional answers for reward computation
+
         # Generate trajectories
-        _, _, rewards, log_probs, ref_log_probs, completion_mask = self.generate_trajectories(prompts)
+        _, _, rewards, log_probs, ref_log_probs, completion_mask = self.generate_trajectories(
+            prompts, answers=answers
+        )
         
         # Compute advantages
         advantages = self.compute_advantages(rewards)
