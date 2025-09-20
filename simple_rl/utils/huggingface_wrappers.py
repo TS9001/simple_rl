@@ -20,27 +20,31 @@ class LanguageModel(nn.Module):
     def __init__(self, config: Dict[str, Any]):
         """
         Initialize language model with HuggingFace model.
-        
+
         Args:
             config: Configuration dictionary with model settings
         """
         super().__init__()
-        
+
         model_config = config.get("model", {})
         self.model_name = model_config.get("hf_model_name", "gpt2")
         self.max_length = model_config.get("max_length", 512)
-        
+        self.use_chat_template = model_config.get("use_chat_template", False)
+
         # Load HuggingFace model and tokenizer
         self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        
+
         # Set padding token if not exists
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-            
+
         # Get model config
         self.vocab_size = self.model.config.vocab_size
         self.hidden_size = self.model.config.hidden_size
+
+        # Check if model supports chat template
+        self.has_chat_template = hasattr(self.tokenizer, 'apply_chat_template')
     
     def forward(
         self,
@@ -205,11 +209,52 @@ class LanguageModel(nn.Module):
     def get_prompt_length(self, prompt_ids: torch.Tensor) -> int:
         """
         Get the length of prompt in tokens.
-        
+
         Args:
             prompt_ids: Prompt token IDs [batch_size, prompt_len]
-            
+
         Returns:
             Length of prompt
         """
         return prompt_ids.shape[1]
+
+    def format_prompt(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        use_chat_template: Optional[bool] = None
+    ) -> str:
+        """
+        Format prompt using model-specific templates.
+
+        This handles model-specific formatting like chat templates for
+        instruction-tuned models (Qwen-Instruct, Llama-Chat, etc.).
+
+        Args:
+            prompt: The user prompt/question
+            system_prompt: Optional system prompt for chat models
+            use_chat_template: Whether to use chat template (if None, uses self.use_chat_template)
+
+        Returns:
+            Formatted prompt string
+        """
+        use_template = use_chat_template if use_chat_template is not None else self.use_chat_template
+
+        if use_template and self.has_chat_template:
+            # Use the model's built-in chat template
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+
+            # Apply chat template (handles model-specific formatting)
+            formatted = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            return formatted
+        else:
+            # For base models without chat templates, just return the prompt
+            # Task-specific formatting should be done before calling this
+            return prompt

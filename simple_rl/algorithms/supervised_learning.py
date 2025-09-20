@@ -70,6 +70,11 @@ class SupervisedLearning(BaseAlgorithm):
         # Track best model
         self.best_loss = float('inf')
         self.best_accuracy = 0.0
+
+        # Prompt formatting configuration (for language models)
+        formatting_config = config.get("formatting", {}) if config else {}
+        self.system_prompt = formatting_config.get("system_prompt", None)
+        self.task_formatter = formatting_config.get("task_formatter", None)
     
     def train(self, num_episodes: int = None) -> Dict[str, float]:
         """
@@ -229,15 +234,48 @@ class SupervisedLearning(BaseAlgorithm):
         
         return metrics
     
+    def format_prompt(self, prompt: str, use_formatting: bool = True) -> str:
+        """
+        Apply task-specific formatting, then delegate to model's format_prompt if available.
+
+        Args:
+            prompt: Raw prompt text
+            use_formatting: Whether to apply formatting
+
+        Returns:
+            Formatted prompt string
+        """
+        if not use_formatting:
+            return prompt
+
+        # Step 1: Apply task-specific formatting (if configured)
+        formatted = prompt
+        if self.task_formatter is not None:
+            if callable(self.task_formatter):
+                # If task_formatter is a function
+                formatted = self.task_formatter(prompt)
+            elif isinstance(self.task_formatter, str):
+                # If task_formatter is a template string
+                formatted = self.task_formatter.replace("{prompt}", prompt)
+
+        # Step 2: Apply model-specific formatting if model supports it
+        if hasattr(self.model, 'format_prompt'):
+            formatted = self.model.format_prompt(
+                formatted,
+                system_prompt=self.system_prompt
+            )
+
+        return formatted
+
     def set_data(
-        self, 
+        self,
         train_data: Optional[DataLoader] = None,
         val_data: Optional[DataLoader] = None,
         test_data: Optional[DataLoader] = None
     ):
         """
         Set data loaders for training, validation, and testing.
-        
+
         Args:
             train_data: Training DataLoader
             val_data: Validation DataLoader

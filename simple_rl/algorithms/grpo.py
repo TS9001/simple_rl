@@ -104,11 +104,10 @@ class GRPO(BaseAlgorithm):
         self.top_p = training_config.get("top_p", 0.9)
         self.gradient_clip = training_config.get("gradient_clip", 1.0)
         
-        # Generation prompt configuration
-        generation_config = self.config.get("generation", {})
-        self.generation_prompt_template = generation_config.get("prompt_template", None)
-        self.system_prompt = generation_config.get("system_prompt", None)
-        self.response_prefix = generation_config.get("response_prefix", None)
+        # Prompt formatting configuration
+        formatting_config = self.config.get("formatting", {})
+        self.system_prompt = formatting_config.get("system_prompt", None)
+        self.task_formatter = formatting_config.get("task_formatter", None)
         
         # Create optimizer
         self.optimizer = torch.optim.Adam(
@@ -140,47 +139,55 @@ class GRPO(BaseAlgorithm):
     
     def format_prompt(self, prompt: str, use_formatting: bool = True) -> str:
         """
-        Format a prompt with system prompt and template if configured.
-        
+        Apply task-specific formatting, then delegate to model's format_prompt.
+
         Args:
             prompt: Raw prompt text
             use_formatting: Whether to apply formatting
-            
+
         Returns:
             Formatted prompt string
         """
         if not use_formatting:
             return prompt
-            
+
+        # Step 1: Apply task-specific formatting (if configured)
         formatted = prompt
-        if self.generation_prompt_template:
-            formatted = self.generation_prompt_template.replace("{prompt}", formatted)
-        if self.system_prompt:
-            formatted = f"{self.system_prompt}\n\n{formatted}"
-        if self.response_prefix:
-            formatted = f"{formatted}{self.response_prefix}"
+        if self.task_formatter is not None:
+            if callable(self.task_formatter):
+                # If task_formatter is a function
+                formatted = self.task_formatter(prompt)
+            elif isinstance(self.task_formatter, str):
+                # If task_formatter is a template string
+                formatted = self.task_formatter.replace("{prompt}", prompt)
+
+        # Step 2: Apply model-specific formatting (chat templates, etc.)
+        # Delegate to the policy model's format_prompt method
+        if hasattr(self.policy, 'format_prompt'):
+            formatted = self.policy.format_prompt(
+                formatted,
+                system_prompt=self.system_prompt
+            )
+
         return formatted
     
-    def set_generation_prompt(
-        self,
-        system_prompt: Optional[str] = None,
-        prompt_template: Optional[str] = None,
-        response_prefix: Optional[str] = None
-    ):
+    def set_system_prompt(self, system_prompt: str):
         """
-        Update generation prompt configuration.
-        
+        Set the system prompt for chat models.
+
         Args:
-            system_prompt: System prompt to prepend
-            prompt_template: Template with {prompt} placeholder
-            response_prefix: Prefix to append after prompt
+            system_prompt: System prompt text
         """
-        if system_prompt is not None:
-            self.system_prompt = system_prompt
-        if prompt_template is not None:
-            self.generation_prompt_template = prompt_template
-        if response_prefix is not None:
-            self.response_prefix = response_prefix
+        self.system_prompt = system_prompt
+
+    def set_task_formatter(self, formatter):
+        """
+        Set the task-specific formatter.
+
+        Args:
+            formatter: Either a function (prompt -> formatted_prompt) or a template string with {prompt}
+        """
+        self.task_formatter = formatter
     
     def generate_trajectories(
         self,
