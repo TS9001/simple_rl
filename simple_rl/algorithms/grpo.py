@@ -33,7 +33,7 @@ class GRPO(BaseAlgorithm):
         self,
         model: Optional[nn.Module] = None,
         config: Optional[Dict[str, Any]] = None,
-        reward_fn: Optional[Callable[[str, str, Optional[str]], float]] = None,
+        batch_reward_fn: Optional[Callable] | None = None,
         use_wandb: bool = False
     ):
         """
@@ -42,7 +42,7 @@ class GRPO(BaseAlgorithm):
         Args:
             model: Language model for text generation (if None, creates from config)
             config: Configuration dictionary
-            reward_fn: Function to compute rewards (prompt, completion, answer) -> float
+            batch_reward_fn: Function to compute rewards (prompt, completion, answer) -> float
             use_wandb: Whether to use Weights & Biases logging
         """
         # Store config and setup device
@@ -117,7 +117,7 @@ class GRPO(BaseAlgorithm):
         )
         
         # Reward function
-        self.reward_fn = reward_fn or self._default_reward_fn
+        self.batch_reward_fn = batch_reward_fn
         self.old_log_probs = None
         
         # Initialize wandb if requested
@@ -132,12 +132,6 @@ class GRPO(BaseAlgorithm):
         self.total_steps = 0
         self.episode = 0
 
-    def _default_reward_fn(self, prompt: str, completion: str, answer: Optional[str] = None) -> float:
-        """Default reward function based on completion length."""
-        # Simple heuristic: longer completions get higher rewards
-        # This should be replaced with actual reward logic
-        return min(len(completion.split()) / 50.0, 1.0)
-        
     def set_generation_prompt(
         self,
         system_prompt: Optional[str] = None,
@@ -182,7 +176,8 @@ class GRPO(BaseAlgorithm):
         all_log_probs = []
         all_ref_log_probs = []
         all_completion_mask = []
-        # Process each prompt
+        
+        # Process each prompt to generate completions and collect log probs
         for prompt, answer in zip(prompts, answers):
             tokenized = self.policy.tokenize([prompt])
             prompt_ids = tokenized["input_ids"].to(self.device)
@@ -236,16 +231,9 @@ class GRPO(BaseAlgorithm):
             # Create mask for completion tokens only
             completion_mask = generated_mask[:, prompt_length -1 : prompt_length -1 + generated_length]
             
-            # Compute rewards for each completion
-            rewards = []
-            for completion in completions:
-                reward = self.reward_fn(prompt, completion, answer)
-                rewards.append(reward)
-            
-            # Store results
+            # Store results (except rewards - we'll compute those in batch)
             all_prompts.extend([prompt] * self.group_size)
             all_completions.extend(completions)
-            all_rewards.extend(rewards)
             
             # Apply masking to log probs before storing
             policy_log_probs = policy_log_probs * completion_mask
@@ -255,16 +243,21 @@ class GRPO(BaseAlgorithm):
             assert completion_mask.shape == policy_log_probs.shape
             assert policy_log_probs[0].shape[0] == (completion_ids[0].shape[0]) 
 
+            # Compute rewards for this group of completions
+            group_rewards = self.batch_reward_fn(completions, [answer] * self.group_size, self.device)
+            all_rewards.append(group_rewards)  # Append the tensor for this group
+            
             # Store each sample's log probs separately
             for i in range(self.group_size):
                 all_log_probs.append(policy_log_probs[i])
                 all_ref_log_probs.append(ref_log_probs[i])
                 all_completion_mask.append(completion_mask[i])
+        
         # Stack into tensors
         all_log_probs = pad_sequence(all_log_probs, batch_first=True, padding_value=0.0)
         all_ref_log_probs = pad_sequence(all_ref_log_probs, batch_first=True, padding_value=0.0)
         all_completion_mask = pad_sequence(all_completion_mask, batch_first=True, padding_value=0.0)
-        all_rewards = torch.tensor(all_rewards, dtype=torch.float32, device=self.device)
+        all_rewards = torch.cat(all_rewards, dim=0)
 
         return all_prompts, all_completions, all_rewards, all_log_probs, all_ref_log_probs, all_completion_mask
         
@@ -394,7 +387,7 @@ class GRPO(BaseAlgorithm):
         """
         self.policy.train()
         prompts = batch["prompts"]
-        answers = batch.get("answers", None)  # Optional answers for reward computation
+        answers = batch["answers"]  # Optional answers for reward computation
 
         # Generate trajectories
         _, _, rewards, log_probs, ref_log_probs, completion_mask = self.generate_trajectories(
