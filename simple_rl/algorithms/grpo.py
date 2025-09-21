@@ -137,30 +137,7 @@ class GRPO(BaseAlgorithm):
         # Simple heuristic: longer completions get higher rewards
         # This should be replaced with actual reward logic
         return min(len(completion.split()) / 50.0, 1.0)
-    
-    def format_prompt(self, prompt: str, use_formatting: bool = True) -> str:
-        """
-        Format a prompt with system prompt and template if configured.
         
-        Args:
-            prompt: Raw prompt text
-            use_formatting: Whether to apply formatting
-            
-        Returns:
-            Formatted prompt string
-        """
-        if not use_formatting:
-            return prompt
-            
-        formatted = prompt
-        if self.generation_prompt_template:
-            formatted = self.generation_prompt_template.replace("{prompt}", formatted)
-        if self.system_prompt:
-            formatted = f"{self.system_prompt}\n\n{formatted}"
-        if self.response_prefix:
-            formatted = f"{formatted}{self.response_prefix}"
-        return formatted
-    
     def set_generation_prompt(
         self,
         system_prompt: Optional[str] = None,
@@ -206,14 +183,8 @@ class GRPO(BaseAlgorithm):
         all_ref_log_probs = []
         all_completion_mask = []
         # Process each prompt
-        for i, prompt in enumerate(prompts):
-            # Get answer if provided
-            answer = answers[i] if answers else None
-            # Format prompt if configured
-            formatted_prompt = self.format_prompt(prompt, use_formatting)
-            
-            # Tokenize single prompt; we'll sample multiple completions via num_return_sequences
-            tokenized = self.policy.tokenize([formatted_prompt])
+        for prompt, answer in zip(prompts, answers):
+            tokenized = self.policy.tokenize([prompt])
             prompt_ids = tokenized["input_ids"].to(self.device)
             prompt_mask = tokenized["attention_mask"].to(self.device)
             
