@@ -39,6 +39,8 @@ class LanguageModel(nn.Module):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        # Note: We don't set padding_side here - we'll handle it per use case
+
         # Get model config
         self.vocab_size = self.model.config.vocab_size
         self.hidden_size = self.model.config.hidden_size
@@ -82,7 +84,7 @@ class LanguageModel(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate completions for given prompts.
-        
+
         Args:
             prompt_ids: Prompt token IDs [batch_size, prompt_len]
             attention_mask: Attention mask for prompts
@@ -91,10 +93,17 @@ class LanguageModel(nn.Module):
             do_sample: Whether to sample or use greedy decoding
             top_k: Top-k sampling parameter
             top_p: Top-p (nucleus) sampling parameter
-            
+
         Returns:
             Tuple of (generated_ids, attention_mask)
         """
+        # Ensure temperature is valid (avoid division by zero)
+        temperature = max(temperature, 1e-7)
+
+        # If attention mask not provided, create one (all ones for real tokens)
+        if attention_mask is None:
+            attention_mask = torch.ones_like(prompt_ids)
+
         with torch.no_grad():
             outputs = self.model.generate(
                 input_ids=prompt_ids,
@@ -164,20 +173,25 @@ class LanguageModel(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Tokenize text strings.
-        
+
         Args:
             texts: List of text strings
             max_length: Maximum sequence length
             truncation: Whether to truncate
             padding: Whether to pad
             return_tensors: Return type ("pt" for PyTorch tensors)
-            
+
         Returns:
             Dictionary with input_ids and attention_mask
         """
         if max_length is None:
             max_length = self.max_length
-            
+
+        # For generation, we typically don't want padding
+        # If padding is needed, use right padding for better generation
+        if padding:
+            self.tokenizer.padding_side = "right"
+
         return self.tokenizer(
             texts,
             max_length=max_length,

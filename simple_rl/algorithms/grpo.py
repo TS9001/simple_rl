@@ -200,107 +200,150 @@ class GRPO(BaseAlgorithm):
         use_formatting: bool = True
     ) -> Tuple[List[str], List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Generate trajectories for a batch of prompts.
-        
+        Generate trajectories for a batch of prompts - now processes all prompts at once.
+
         Args:
             prompts: List of prompt strings
             answers: Optional list of correct answers for reward computation
             use_formatting: Whether to apply prompt formatting
-            
+
         Returns:
             Tuple of (prompts, completions, rewards, log_probs, ref_log_probs, completion_mask)
         """
-        all_prompts = []
-        all_completions = []
-        all_rewards = []
+        # Format all prompts at once
+        formatted_prompts = [self.format_prompt(prompt, use_formatting) for prompt in prompts]
+
+        # Tokenize all prompts together
+        tokenized = self.policy.tokenize(formatted_prompts)
+        prompt_ids = tokenized["input_ids"].to(self.device)
+        prompt_mask = tokenized["attention_mask"].to(self.device)
+
+        batch_size = len(prompts)
+        total_sequences = batch_size * self.group_size
+
+        # Generate all completions in batch
+        prev = self.policy.training
+        self.policy.eval()
+
+        with torch.no_grad():
+            generated_ids, generated_mask = self.policy.generate(
+                prompt_ids,
+                attention_mask=prompt_mask,
+                max_new_tokens=self.max_new_tokens,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                num_return_sequences=self.group_size,
+                min_new_tokens=1,
+            )
+
+        self.policy.train(prev)
+
+        # Get prompt lengths and expand for all generated sequences
+        # Each prompt generates group_size sequences
+        prompt_lengths_original = (prompt_mask.sum(dim=1)).cpu().numpy()
+        prompt_lengths = np.repeat(prompt_lengths_original, self.group_size)
+
+        # Compute log probabilities for all sequences at once
+        prev_mode = self.policy.training
+        self.policy.eval()
+        with torch.enable_grad():
+            policy_log_probs_full = self.policy.compute_log_probs(
+                generated_ids,
+                attention_mask=generated_mask,
+                target_mask=None
+            )
+        if prev_mode:
+            self.policy.train()
+
+        # Compute reference log probabilities
+        with torch.no_grad():
+            ref_log_probs_full = self.ref_policy.compute_log_probs(
+                generated_ids,
+                attention_mask=generated_mask,
+                target_mask=None
+            )
+
+        # Batch decode all completions at once
+        # First, extract all completion token IDs efficiently
+        all_completion_ids = []
+        for seq_idx in range(total_sequences):
+            prompt_len = prompt_lengths[seq_idx]
+            completion_ids = generated_ids[seq_idx, prompt_len:]
+            all_completion_ids.append(completion_ids)
+
+        # Stack completions and decode them all at once
+        completion_ids_padded = pad_sequence(all_completion_ids, batch_first=True, padding_value=self.policy.tokenizer.pad_token_id)
+        all_completions_raw = self.policy.decode(completion_ids_padded, skip_special_tokens=True)
+
+        # Vectorized extraction of log probs for completion tokens
+        # Create indices for extracting completion log probs
+        max_seq_len = policy_log_probs_full.shape[1]
+
+        # Build index masks for completion tokens
+        seq_range = torch.arange(max_seq_len, device=self.device).unsqueeze(0).expand(total_sequences, -1)
+        prompt_lens_tensor = torch.tensor(prompt_lengths, device=self.device).unsqueeze(1)
+
+        # Mask for completion positions (accounting for shift in log probs)
+        completion_mask_full = (seq_range >= (prompt_lens_tensor - 1)) & (seq_range < (generated_mask.sum(dim=1).unsqueeze(1) - 1))
+
+        # Apply mask to get completion log probs
+        policy_log_probs_masked = policy_log_probs_full * completion_mask_full.float()
+        ref_log_probs_masked = ref_log_probs_full * completion_mask_full.float()
+
+        # Extract individual sequences for padding (still needed due to variable lengths)
+        # Since min_new_tokens=1, we always have completions
         all_log_probs = []
         all_ref_log_probs = []
         all_completion_mask = []
-        # Process each prompt
-        for i, prompt in enumerate(prompts):
-            # Get answer if provided
-            answer = answers[i] if answers else None
-            # Format prompt if configured
-            formatted_prompt = self.format_prompt(prompt, use_formatting)
-            
-            # Tokenize single prompt; we'll sample multiple completions via num_return_sequences
-            tokenized = self.policy.tokenize([formatted_prompt])
-            prompt_ids = tokenized["input_ids"].to(self.device)
-            prompt_mask = tokenized["attention_mask"].to(self.device)
-            
-            # Generate completions
-            prev = self.policy.training
-            self.policy.eval()
-            with torch.no_grad():
-                generated_ids, generated_mask = self.policy.generate(
-                    prompt_ids, attention_mask=prompt_mask,
-                    max_new_tokens=self.max_new_tokens,
-                    temperature=self.temperature,
-                    top_k=self.top_k, top_p=self.top_p,
-                    num_return_sequences=self.group_size,
-                    min_new_tokens=1,  # also avoids empty completion windows
-                )
-            self.policy.train(prev)
-            
-            # Get prompt length to extract completions
-            prompt_length = prompt_ids.shape[1]
-            generated_length = generated_ids.shape[1] - prompt_length
-            # Decode completions
-            completion_ids = generated_ids[:, prompt_length:]
-            completions = self.policy.decode(completion_ids)
 
-            # Compute log probabilities for policy (only for completion tokens)
-            prev_mode = self.policy.training
-            self.policy.eval()
-            with torch.enable_grad():  # Ensure gradients are enabled for policy
-                policy_log_probs = self.policy.compute_log_probs(
-                    generated_ids,
-                    attention_mask=generated_mask,
-                    target_mask=None  # Let the model handle masking internally
-                )
-                # Extract only completion log probs (account for shift by 1)
-                policy_log_probs = policy_log_probs[:, prompt_length -1 : prompt_length -1 + generated_length]
-            if prev_mode:
-                self.policy.train()
+        # Compute all completion lengths at once
+        completion_ends = generated_mask.sum(dim=1).cpu().numpy()
+        completion_lengths = completion_ends - prompt_lengths
 
-            # Compute log probabilities for reference model
-            with torch.no_grad():
-                ref_log_probs = self.ref_policy.compute_log_probs(
-                    generated_ids,
-                    attention_mask=generated_mask,
-                    target_mask=None
-                )
-                # Extract only completion log probs (account for shift by 1)
-                ref_log_probs = ref_log_probs[:, prompt_length -1 : prompt_length -1 + generated_length]
-            generated_mask = generated_mask[:, 1:]
-            # Create mask for completion tokens only
-            completion_mask = generated_mask[:, prompt_length -1 : prompt_length -1 + generated_length]
-            
-            # Compute rewards for each completion
-            rewards = []
-            for completion in completions:
-                reward = self.reward_fn(prompt, completion, answer)
-                rewards.append(reward)
-            
-            # Store results
-            all_prompts.extend([prompt] * self.group_size)
-            all_completions.extend(completions)
-            all_rewards.extend(rewards)
-            
-            # Apply masking to log probs before storing
-            policy_log_probs = policy_log_probs * completion_mask
-            ref_log_probs = ref_log_probs * completion_mask
+        for seq_idx in range(total_sequences):
+            prompt_len = prompt_lengths[seq_idx]
+            actual_completion_len = completion_lengths[seq_idx]
 
-            assert policy_log_probs.shape == ref_log_probs.shape
-            assert completion_mask.shape == policy_log_probs.shape
-            assert policy_log_probs[0].shape[0] == (completion_ids[0].shape[0]) 
+            start_idx = prompt_len - 1
+            end_idx = start_idx + actual_completion_len
 
-            # Store each sample's log probs separately
-            for i in range(self.group_size):
-                all_log_probs.append(policy_log_probs[i])
-                all_ref_log_probs.append(ref_log_probs[i])
-                all_completion_mask.append(completion_mask[i])
-        # Stack into tensors
+            policy_log_probs = policy_log_probs_masked[seq_idx, start_idx:end_idx]
+            ref_log_probs = ref_log_probs_masked[seq_idx, start_idx:end_idx]
+            mask = completion_mask_full[seq_idx, start_idx:end_idx].float()
+
+            all_log_probs.append(policy_log_probs)
+            all_ref_log_probs.append(ref_log_probs)
+            all_completion_mask.append(mask)
+
+        # Process completions and compute rewards
+        # Clean completions by removing the prompt part from decoded text
+        all_completions = []
+        all_rewards = []
+        all_prompts = []
+
+        for seq_idx in range(total_sequences):
+            prompt_idx = seq_idx // self.group_size
+            prompt = prompts[prompt_idx]
+            answer = answers[prompt_idx] if answers else None
+
+            # Get the decoded completion (already has prompt tokens masked)
+            completion = all_completions_raw[seq_idx].strip()
+
+            # Further clean if needed (remove any remaining prompt text)
+            # This is faster than individual decode calls
+            formatted_prompt = formatted_prompts[prompt_idx]
+            if completion.startswith(formatted_prompt):
+                completion = completion[len(formatted_prompt):].strip()
+
+            # Compute reward
+            reward = self.reward_fn(prompt, completion, answer)
+
+            all_prompts.append(prompt)
+            all_completions.append(completion)
+            all_rewards.append(reward)
+
+        # Pad and stack tensors
         all_log_probs = pad_sequence(all_log_probs, batch_first=True, padding_value=0.0)
         all_ref_log_probs = pad_sequence(all_ref_log_probs, batch_first=True, padding_value=0.0)
         all_completion_mask = pad_sequence(all_completion_mask, batch_first=True, padding_value=0.0)
