@@ -103,6 +103,7 @@ class GRPO(BaseAlgorithm):
         self.top_k = training_config.get("top_k", None)
         self.top_p = training_config.get("top_p", 0.9)
         self.gradient_clip = training_config.get("gradient_clip", 1.0)
+        self.gradient_accumulation_steps = training_config.get("gradient_accumulation_steps", 1)
         
         # Prompt formatting configuration
         formatting_config = self.config.get("formatting", {})
@@ -130,6 +131,9 @@ class GRPO(BaseAlgorithm):
         # Training statistics
         self.total_steps = 0
         self.episode = 0
+
+        # Initialize gradients to zero for accumulation
+        self.optimizer.zero_grad()
 
     def _default_reward_fn(self, prompt: str, completion: str, answer: Optional[str] = None) -> float:
         """Default reward function based on completion length."""
@@ -366,12 +370,13 @@ class GRPO(BaseAlgorithm):
         
         return loss, metrics
 
-    def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
+    def train_step(self, batch: Dict[str, Any], accumulation_step: int = 0) -> Dict[str, float]:
         """
-        Perform a single training step.
+        Perform a single training step with gradient accumulation support.
 
         Args:
             batch: Dictionary with 'prompts' and optionally 'answers' keys
+            accumulation_step: Current step in gradient accumulation (0-indexed)
 
         Returns:
             Dictionary of training metrics
@@ -384,37 +389,45 @@ class GRPO(BaseAlgorithm):
         _, _, rewards, log_probs, ref_log_probs, completion_mask = self.generate_trajectories(
             prompts, answers=answers
         )
-        
+
         # Compute advantages
         advantages = self.compute_advantages(rewards)
-        
+
         # Compute loss
         loss, metrics = self.compute_loss(log_probs, advantages, ref_log_probs, completion_mask)
-        
-        # Backward pass
-        self.optimizer.zero_grad()
+
+        # Scale loss by accumulation steps to maintain effective learning rate
+        loss = loss / self.gradient_accumulation_steps
+
+        # Backward pass (accumulate gradients)
         loss.backward()
-        
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=self.gradient_clip)
-        
-        self.optimizer.step()
-        
+
+        # Only update weights after accumulating gradients
+        if (accumulation_step + 1) % self.gradient_accumulation_steps == 0:
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=self.gradient_clip)
+
+            # Optimizer step
+            self.optimizer.step()
+
+            # Clear gradients for next accumulation
+            self.optimizer.zero_grad()
+
+            # Update statistics only on actual updates
+            self.total_steps += 1
+
         # Update old log probs
         self.old_log_probs = log_probs.detach()
-        
-        # Update statistics
-        self.total_steps += 1
-        
-        # Add rewards to metrics
+
+        # Add rewards to metrics (scale back the loss for reporting)
         metrics["reward_mean"] = rewards.mean().item()
         metrics["reward_std"] = rewards.std().item()
-        metrics["total_loss"] = loss.item()
-        
-        # Log to wandb if enabled
-        if self.use_wandb:
+        metrics["total_loss"] = (loss * self.gradient_accumulation_steps).item()
+
+        # Log to wandb if enabled and on actual update step
+        if self.use_wandb and (accumulation_step + 1) % self.gradient_accumulation_steps == 0:
             wandb.log(metrics, step=self.total_steps)
-        
+
         return metrics
     
     def train(self, num_episodes: int) -> Dict[str, float]:
