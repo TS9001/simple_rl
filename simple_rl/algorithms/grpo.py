@@ -340,58 +340,6 @@ class GRPO(BaseAlgorithm):
         
         return advantages
     
-    # def compute_loss(
-    #     self,
-    #     log_probs: torch.Tensor,
-    #     advantages: torch.Tensor,
-    #     ref_log_probs: torch.Tensor,
-    #     old_log_probs: torch.Tensor | None = None
-    # ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    #     """
-    #     Compute GRPO loss.
-        
-    #     Args:
-    #         log_probs: Policy log probabilities [batch_size, seq_len]
-    #         advantages: Advantages [batch_size]
-    #         ref_log_probs: Reference log probabilities [batch_size, seq_len]
-            
-    #     Returns:
-    #         Tuple of (loss, metrics_dict)
-    #     """
-    #     # Sum log probs across sequence
-    #     log_probs_sum = log_probs.sum(dim=-1)
-    #     ref_log_probs_sum = ref_log_probs.sum(dim=-1)
-        
-    #     advantages = advantages.detach()
-    #     # Policy gradient loss
-    #     if False and old_log_probs is not None: # TODO PUT MULTIEPOCH TRAINING HERE
-    #         # PPO-style clipping
-    #         ratio = torch.exp(log_probs_sum - old_log_probs.sum(dim=-1).detach())
-    #         clipped_ratio = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon)
-            
-    #         pg_loss = -torch.min(
-    #             ratio * advantages,
-    #             clipped_ratio * advantages
-    #         ).mean()
-    #     else:
-    #         pg_loss = -(log_probs_sum * advantages).mean()
-        
-    #     # KL divergence for monitoring
-    #     kl_div = (log_probs_sum - ref_log_probs_sum.detach()).mean()
-
-    #     # Total loss with KL penalty
-    #     loss = pg_loss + (self.kl_coef * kl_div)
-        
-    #     # Metrics for logging
-    #     metrics = {
-    #         "pg_loss": pg_loss.item(),
-    #         "kl_divergence": kl_div.item(),
-    #         "advantages_mean": advantages.mean().item(),
-    #         "advantages_std": advantages.std().item(),
-    #     }
-        
-    #     return loss, metrics
-    
     def compute_loss(self, log_probs, advantages, ref_log_probs, completion_mask):
 
         # Get sequence-level log probabilities by summing
