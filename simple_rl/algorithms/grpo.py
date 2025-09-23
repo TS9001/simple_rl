@@ -410,7 +410,8 @@ class GRPO(BaseAlgorithm):
         self.optimizer.step()
         
         # Update old log probs
-        self.old_log_probs = log_probs.detach()
+        # TODO ENABLE IN FUTURE ONCE BATCH PROCESSING IS THERE
+        #self.old_log_probs = log_probs.detach()
         
         # Update statistics
         self.total_steps += 1
