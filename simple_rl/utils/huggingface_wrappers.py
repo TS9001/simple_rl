@@ -27,7 +27,7 @@ class LanguageModel(nn.Module):
         super().__init__()
         
         model_config = config.get("model", {})
-        self.model_name = model_config.get("hf_model_name", "gpt2")
+        self.model_name = model_config.get("model_name")
         self.max_length = model_config.get("max_length", 512)
         
         # Load HuggingFace model and tokenizer

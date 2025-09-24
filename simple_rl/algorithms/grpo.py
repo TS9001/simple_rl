@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from typing import Dict, Any, List, Optional, Tuple, Callable, Union
 import numpy as np
+import math
 import copy
 from pathlib import Path
 import wandb
@@ -31,7 +32,6 @@ class GRPO(BaseAlgorithm):
     
     def __init__(
         self,
-        model: Optional[nn.Module] = None,
         config: Optional[Dict[str, Any]] = None,
         batch_reward_fn: Optional[Callable] | None = None,
         use_wandb: bool = False
@@ -40,7 +40,6 @@ class GRPO(BaseAlgorithm):
         Initialize GRPO algorithm.
         
         Args:
-            model: Language model for text generation (if None, creates from config)
             config: Configuration dictionary
             batch_reward_fn: Function to compute rewards (prompt, completion, answer) -> float
             use_wandb: Whether to use Weights & Biases logging
@@ -57,14 +56,11 @@ class GRPO(BaseAlgorithm):
             self.device = torch.device("cpu")
         
         # Initialize or create model
-        if model is None:
-            if not config:
-                raise ValueError("Either model or config must be provided")
-            self.policy = LanguageModel(config)
-        elif isinstance(model, LanguageModel):
-            self.policy = model
-        else:
-            self.policy = LanguageModel(config)
+        
+        if not config:
+            raise ValueError("Either model or config must be provided")
+
+        self.policy = LanguageModel(config)
         
         # Move policy to device
         self.policy = self.policy.to(self.device)
@@ -93,11 +89,15 @@ class GRPO(BaseAlgorithm):
         self.kl_coef = algo_config.get("kl_coef", 0.05)
         self.normalize_rewards = algo_config.get("normalize_rewards", True)
         self.clip_epsilon = algo_config.get("clip_epsilon", 0.2)
+        self.store_completions = algo_config.get("store_completions", True)
 
         # Training parameters
         training_config = self.config.get("training", {})
         self.learning_rate = training_config.get("learning_rate", 1e-5)
         self.batch_size = training_config.get("batch_size", 8)
+        self.minibatch_size = training_config.get("minibatch_size", self.batch_size)
+        if self.minibatch_size in (None, 0):
+            self.minibatch_size = self.batch_size
         self.max_new_tokens = training_config.get("max_new_tokens", 128)
         self.temperature = training_config.get("temperature", 0.9)
         self.top_k = training_config.get("top_k", None)
@@ -157,8 +157,9 @@ class GRPO(BaseAlgorithm):
         self,
         prompts: List[str],
         answers: Optional[List[str]] = None,
-        use_formatting: bool = True
-    ) -> Tuple[List[str], List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        use_formatting: bool = True,
+        store_outputs: Optional[bool] = None,
+    ) -> Tuple[Optional[List[str]], Optional[List[str]], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Generate trajectories for a batch of prompts.
         
@@ -166,12 +167,14 @@ class GRPO(BaseAlgorithm):
             prompts: List of prompt strings
             answers: Optional list of correct answers for reward computation
             use_formatting: Whether to apply prompt formatting
+            store_outputs: Override flag controlling whether decoded prompts/completions are returned
             
         Returns:
             Tuple of (prompts, completions, rewards, log_probs, ref_log_probs, completion_mask)
         """
-        all_prompts = []
-        all_completions = []
+        store = self.store_completions if store_outputs is None else store_outputs
+        all_prompts = [] if store else None
+        all_completions = [] if store else None
         all_rewards = []
         all_log_probs = []
         all_ref_log_probs = []
@@ -208,11 +211,18 @@ class GRPO(BaseAlgorithm):
             prev_mode = self.policy.training
             self.policy.eval()
             with torch.enable_grad():  # Ensure gradients are enabled for policy
-                policy_log_probs = self.policy.compute_log_probs(
-                    generated_ids,
-                    attention_mask=generated_mask,
-                    target_mask=None  # Let the model handle masking internally
-                )
+                prev_cache = getattr(self.policy.model.config, "use_cache", None)
+                if prev_cache is not None:
+                    self.policy.model.config.use_cache = False
+                try:
+                    policy_log_probs = self.policy.compute_log_probs(
+                        generated_ids,
+                        attention_mask=generated_mask,
+                        target_mask=None  # Let the model handle masking internally
+                    )
+                finally:
+                    if prev_cache is not None:
+                        self.policy.model.config.use_cache = prev_cache
                 # Extract only completion log probs (account for shift by 1)
                 policy_log_probs = policy_log_probs[:, prompt_length -1 : prompt_length -1 + generated_length]
             if prev_mode:
@@ -220,11 +230,18 @@ class GRPO(BaseAlgorithm):
 
             # Compute log probabilities for reference model
             with torch.no_grad():
-                ref_log_probs = self.ref_policy.compute_log_probs(
-                    generated_ids,
-                    attention_mask=generated_mask,
-                    target_mask=None
-                )
+                prev_cache = getattr(self.ref_policy.model.config, "use_cache", None)
+                if prev_cache is not None:
+                    self.ref_policy.model.config.use_cache = False
+                try:
+                    ref_log_probs = self.ref_policy.compute_log_probs(
+                        generated_ids,
+                        attention_mask=generated_mask,
+                        target_mask=None
+                    )
+                finally:
+                    if prev_cache is not None:
+                        self.ref_policy.model.config.use_cache = prev_cache
                 # Extract only completion log probs (account for shift by 1)
                 ref_log_probs = ref_log_probs[:, prompt_length -1 : prompt_length -1 + generated_length]
             generated_mask = generated_mask[:, 1:]
@@ -232,8 +249,9 @@ class GRPO(BaseAlgorithm):
             completion_mask = generated_mask[:, prompt_length -1 : prompt_length -1 + generated_length]
             
             # Store results (except rewards - we'll compute those in batch)
-            all_prompts.extend([prompt] * self.group_size)
-            all_completions.extend(completions)
+            if store:
+                all_prompts.extend([prompt] * self.group_size)
+                all_completions.extend(completions)
             
             # Apply masking to log probs before storing
             policy_log_probs = policy_log_probs * completion_mask
@@ -259,7 +277,9 @@ class GRPO(BaseAlgorithm):
         all_completion_mask = pad_sequence(all_completion_mask, batch_first=True, padding_value=0.0)
         all_rewards = torch.cat(all_rewards, dim=0)
 
-        return all_prompts, all_completions, all_rewards, all_log_probs, all_ref_log_probs, all_completion_mask
+        if store:
+            return all_prompts, all_completions, all_rewards, all_log_probs, all_ref_log_probs, all_completion_mask
+        return None, None, all_rewards, all_log_probs, all_ref_log_probs, all_completion_mask
         
     def compute_advantages(
         self,
@@ -297,58 +317,6 @@ class GRPO(BaseAlgorithm):
         
         return advantages
     
-    # def compute_loss(
-    #     self,
-    #     log_probs: torch.Tensor,
-    #     advantages: torch.Tensor,
-    #     ref_log_probs: torch.Tensor,
-    #     old_log_probs: torch.Tensor | None = None
-    # ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    #     """
-    #     Compute GRPO loss.
-        
-    #     Args:
-    #         log_probs: Policy log probabilities [batch_size, seq_len]
-    #         advantages: Advantages [batch_size]
-    #         ref_log_probs: Reference log probabilities [batch_size, seq_len]
-            
-    #     Returns:
-    #         Tuple of (loss, metrics_dict)
-    #     """
-    #     # Sum log probs across sequence
-    #     log_probs_sum = log_probs.sum(dim=-1)
-    #     ref_log_probs_sum = ref_log_probs.sum(dim=-1)
-        
-    #     advantages = advantages.detach()
-    #     # Policy gradient loss
-    #     if False and old_log_probs is not None: # TODO PUT MULTIEPOCH TRAINING HERE
-    #         # PPO-style clipping
-    #         ratio = torch.exp(log_probs_sum - old_log_probs.sum(dim=-1).detach())
-    #         clipped_ratio = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon)
-            
-    #         pg_loss = -torch.min(
-    #             ratio * advantages,
-    #             clipped_ratio * advantages
-    #         ).mean()
-    #     else:
-    #         pg_loss = -(log_probs_sum * advantages).mean()
-        
-    #     # KL divergence for monitoring
-    #     kl_div = (log_probs_sum - ref_log_probs_sum.detach()).mean()
-
-    #     # Total loss with KL penalty
-    #     loss = pg_loss + (self.kl_coef * kl_div)
-        
-    #     # Metrics for logging
-    #     metrics = {
-    #         "pg_loss": pg_loss.item(),
-    #         "kl_divergence": kl_div.item(),
-    #         "advantages_mean": advantages.mean().item(),
-    #         "advantages_std": advantages.std().item(),
-    #     }
-        
-    #     return loss, metrics
-    
     def compute_loss(self, log_probs, advantages, ref_log_probs, completion_mask):
 
         # Get sequence-level log probabilities by summing
@@ -377,7 +345,7 @@ class GRPO(BaseAlgorithm):
 
     def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
         """
-        Perform a single training step.
+        Perform a single training step with gradient accumulation.
 
         Args:
             batch: Dictionary with 'prompts' and optionally 'answers' keys
@@ -389,42 +357,88 @@ class GRPO(BaseAlgorithm):
         prompts = batch["prompts"]
         answers = batch["answers"]  # Optional answers for reward computation
 
-        # Generate trajectories
-        _, _, rewards, log_probs, ref_log_probs, completion_mask = self.generate_trajectories(
-            prompts, answers=answers
-        )
-        
-        # Compute advantages
-        advantages = self.compute_advantages(rewards)
-        
-        # Compute loss
-        loss, metrics = self.compute_loss(log_probs, advantages, ref_log_probs, completion_mask)
-        
-        # Backward pass
+        # Calculate number of accumulation steps (ceil to cover partial minibatches)
+        num_accumulation_steps = max(1, math.ceil(len(prompts) / self.minibatch_size))
+
+        # Zero gradients at the start
         self.optimizer.zero_grad()
-        loss.backward()
-        
-        # Gradient clipping
+
+        # Accumulate metrics across minibatches
+        total_loss = 0.0
+        total_pg_loss = 0.0
+        total_kl = 0.0
+        total_reward_mean = 0.0
+        total_reward_std = 0.0
+        total_tokens = 0
+
+        # Total sequences across full batch (each prompt yields group_size sequences)
+        total_sequences = len(prompts) * self.group_size
+
+        # Process minibatches
+        for i in range(0, len(prompts), self.minibatch_size):
+            end_idx = min(i + self.minibatch_size, len(prompts))
+            mb_prompts = prompts[i:end_idx]
+            mb_answers = answers[i:end_idx] if answers else None
+
+            # Generate trajectories for this minibatch
+            prompts_out, completions_out, rewards, log_probs, ref_log_probs, completion_mask = self.generate_trajectories(
+                mb_prompts, answers=mb_answers, store_outputs=self.store_completions
+            )
+
+            # Compute advantages
+            advantages = self.compute_advantages(rewards)
+
+            # Compute loss
+            loss, mb_metrics = self.compute_loss(log_probs, advantages, ref_log_probs, completion_mask)
+
+            # Weight loss by fraction of sequences in this minibatch for proper averaging
+            mb_sequences = len(mb_prompts) * self.group_size
+            weight = mb_sequences / max(1, total_sequences)
+            scaled_loss = loss * weight
+
+            # Backward pass (accumulate gradients)
+            scaled_loss.backward()
+
+            # Accumulate metrics (use weighted values to match actual training)
+            total_loss += scaled_loss.item()
+            total_pg_loss += mb_metrics["pg_loss"] * weight
+            total_kl += mb_metrics["kl_divergence"] * weight
+            total_reward_mean += rewards.mean().item() * weight
+            total_reward_std += rewards.std().item() * weight
+            total_tokens += mb_metrics.get("tokens_generated", 0)
+
+            # Clean up intermediate tensors to prevent memory buildup
+            if self.store_completions:
+                del prompts_out, completions_out
+            del rewards, log_probs, ref_log_probs, completion_mask, advantages, loss, scaled_loss
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+            elif torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Gradient clipping on accumulated gradients
         torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=self.gradient_clip)
-        
+
+        # Update parameters
         self.optimizer.step()
-        
-        # Update old log probs
-        # TODO ENABLE IN FUTURE ONCE BATCH PROCESSING IS THERE
-        #self.old_log_probs = log_probs.detach()
-        
+
         # Update statistics
         self.total_steps += 1
-        
-        # Add rewards to metrics
-        metrics["reward_mean"] = rewards.mean().item()
-        metrics["reward_std"] = rewards.std().item()
-        metrics["total_loss"] = loss.item()
-        
+
+        # Aggregate metrics (we used weighted accumulation, so values are already averaged)
+        metrics = {
+            "total_loss": total_loss,
+            "pg_loss": total_pg_loss,
+            "kl_divergence": total_kl,
+            "reward_mean": total_reward_mean,
+            "reward_std": total_reward_std,
+            "tokens_generated": total_tokens,  # Total tokens, not averaged
+        }
+
         # Log to wandb if enabled
         if self.use_wandb:
             wandb.log(metrics, step=self.total_steps)
-        
+
         return metrics
     
     def train(self, num_episodes: int) -> Dict[str, float]:
@@ -447,9 +461,8 @@ class GRPO(BaseAlgorithm):
             # Generate random prompts for demo (replace with actual data)
             prompts = [f"Question {i}: What is {i}+{i}?" for i in range(self.batch_size)]
 
-            # Minibatch training within an episode
+            # Training with gradient accumulation
             training_cfg = self.config.get("training", {})
-            minibatch_size = training_cfg.get("minibatch_size", self.batch_size)
             update_epochs = training_cfg.get("update_epochs", 1)
 
             total_loss = 0.0
@@ -457,35 +470,33 @@ class GRPO(BaseAlgorithm):
             total_kl = 0.0
             total_reward_mean = 0.0
             total_reward_std = 0.0
-            num_updates = 0
+            total_tokens = 0.0
 
             for _ in range(update_epochs):
                 # Shuffle prompts each epoch
                 perm = torch.randperm(len(prompts)).tolist()
                 shuffled_prompts = [prompts[idx] for idx in perm]
 
-                for start in range(0, len(shuffled_prompts), minibatch_size):
-                    end = min(start + minibatch_size, len(shuffled_prompts))
-                    mb_prompts = shuffled_prompts[start:end]
-                    batch = {"prompts": mb_prompts}
-                    metrics = self.train_step(batch)
+                # Process entire batch with gradient accumulation
+                batch = {"prompts": shuffled_prompts}
+                metrics = self.train_step(batch)
 
-                    total_loss += metrics["total_loss"]
-                    total_pg_loss += metrics["pg_loss"]
-                    total_kl += metrics["kl_divergence"]
-                    total_reward_mean += metrics["reward_mean"]
-                    total_reward_std += metrics.get("reward_std", 0.0)
-                    num_updates += 1
+                total_loss += metrics["total_loss"]
+                total_pg_loss += metrics["pg_loss"]
+                total_kl += metrics["kl_divergence"]
+                total_reward_mean += metrics["reward_mean"]
+                total_reward_std += metrics.get("reward_std", 0.0)
+                total_tokens += metrics.get("tokens_generated", 0.0)
 
-            # Average metrics over minibatches/epochs
-            if num_updates > 0:
-                metrics = {
-                    "total_loss": total_loss / num_updates,
-                    "pg_loss": total_pg_loss / num_updates,
-                    "kl_divergence": total_kl / num_updates,
-                    "reward_mean": total_reward_mean / num_updates,
-                    "reward_std": total_reward_std / num_updates,
-                }
+            # Average metrics over epochs
+            metrics = {
+                "total_loss": total_loss / update_epochs,
+                "pg_loss": total_pg_loss / update_epochs,
+                "kl_divergence": total_kl / update_epochs,
+                "reward_mean": total_reward_mean / update_epochs,
+                "reward_std": total_reward_std / update_epochs,
+                "tokens_generated": total_tokens / update_epochs,
+            }
             
             # Print progress
             if episode % max(1, num_episodes // 10) == 0:
