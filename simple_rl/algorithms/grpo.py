@@ -233,14 +233,18 @@ class GRPO(BaseAlgorithm):
             )
 
         print("-" * 120)
-        print(f"SUMMARY: Total execution time: {total_time:.6f}s | Total operations: {total_calls} | Operations tracked: {len(timing_stats)}")
+        print(
+            f"SUMMARY: Total execution time: {total_time:.6f}s | Total operations: {total_calls} | Operations tracked: {len(timing_stats)}"
+        )
 
         # Additional technical metrics
         if len(timing_stats) > 0:
             times_per_op = [stats["mean"] for stats in timing_stats.values()]
-            print(f"STATS: Mean operation time: {np.mean(times_per_op):.6f}s | "
-                  f"Operation time stddev: {np.std(times_per_op):.6f}s | "
-                  f"Slowest operation: {max(timing_stats.keys(), key=lambda x: timing_stats[x]['total'])}")
+            print(
+                f"STATS: Mean operation time: {np.mean(times_per_op):.6f}s | "
+                f"Operation time stddev: {np.std(times_per_op):.6f}s | "
+                f"Slowest operation: {max(timing_stats.keys(), key=lambda x: timing_stats[x]['total'])}"
+            )
         print()
 
     def reset_timings(self):
@@ -286,8 +290,8 @@ class GRPO(BaseAlgorithm):
         for prompt, answer in zip(prompts, answers):
             self._start_timer("tokenization")
             tokenized = self.policy.tokenize([prompt])
-            prompt_ids = tokenized["input_ids"].to(self.device)
-            prompt_mask = tokenized["attention_mask"].to(self.device)
+            prompt_ids = tokenized["input_ids"]
+            prompt_mask = tokenized["attention_mask"]
             self._end_timer("tokenization")
 
             # Generate completions

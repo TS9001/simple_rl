@@ -43,6 +43,11 @@ class LanguageModel(nn.Module):
         self.vocab_size = self.model.config.vocab_size
         self.hidden_size = self.model.config.hidden_size
 
+    @property
+    def device(self) -> torch.device:
+        """Get the device of the model."""
+        return next(self.model.parameters()).device
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -108,8 +113,12 @@ class LanguageModel(nn.Module):
 
         generated_ids = outputs.sequences
 
-        # Create attention mask for generated sequence
-        generated_attention_mask = (generated_ids != self.tokenizer.pad_token_id).long()
+        # Create attention mask for generated sequence (ensure it's on the same device)
+        generated_attention_mask = (
+            (generated_ids != self.tokenizer.pad_token_id)
+            .long()
+            .to(generated_ids.device)
+        )
 
         return generated_ids, generated_attention_mask
 
@@ -154,6 +163,7 @@ class LanguageModel(nn.Module):
         truncation: bool = True,
         padding: bool = True,
         return_tensors: str = "pt",
+        return_device: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Tokenize text strings.
@@ -164,6 +174,7 @@ class LanguageModel(nn.Module):
             truncation: Whether to truncate
             padding: Whether to pad
             return_tensors: Return type ("pt" for PyTorch tensors)
+            return_device: Whether to move tensors to model device
 
         Returns:
             Dictionary with input_ids and attention_mask
@@ -171,13 +182,19 @@ class LanguageModel(nn.Module):
         if max_length is None:
             max_length = self.max_length
 
-        return self.tokenizer(
+        tokenized = self.tokenizer(
             texts,
             max_length=max_length,
             truncation=truncation,
             padding=padding,
             return_tensors=return_tensors,
         )
+
+        # Move tensors to model device if requested
+        if return_device and return_tensors == "pt":
+            tokenized = {k: v.to(self.device) for k, v in tokenized.items()}
+
+        return tokenized
 
     def decode(
         self, token_ids: torch.Tensor, skip_special_tokens: bool = True
