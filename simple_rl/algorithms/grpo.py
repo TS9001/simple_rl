@@ -289,6 +289,88 @@ class GRPO(BaseAlgorithm):
         # Create mask: 1 for positions <= first EOS, 0 for positions after EOS
         return (sequence_indices <= eos_idx.unsqueeze(1)).float()
 
+    def _generate_grouped_completions(
+        self, prompts: List[str]
+    ) -> Dict[str, torch.Tensor]:
+        """Generate interleaved completions for a batch of prompts."""
+
+        self._start_timer("batch_tokenization")
+        tokenized = self.policy.tokenize(prompts, padding_side="left")
+        batch_prompt_ids = tokenized["input_ids"].to(self.device)
+        batch_prompt_mask = tokenized["attention_mask"].to(self.device)
+        self._end_timer("batch_tokenization")
+
+        self._start_timer("prompt_replication")
+        num_prompts = len(prompts)
+        total_sequences = num_prompts * self.group_size
+
+        replicated_prompt_ids = batch_prompt_ids.repeat_interleave(
+            self.group_size, dim=0
+        )
+        replicated_prompt_mask = batch_prompt_mask.repeat_interleave(
+            self.group_size, dim=0
+        )
+        self._end_timer("prompt_replication")
+
+        self._start_timer("batch_text_generation")
+        prev = self.policy.training
+        self.policy.eval()
+        with torch.no_grad():
+            generated_ids, generated_mask = self.policy.generate(
+                replicated_prompt_ids,
+                attention_mask=replicated_prompt_mask,
+                max_new_tokens=self.max_new_tokens,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                num_return_sequences=1,
+                min_new_tokens=1,
+            )
+        self.policy.train(prev)
+        self._end_timer("batch_text_generation")
+
+        self._start_timer("completion_extraction")
+        prompt_lengths = batch_prompt_mask.sum(dim=-1)
+        prompt_start_positions = torch.argmax(batch_prompt_mask, dim=-1)
+        prompt_end_positions = prompt_start_positions + prompt_lengths
+        replicated_prompt_end_positions = prompt_end_positions.repeat_interleave(
+            self.group_size, dim=0
+        )
+
+        all_completion_ids = []
+        for seq_idx in range(total_sequences):
+            prompt_end = int(replicated_prompt_end_positions[seq_idx])
+            seq_completion_ids = generated_ids[seq_idx, prompt_end:]
+            all_completion_ids.append(seq_completion_ids)
+
+        max_completion_length = (
+            max(comp_ids.size(0) for comp_ids in all_completion_ids)
+            if all_completion_ids
+            else 0
+        )
+        completion_ids = torch.stack(
+            [
+                torch.nn.functional.pad(
+                    comp_ids,
+                    (0, max_completion_length - comp_ids.size(0)),
+                    value=self.policy.tokenizer.pad_token_id,
+                )
+                for comp_ids in all_completion_ids
+            ]
+        )
+        completion_texts = self.policy.decode(completion_ids)
+        self._end_timer("completion_extraction")
+
+        return {
+            "generated_ids": generated_ids,
+            "generated_mask": generated_mask,
+            "completion_ids": completion_ids,
+            "completion_texts": completion_texts,
+            "all_completion_ids": all_completion_ids,
+            "prompt_end_positions": replicated_prompt_end_positions,
+            "total_sequences": total_sequences,
+        }
+
     def generate_trajectories(
         self,
         prompts: List[str],
@@ -323,90 +405,14 @@ class GRPO(BaseAlgorithm):
         all_ref_log_probs = []
         all_completion_mask = []
 
-        # BATCHED APPROACH: Process all prompts at once with interleaving
-        self._start_timer("batch_tokenization")
-        tokenized = self.policy.tokenize(prompts, padding_side='left')
-        batch_prompt_ids = tokenized["input_ids"].to(self.device)  # [num_prompts, max_prompt_len]
-        batch_prompt_mask = tokenized["attention_mask"].to(self.device)
-        self._end_timer("batch_tokenization")
-
-        # Replicate each prompt group_size times for parallel generation
-        # Interleave: [prompt1, prompt1, ..., prompt2, prompt2, ...]
-        self._start_timer("prompt_replication")
-        num_prompts = len(prompts)
-        total_sequences = num_prompts * self.group_size
-
-        # Repeat each row group_size times
-        replicated_prompt_ids = batch_prompt_ids.repeat_interleave(
-            self.group_size, dim=0
-        )  # [total_sequences, max_prompt_len]
-        replicated_prompt_mask = batch_prompt_mask.repeat_interleave(
-            self.group_size, dim=0
-        )
-        self._end_timer("prompt_replication")
-
-
-        # Generate all completions in a single batched call
-        self._start_timer("batch_text_generation")
-        prev = self.policy.training
-
-        self.policy.eval()
-        with torch.no_grad():
-            generated_ids, generated_mask = self.policy.generate(
-                replicated_prompt_ids,
-                attention_mask=replicated_prompt_mask,
-                max_new_tokens=self.max_new_tokens,
-                temperature=self.temperature,
-                top_k=self.top_k,
-                top_p=self.top_p,
-                num_return_sequences=1,  # Already replicated, so 1 per replicated prompt
-                min_new_tokens=1,
-            )
-        self.policy.train(prev)
-        self._end_timer("batch_text_generation")
-
-        # Extract completion tokens from generated sequences
-        self._start_timer("completion_extraction")
-        # Determine actual prompt lengths and starting offsets (supports left/right padding)
-        prompt_lengths = batch_prompt_mask.sum(dim=-1)
-        prompt_start_positions = torch.argmax(batch_prompt_mask, dim=-1)
-        prompt_end_positions = prompt_start_positions + prompt_lengths
-
-        replicated_prompt_lengths = prompt_lengths.repeat_interleave(
-            self.group_size, dim=0
-        )
-        replicated_prompt_end_positions = prompt_end_positions.repeat_interleave(
-            self.group_size, dim=0
-        )
-
-        # Extract completions based on individual prompt end positions
-        all_completion_ids = []
-        all_completion_texts = []
-
-        for seq_idx in range(total_sequences):
-            # Extract completion for this sequence
-            prompt_end = int(replicated_prompt_end_positions[seq_idx])
-            seq_completion_ids = generated_ids[seq_idx, prompt_end:]
-            all_completion_ids.append(seq_completion_ids)
-
-        # Stack completions and decode
-        max_completion_length = (
-            max(comp_ids.size(0) for comp_ids in all_completion_ids)
-            if all_completion_ids
-            else 0
-        )
-        completion_ids = torch.stack(
-            [
-                torch.nn.functional.pad(
-                    comp_ids,
-                    (0, max_completion_length - comp_ids.size(0)),
-                    value=self.policy.tokenizer.pad_token_id,
-                )
-                for comp_ids in all_completion_ids
-            ]
-        )
-        completion_texts = self.policy.decode(completion_ids)
-        self._end_timer("completion_extraction")
+        generation = self._generate_grouped_completions(prompts)
+        generated_ids = generation["generated_ids"]
+        generated_mask = generation["generated_mask"]
+        completion_ids = generation["completion_ids"]
+        completion_texts = generation["completion_texts"]
+        all_completion_ids = generation["all_completion_ids"]
+        replicated_prompt_end_positions = generation["prompt_end_positions"]
+        total_sequences = generation["total_sequences"]
 
         # Compute log probabilities for policy (batched)
         self._start_timer("batch_policy_log_probs")
