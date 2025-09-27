@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+from sympy import N
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,12 +52,15 @@ class GRPO(BaseAlgorithm):
         self.config = config or {}
         self.use_wandb = use_wandb
         # Prefer CUDA, then MPS, else CPU
-        if torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            self.device = torch.device("mps")
-        else:
-            self.device = torch.device("cpu")
+        self.device = config.get("device", None)
+        if self.device is None:
+            print("No device specified, using CUDA if available, then MPS, else CPU")
+            if torch.cuda.is_available():
+                self.device = torch.device("cuda")
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                self.device = torch.device("mps")
+            else:
+                self.device = torch.device("cpu")
 
         # Initialize or create model
 
@@ -252,6 +256,39 @@ class GRPO(BaseAlgorithm):
         self.timings.clear()
         self.current_timings.clear()
 
+    def _create_completion_mask(self, completion_ids):
+        """
+        Creates a mask for completion tokens that excludes tokens after the EOS token.
+
+        Args:
+            completion_ids: Token IDs of the generated completions [batch_size, seq_len]
+
+        Returns:
+            Binary mask with 1s for valid tokens and 0s after the EOS token
+        """
+        eos_token_id = self.policy.tokenizer.eos_token_id
+        is_eos = completion_ids == eos_token_id
+
+        # Find the index of the first EOS token in each sequence
+        eos_idx = torch.full(
+            (is_eos.size(0),),
+            is_eos.size(1),
+            dtype=torch.long,
+            device=completion_ids.device,
+        )
+
+        # Update indices where EOS tokens exist
+        mask_exists = is_eos.any(dim=1)
+        eos_idx[mask_exists] = is_eos.int().argmax(dim=1)[mask_exists]
+
+        # Create sequence indices
+        sequence_indices = torch.arange(
+            is_eos.size(1), device=completion_ids.device
+        ).expand(is_eos.size(0), -1)
+
+        # Create mask: 1 for positions <= first EOS, 0 for positions after EOS
+        return (sequence_indices <= eos_idx.unsqueeze(1)).float()
+
     def generate_trajectories(
         self,
         prompts: List[str],
@@ -286,116 +323,183 @@ class GRPO(BaseAlgorithm):
         all_ref_log_probs = []
         all_completion_mask = []
 
-        # Process each prompt to generate completions and collect log probs
-        for prompt, answer in zip(prompts, answers):
-            self._start_timer("tokenization")
-            tokenized = self.policy.tokenize([prompt])
-            prompt_ids = tokenized["input_ids"]
-            prompt_mask = tokenized["attention_mask"]
-            self._end_timer("tokenization")
+        # BATCHED APPROACH: Process all prompts at once with interleaving
+        self._start_timer("batch_tokenization")
+        tokenized = self.policy.tokenize(prompts, padding_side='left')
+        batch_prompt_ids = tokenized["input_ids"].to(self.device)  # [num_prompts, max_prompt_len]
+        batch_prompt_mask = tokenized["attention_mask"].to(self.device)
+        self._end_timer("batch_tokenization")
 
-            # Generate completions
-            self._start_timer("text_generation")
-            prev = self.policy.training
-            self.policy.eval()
-            with torch.no_grad():
-                generated_ids, generated_mask = self.policy.generate(
-                    prompt_ids,
-                    attention_mask=prompt_mask,
-                    max_new_tokens=self.max_new_tokens,
-                    temperature=self.temperature,
-                    top_k=self.top_k,
-                    top_p=self.top_p,
-                    num_return_sequences=self.group_size,
-                    min_new_tokens=1,  # also avoids empty completion windows
+        # Replicate each prompt group_size times for parallel generation
+        # Interleave: [prompt1, prompt1, ..., prompt2, prompt2, ...]
+        self._start_timer("prompt_replication")
+        num_prompts = len(prompts)
+        total_sequences = num_prompts * self.group_size
+
+        # Repeat each row group_size times
+        replicated_prompt_ids = batch_prompt_ids.repeat_interleave(
+            self.group_size, dim=0
+        )  # [total_sequences, max_prompt_len]
+        replicated_prompt_mask = batch_prompt_mask.repeat_interleave(
+            self.group_size, dim=0
+        )
+        self._end_timer("prompt_replication")
+
+
+        # Generate all completions in a single batched call
+        self._start_timer("batch_text_generation")
+        prev = self.policy.training
+
+        self.policy.eval()
+        with torch.no_grad():
+            generated_ids, generated_mask = self.policy.generate(
+                replicated_prompt_ids,
+                attention_mask=replicated_prompt_mask,
+                max_new_tokens=self.max_new_tokens,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                num_return_sequences=1,  # Already replicated, so 1 per replicated prompt
+                min_new_tokens=1,
+            )
+        self.policy.train(prev)
+        self._end_timer("batch_text_generation")
+
+        # Extract completion tokens from generated sequences
+        self._start_timer("completion_extraction")
+        # With right padding, we need to find the actual prompt lengths for each sequence
+        prompt_lengths = batch_prompt_mask.sum(dim=-1)  # Actual length of each prompt
+
+        # For right-padded sequences, extract completions based on individual prompt lengths
+        all_completion_ids = []
+        all_completion_texts = []
+
+        for seq_idx in range(total_sequences):
+            # Map back to original prompt index
+            prompt_idx = seq_idx // self.group_size
+            actual_prompt_length = prompt_lengths[prompt_idx].item()
+
+            # Extract completion for this sequence
+            seq_completion_ids = generated_ids[seq_idx, actual_prompt_length:]
+            all_completion_ids.append(seq_completion_ids)
+
+        # Stack completions and decode
+        completion_ids = torch.stack(
+            [
+                torch.nn.functional.pad(
+                    comp_ids,
+                    (0, max(len(cid) for cid in all_completion_ids) - len(comp_ids)),
+                    value=self.policy.tokenizer.pad_token_id,
                 )
-            self.policy.train(prev)
-            self._end_timer("text_generation")
-
-            # Get prompt length to extract completions
-            prompt_length = prompt_ids.shape[1]
-            generated_length = generated_ids.shape[1] - prompt_length
-            # Decode completions
-            self._start_timer("completion_decoding")
-            completion_ids = generated_ids[:, prompt_length:]
-            completions = self.policy.decode(completion_ids)
-            self._end_timer("completion_decoding")
-
-            # Compute log probabilities for policy (only for completion tokens)
-            self._start_timer("policy_log_probs")
-            prev_mode = self.policy.training
-            self.policy.eval()
-            with torch.enable_grad():  # Ensure gradients are enabled for policy
-                prev_cache = getattr(self.policy.model.config, "use_cache", None)
-                if prev_cache is not None:
-                    self.policy.model.config.use_cache = False
-                try:
-                    policy_log_probs = self.policy.compute_log_probs(
-                        generated_ids,
-                        attention_mask=generated_mask,
-                        target_mask=None,  # Let the model handle masking internally
-                    )
-                finally:
-                    if prev_cache is not None:
-                        self.policy.model.config.use_cache = prev_cache
-                # Extract only completion log probs (account for shift by 1)
-                policy_log_probs = policy_log_probs[
-                    :, prompt_length - 1 : prompt_length - 1 + generated_length
-                ]
-            if prev_mode:
-                self.policy.train()
-            self._end_timer("policy_log_probs")
-
-            # Compute log probabilities for reference model
-            self._start_timer("ref_log_probs")
-            with torch.no_grad():
-                prev_cache = getattr(self.ref_policy.model.config, "use_cache", None)
-                if prev_cache is not None:
-                    self.ref_policy.model.config.use_cache = False
-                try:
-                    ref_log_probs = self.ref_policy.compute_log_probs(
-                        generated_ids, attention_mask=generated_mask, target_mask=None
-                    )
-                finally:
-                    if prev_cache is not None:
-                        self.ref_policy.model.config.use_cache = prev_cache
-                # Extract only completion log probs (account for shift by 1)
-                ref_log_probs = ref_log_probs[
-                    :, prompt_length - 1 : prompt_length - 1 + generated_length
-                ]
-            self._end_timer("ref_log_probs")
-            generated_mask = generated_mask[:, 1:]
-            # Create mask for completion tokens only
-            completion_mask = generated_mask[
-                :, prompt_length - 1 : prompt_length - 1 + generated_length
+                for comp_ids in all_completion_ids
             ]
+        )
+        completion_texts = self.policy.decode(completion_ids)
+        self._end_timer("completion_extraction")
 
-            # Store results (except rewards - we'll compute those in batch)
+        # Compute log probabilities for policy (batched)
+        self._start_timer("batch_policy_log_probs")
+        prev_mode = self.policy.training
+        self.policy.eval()
+        with torch.enable_grad():
+            prev_cache = getattr(self.policy.model.config, "use_cache", None)
+            if prev_cache is not None:
+                self.policy.model.config.use_cache = False
+            try:
+                policy_log_probs = self.policy.compute_log_probs(
+                    generated_ids,
+                    attention_mask=generated_mask,
+                    target_mask=None,
+                )
+            finally:
+                if prev_cache is not None:
+                    self.policy.model.config.use_cache = prev_cache
+        if prev_mode:
+            self.policy.train()
+        self._end_timer("batch_policy_log_probs")
+
+        # Compute log probabilities for reference model (batched)
+        self._start_timer("batch_ref_log_probs")
+        with torch.no_grad():
+            prev_cache = getattr(self.ref_policy.model.config, "use_cache", None)
+            if prev_cache is not None:
+                self.ref_policy.model.config.use_cache = False
+            try:
+                ref_log_probs = self.ref_policy.compute_log_probs(
+                    generated_ids, attention_mask=generated_mask, target_mask=None
+                )
+            finally:
+                if prev_cache is not None:
+                    self.ref_policy.model.config.use_cache = prev_cache
+        self._end_timer("batch_ref_log_probs")
+
+        # Create proper completion masks and extract completion log probs
+        self._start_timer("mask_and_extract_completions")
+
+        # Create EOS-aware completion mask
+        completion_mask = self._create_completion_mask(completion_ids)
+
+        # Extract completion log probs handling variable prompt lengths
+        for seq_idx in range(total_sequences):
+            # Map back to original prompt index
+            prompt_idx = seq_idx // self.group_size
+            actual_prompt_length = prompt_lengths[prompt_idx].item()
+
+            # Get the actual completion length for this sequence
+            seq_completion_ids = all_completion_ids[seq_idx]
+            actual_completion_length = len(seq_completion_ids)
+
+            # Extract log probs for this sequence's completion (matching actual length)
+            completion_start = actual_prompt_length - 1  # Account for shift by 1
+            completion_end = completion_start + actual_completion_length
+
+            seq_policy_log_probs = policy_log_probs[
+                seq_idx, completion_start:completion_end
+            ]
+            seq_ref_log_probs = ref_log_probs[seq_idx, completion_start:completion_end]
+
+            # Get completion mask for the actual completion length
+            seq_completion_mask = completion_mask[seq_idx, :actual_completion_length]
+
+            # Ensure all tensors have the same length
+            min_length = min(
+                len(seq_policy_log_probs),
+                len(seq_ref_log_probs),
+                len(seq_completion_mask)
+            )
+
+            seq_policy_log_probs = seq_policy_log_probs[:min_length]
+            seq_ref_log_probs = seq_ref_log_probs[:min_length]
+            seq_completion_mask = seq_completion_mask[:min_length]
+
+            # Apply masking
+            seq_policy_log_probs = seq_policy_log_probs * seq_completion_mask
+            seq_ref_log_probs = seq_ref_log_probs * seq_completion_mask
+
+            all_log_probs.append(seq_policy_log_probs)
+            all_ref_log_probs.append(seq_ref_log_probs)
+            all_completion_mask.append(seq_completion_mask)
+        self._end_timer("mask_and_extract_completions")
+
+        # Batch compute rewards by group
+        self._start_timer("batch_reward_computation")
+        for prompt_idx, (prompt, answer) in enumerate(zip(prompts, answers)):
+            # Get completions for this prompt (group_size consecutive sequences)
+            start_idx = prompt_idx * self.group_size
+            end_idx = start_idx + self.group_size
+            group_completions = completion_texts[start_idx:end_idx]
+
+            # Compute rewards for this group
+            group_rewards = self.batch_reward_fn(
+                group_completions, [answer] * self.group_size, self.device
+            )
+            all_rewards.append(group_rewards)
+
+            # Store prompts and completions if needed
             if store:
                 all_prompts.extend([prompt] * self.group_size)
-                all_completions.extend(completions)
-
-            # Apply masking to log probs before storing
-            policy_log_probs = policy_log_probs * completion_mask
-            ref_log_probs = ref_log_probs * completion_mask
-
-            assert policy_log_probs.shape == ref_log_probs.shape
-            assert completion_mask.shape == policy_log_probs.shape
-            assert policy_log_probs[0].shape[0] == (completion_ids[0].shape[0])
-
-            # Compute rewards for this group of completions
-            self._start_timer("reward_computation")
-            group_rewards = self.batch_reward_fn(
-                completions, [answer] * self.group_size, self.device
-            )
-            all_rewards.append(group_rewards)  # Append the tensor for this group
-            self._end_timer("reward_computation")
-
-            # Store each sample's log probs separately
-            for i in range(self.group_size):
-                all_log_probs.append(policy_log_probs[i])
-                all_ref_log_probs.append(ref_log_probs[i])
-                all_completion_mask.append(completion_mask[i])
+                all_completions.extend(group_completions)
+        self._end_timer("batch_reward_computation")
 
         # Stack into tensors
         self._start_timer("tensor_stacking")

@@ -32,12 +32,25 @@ class LanguageModel(nn.Module):
         self.max_length = model_config.get("max_length", 512)
 
         # Load HuggingFace model and tokenizer
-        self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto" if torch.cuda.is_available() else None,
+            trust_remote_code=True
+            )
 
-        # Set padding token if not exists
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name,
+            padding_side="left",
+            add_eos_token=False,
+            add_bos_token=False,
+        )
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.model.config.pad_token_id = self.tokenizer.eos_token_id
+        self.model.config.eos_token_id = self.tokenizer.eos_token_id
+
+        # For decoder-only models, use left padding by default
+        # But we'll switch to right padding for batched generation to avoid inf/nan issues
+        self.tokenizer.padding_side = "left"
 
         # Get model config
         self.vocab_size = self.model.config.vocab_size
@@ -159,11 +172,9 @@ class LanguageModel(nn.Module):
     def tokenize(
         self,
         texts: List[str],
-        max_length: Optional[int] = None,
-        truncation: bool = True,
-        padding: bool = True,
+        padding_side: str = "right",
         return_tensors: str = "pt",
-        return_device: bool = True,
+
     ) -> Dict[str, torch.Tensor]:
         """
         Tokenize text strings.
@@ -172,29 +183,18 @@ class LanguageModel(nn.Module):
             texts: List of text strings
             max_length: Maximum sequence length
             truncation: Whether to truncate
-            padding: Whether to pad
             return_tensors: Return type ("pt" for PyTorch tensors)
-            return_device: Whether to move tensors to model device
 
         Returns:
             Dictionary with input_ids and attention_mask
         """
-        if max_length is None:
-            max_length = self.max_length
+
 
         tokenized = self.tokenizer(
-            texts,
-            max_length=max_length,
-            truncation=truncation,
-            padding=padding,
-            return_tensors=return_tensors,
+            texts, return_tensors=return_tensors, padding=True, padding_side=padding_side
         )
 
-        # Move tensors to model device if requested
-        if return_device and return_tensors == "pt":
-            tokenized = {k: v.to(self.device) for k, v in tokenized.items()}
-
-        return tokenized
+        return tokenized.to(self.device)
 
     def decode(
         self, token_ids: torch.Tensor, skip_special_tokens: bool = True
