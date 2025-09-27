@@ -367,28 +367,39 @@ class GRPO(BaseAlgorithm):
 
         # Extract completion tokens from generated sequences
         self._start_timer("completion_extraction")
-        # With right padding, we need to find the actual prompt lengths for each sequence
-        prompt_lengths = batch_prompt_mask.sum(dim=-1)  # Actual length of each prompt
+        # Determine actual prompt lengths and starting offsets (supports left/right padding)
+        prompt_lengths = batch_prompt_mask.sum(dim=-1)
+        prompt_start_positions = torch.argmax(batch_prompt_mask, dim=-1)
+        prompt_end_positions = prompt_start_positions + prompt_lengths
 
-        # For right-padded sequences, extract completions based on individual prompt lengths
+        replicated_prompt_lengths = prompt_lengths.repeat_interleave(
+            self.group_size, dim=0
+        )
+        replicated_prompt_end_positions = prompt_end_positions.repeat_interleave(
+            self.group_size, dim=0
+        )
+
+        # Extract completions based on individual prompt end positions
         all_completion_ids = []
         all_completion_texts = []
 
         for seq_idx in range(total_sequences):
-            # Map back to original prompt index
-            prompt_idx = seq_idx // self.group_size
-            actual_prompt_length = prompt_lengths[prompt_idx].item()
-
             # Extract completion for this sequence
-            seq_completion_ids = generated_ids[seq_idx, actual_prompt_length:]
+            prompt_end = int(replicated_prompt_end_positions[seq_idx])
+            seq_completion_ids = generated_ids[seq_idx, prompt_end:]
             all_completion_ids.append(seq_completion_ids)
 
         # Stack completions and decode
+        max_completion_length = (
+            max(comp_ids.size(0) for comp_ids in all_completion_ids)
+            if all_completion_ids
+            else 0
+        )
         completion_ids = torch.stack(
             [
                 torch.nn.functional.pad(
                     comp_ids,
-                    (0, max(len(cid) for cid in all_completion_ids) - len(comp_ids)),
+                    (0, max_completion_length - comp_ids.size(0)),
                     value=self.policy.tokenizer.pad_token_id,
                 )
                 for comp_ids in all_completion_ids
@@ -441,16 +452,14 @@ class GRPO(BaseAlgorithm):
 
         # Extract completion log probs handling variable prompt lengths
         for seq_idx in range(total_sequences):
-            # Map back to original prompt index
-            prompt_idx = seq_idx // self.group_size
-            actual_prompt_length = prompt_lengths[prompt_idx].item()
-
             # Get the actual completion length for this sequence
             seq_completion_ids = all_completion_ids[seq_idx]
-            actual_completion_length = len(seq_completion_ids)
+            actual_completion_length = seq_completion_ids.size(0)
+
+            prompt_end = int(replicated_prompt_end_positions[seq_idx])
 
             # Extract log probs for this sequence's completion (matching actual length)
-            completion_start = actual_prompt_length - 1  # Account for shift by 1
+            completion_start = max(prompt_end - 1, 0)  # Account for shift by 1
             completion_end = completion_start + actual_completion_length
 
             seq_policy_log_probs = policy_log_probs[
