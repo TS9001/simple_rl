@@ -9,6 +9,8 @@ import copy
 import math
 import time
 from collections import OrderedDict, defaultdict
+from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -18,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
+from torch.cuda.amp import GradScaler
 from torch.nn.utils.rnn import pad_sequence
 
 from simple_rl.algorithms.base import BaseAlgorithm
@@ -73,7 +76,6 @@ class GRPO(BaseAlgorithm):
         self.policy = self.policy.to(self.device)
 
         # Create reference model (frozen copy for KL divergence)
-        # Create reference model (frozen copy for KL divergence)
         self.ref_policy = copy.deepcopy(self.policy)
         self.ref_policy = self.ref_policy.to(self.device)
 
@@ -115,16 +117,13 @@ class GRPO(BaseAlgorithm):
         self.top_p = training_config.get("top_p", 0.9)
         self.gradient_clip = training_config.get("gradient_clip", 1.0)
 
-        # Generation prompt configuration
-        generation_config = self.config.get("generation", {})
-        self.generation_prompt_template = generation_config.get("prompt_template", None)
-        self.system_prompt = generation_config.get("system_prompt", None)
-        self.response_prefix = generation_config.get("response_prefix", None)
+        # Determine precision/AMP settings
+        self._amp_enabled = False
+        self._amp_device = None
+        self._grad_scaler: Optional[torch.cuda.amp.GradScaler] = None
+        self._autocast: Callable = nullcontext
 
-        # Create optimizer
-        self.optimizer = torch.optim.Adam(
-            self.policy.parameters(), lr=self.learning_rate
-        )
+        self._configure_training_components()
 
         # Reward function
         self.batch_reward_fn = batch_reward_fn
@@ -147,26 +146,122 @@ class GRPO(BaseAlgorithm):
         self.current_timings = {}
         self.timing_enabled = True
 
-    def set_generation_prompt(
-        self,
-        system_prompt: Optional[str] = None,
-        prompt_template: Optional[str] = None,
-        response_prefix: Optional[str] = None,
-    ):
-        """
-        Update generation prompt configuration.
+    def _configure_training_components(self) -> None:
+        """Initialize optimizer, AMP scaler, and autocast context."""
 
-        Args:
-            system_prompt: System prompt to prepend
-            prompt_template: Template with {prompt} placeholder
-            response_prefix: Prefix to append after prompt
-        """
-        if system_prompt is not None:
-            self.system_prompt = system_prompt
-        if prompt_template is not None:
-            self.generation_prompt_template = prompt_template
-        if response_prefix is not None:
-            self.response_prefix = response_prefix
+        optimizer_cfg = self.config.get("optimizer", {})
+        optimizer_type = str(optimizer_cfg.get("type", "adam")).lower()
+        lr = optimizer_cfg.get("lr", self.learning_rate)
+        betas = optimizer_cfg.get("betas", (0.9, 0.999))
+        eps = optimizer_cfg.get("eps", 1e-8)
+
+        fused_requested = optimizer_cfg.get("fused", True)
+        optimizer_kwargs: Dict[str, Any] = {"lr": lr, "betas": betas, "eps": eps}
+
+        if optimizer_type == "adamw":
+            optimizer_kwargs["weight_decay"] = optimizer_cfg.get("weight_decay", 0.0)
+            optimizer_class = torch.optim.AdamW
+        else:
+            optimizer_class = torch.optim.Adam
+
+        if torch.cuda.is_available() and fused_requested:
+            optimizer_kwargs["fused"] = True
+
+        try:
+            self.optimizer = optimizer_class(self.policy.parameters(), **optimizer_kwargs)
+        except TypeError:
+            optimizer_kwargs.pop("fused", None)
+            self.optimizer = optimizer_class(self.policy.parameters(), **optimizer_kwargs)
+
+        # Mixed precision configuration
+        optim_section = self.config.get("optimization", {})
+        mp_config = optim_section.get("mixed_precision", {})
+        device_type = getattr(self.device, "type", str(self.device))
+
+        self._amp_enabled = False
+        self._amp_device = None
+        self._grad_scaler = None
+        self._autocast = nullcontext
+
+        # Normalize mp_config into dict form
+        if isinstance(mp_config, str):
+            mp_config = {"mode": mp_config}
+
+        if not isinstance(mp_config, dict):
+            mp_config = {"mode": "auto"}
+
+        mode = mp_config.get("mode", "auto")
+        mp_enabled = mp_config.get("enabled", True)
+
+        if device_type == "cuda" and mp_enabled and mode != "off":
+            dtype_key = mp_config.get("dtype", "fp16")
+            # Same logic as model wrapper
+            alias_map: Dict[str, torch.dtype] = {
+                "fp16": torch.float16,
+                "bf16": torch.bfloat16,
+                "fp32": torch.float32,
+            }
+            if isinstance(dtype_key, str):
+                target_dtype = alias_map.get(dtype_key.lower())
+                if target_dtype is None:
+                    raise ValueError(f"Unsupported dtype specification: {dtype_key!r}")
+            elif isinstance(dtype_key, torch.dtype):
+                target_dtype = dtype_key
+            else:
+                target_dtype = torch.float16  # fallback
+
+            self._autocast = partial(torch.cuda.amp.autocast, dtype=target_dtype)
+            self._grad_scaler = GradScaler(
+                enabled=True,
+                growth_factor=mp_config.get("growth_factor", 2.0),
+                backoff_factor=mp_config.get("backoff_factor", 0.5),
+                growth_interval=mp_config.get("growth_interval", 2000),
+            )
+            self._amp_enabled = True
+            self._amp_device = "cuda"
+
+        elif device_type == "mps" and mp_enabled:
+            # PyTorch nightly adds experimental autocast for MPS; keep opt-in only
+            requested = mode in {"fp16", "mps_fp16", "enable"}
+            if requested:
+                try:
+                    # Same logic as model wrapper for dtype handling
+                    dtype_key = mp_config.get("dtype", "fp16")
+                    alias_map: Dict[str, torch.dtype] = {
+                        "fp16": torch.float16,
+                        "bf16": torch.bfloat16,
+                        "fp32": torch.float32,
+                    }
+                    if isinstance(dtype_key, str):
+                        target_dtype = alias_map.get(dtype_key.lower())
+                        if target_dtype is None:
+                            raise ValueError(f"Unsupported dtype specification: {dtype_key!r}")
+                    elif isinstance(dtype_key, torch.dtype):
+                        target_dtype = dtype_key
+                    else:
+                        target_dtype = torch.float16  # fallback
+
+                    self._autocast = partial(
+                        torch.autocast, device_type="mps", dtype=target_dtype
+                    )
+                    self._amp_enabled = True
+                    self._amp_device = "mps"
+                except RuntimeError:
+                    print(
+                        "Mixed precision autocast on MPS failed to initialize. Falling back to full precision."
+                    )
+                    self._autocast = nullcontext
+                    self._amp_enabled = False
+            else:
+                if mode not in {"off", "disable"}:
+                    print(
+                        "Mixed precision on MPS remains experimental in the latest PyTorch nightly; keeping full precision."
+                    )
+
+        else:
+            # CPU or other devices
+            self._autocast = nullcontext
+            self._amp_enabled = False
 
     def _start_timer(self, operation_name: str):
         """Start timing an operation."""
@@ -648,6 +743,8 @@ class GRPO(BaseAlgorithm):
         total_sequences = len(prompts) * self.group_size
 
         # Process minibatches
+        autocast_ctx = self._autocast() if callable(self._autocast) else self._autocast
+
         for i in range(0, len(prompts), self.minibatch_size):
             end_idx = min(i + self.minibatch_size, len(prompts))
             mb_prompts = prompts[i:end_idx]
@@ -670,10 +767,11 @@ class GRPO(BaseAlgorithm):
             # Compute advantages
             advantages = self.compute_advantages(rewards)
 
-            # Compute loss
-            loss, mb_metrics = self.compute_loss(
-                log_probs, advantages, ref_log_probs, completion_mask
-            )
+            # Compute loss under autocast context
+            with autocast_ctx:
+                loss, mb_metrics = self.compute_loss(
+                    log_probs, advantages, ref_log_probs, completion_mask
+                )
 
             # Weight loss by fraction of sequences in this minibatch for proper averaging
             mb_sequences = len(mb_prompts) * self.group_size
@@ -682,7 +780,10 @@ class GRPO(BaseAlgorithm):
 
             # Backward pass (accumulate gradients)
             self._start_timer("backward_pass")
-            scaled_loss.backward()
+            if self._amp_enabled and self._grad_scaler is not None:
+                self._grad_scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
             self._end_timer("backward_pass")
 
             # Accumulate metrics (use weighted values to match actual training)
@@ -714,6 +815,9 @@ class GRPO(BaseAlgorithm):
 
         # Gradient clipping on accumulated gradients
         self._start_timer("gradient_clipping")
+        if self._amp_enabled and self._grad_scaler is not None:
+            self._grad_scaler.unscale_(self.optimizer)
+
         torch.nn.utils.clip_grad_norm_(
             self.policy.parameters(), max_norm=self.gradient_clip
         )
@@ -721,7 +825,11 @@ class GRPO(BaseAlgorithm):
 
         # Update parameters
         self._start_timer("parameter_update")
-        self.optimizer.step()
+        if self._amp_enabled and self._grad_scaler is not None:
+            self._grad_scaler.step(self.optimizer)
+            self._grad_scaler.update()
+        else:
+            self.optimizer.step()
         self._end_timer("parameter_update")
 
         # Update statistics

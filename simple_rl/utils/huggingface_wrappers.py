@@ -1,7 +1,7 @@
 """HuggingFace model wrappers and utilities."""
 
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -35,9 +35,29 @@ class LanguageModel(nn.Module):
         self.model_name = model_config.get("model_name")
         self.max_length = model_config.get("max_length", 512)
 
+        # Determine model dtype and device placement once
+        dtype_cfg = model_config.get("torch_dtype") or model_config.get("model_type")
+
+        dtype_cfg: Dict[str, torch.dtype] = {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+            "fp32": torch.float32,
+        }.get(dtype_cfg.lower())
+
+        target_device = model_config.get("device") or config.get("device")
+        if target_device is None:
+            if torch.cuda.is_available():
+                target_device = torch.device("cuda")
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                target_device = torch.device("mps")
+            else:
+                target_device = torch.device("cpu")
+        else:
+            target_device = torch.device(target_device)
+
         # Load HuggingFace model and tokenizer
         loader_kwargs: Dict[str, Any] = {
-            "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
+            "torch_dtype": dtype_cfg,
             "trust_remote_code": True,
         }
 
@@ -85,8 +105,19 @@ class LanguageModel(nn.Module):
         self._compiled_device_type: Optional[str] = None
         self._using_bettertransformer: bool = False
 
+        # Resolve initial device placement and apply once
+        super().to(target_device)
+        self._ensure_compiled()
         self._apply_device_optimizations()
-        self._maybe_enable_bettertransformer()
+
+    def to(self, *args, **kwargs):
+        """Override to() to re-run backend-specific setup after device moves."""
+
+        module = super().to(*args, **kwargs)
+        self._ensure_compiled()
+        self._apply_device_optimizations()
+        return module
+
 
     @property
     def device(self) -> torch.device:
@@ -109,7 +140,6 @@ class LanguageModel(nn.Module):
         Returns:
             Logits [batch_size, seq_len, vocab_size]
         """
-        self._ensure_compiled()
         outputs = self.model(
             input_ids=input_ids, attention_mask=attention_mask, **kwargs
         )
@@ -118,15 +148,24 @@ class LanguageModel(nn.Module):
     def _ensure_compiled(self) -> None:
         """Compile the underlying model based on available backends."""
 
+        # Check if compile is enabled in config
+        compile_cfg = self.config.get("model", {}).get("compile", {})
+        compile_enabled = compile_cfg.get("enabled", True)
+
+        if not compile_enabled:
+            self._compiled_device_type = "disabled"
+            return
+
         # Determine current target
         param_device = self.device
         target_type = getattr(param_device, "type", None)
 
-        if target_type is None or self._compiled_device_type in (target_type, "disabled", "failed"):
+        if target_type == "cpu":
+            # Defer compilation until the module is moved to an accelerated backend
+            self._compiled_device_type = None
             return
 
-        if not hasattr(torch, "compile"):
-            self._compiled_device_type = "disabled"
+        if self._compiled_device_type in (target_type, "disabled", "failed"):
             return
 
         compile_kwargs: Dict[str, Any] = {}
@@ -134,10 +173,10 @@ class LanguageModel(nn.Module):
         # torch.compile support varies per backend
         if target_type == "mps":
             # Use the recommended AOT eager backend for MPS
-            compile_kwargs["backend"] = "aot_eager"
+            compile_kwargs["backend"] = compile_cfg.get("backend", "aot_eager")
         elif target_type == "cuda":
             # Use max-autotune for best perf on CUDA; enable cudagraphs if possible
-            compile_kwargs["mode"] = "max-autotune"
+            compile_kwargs["mode"] = compile_cfg.get("mode", "max-autotune")
             compile_kwargs["options"] = {
                 "triton.cudagraphs": True,
                 "shape_padding": True,
@@ -191,31 +230,6 @@ class LanguageModel(nn.Module):
                 torch.mps.empty_cache()
             except AttributeError:
                 pass
-
-    def _maybe_enable_bettertransformer(self) -> None:
-        """Switch to BetterTransformer if available for faster attention kernels."""
-
-        if self._using_bettertransformer:
-            return
-
-        optim_cfg = self.config.get("optimization", {}) if hasattr(self, "config") else {}
-        if optim_cfg.get("enable_bettertransformer", True) is False:
-            return
-
-        if getattr(self, "_attention_impl", None) in {"flash_attention_2", "flash_attention"}:
-            return
-
-        if not hasattr(self.model, "to_bettertransformer"):
-            return
-
-        if not (torch.cuda.is_available() or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())):
-            return
-
-        try:
-            self.model = self.model.to_bettertransformer()
-            self._using_bettertransformer = True
-        except (RuntimeError, ValueError):
-            self._using_bettertransformer = False
 
     def generate(
         self,
