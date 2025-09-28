@@ -8,6 +8,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from simple_rl.utils.device import get_target_device, apply_device_optimizations, clear_device_cache
+from simple_rl.utils.compilation import ModelCompilationManager
+from simple_rl.utils.model_loading import load_huggingface_model_and_tokenizer, setup_tokenizer_and_model_config
+
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -35,63 +39,16 @@ class LanguageModel(nn.Module):
         self.model_name = model_config.get("model_name")
         self.max_length = model_config.get("max_length", 512)
 
-        # Determine model dtype and device placement once
-        dtype_cfg = model_config.get("torch_dtype") or model_config.get("model_type")
+        # Determine target device
+        target_device = get_target_device(model_config.get("device") or config.get("device"))
 
-        dtype_cfg: Dict[str, torch.dtype] = {
-            "fp16": torch.float16,
-            "bf16": torch.bfloat16,
-            "fp32": torch.float32,
-        }.get(dtype_cfg.lower())
-
-        target_device = model_config.get("device") or config.get("device")
-        if target_device is None:
-            if torch.cuda.is_available():
-                target_device = torch.device("cuda")
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                target_device = torch.device("mps")
-            else:
-                target_device = torch.device("cpu")
-        else:
-            target_device = torch.device(target_device)
-
-        # Load HuggingFace model and tokenizer
-        loader_kwargs: Dict[str, Any] = {
-            "torch_dtype": dtype_cfg,
-            "trust_remote_code": True,
-        }
-
-        if torch.cuda.is_available():
-            loader_kwargs["device_map"] = "auto"
-            loader_kwargs.setdefault("low_cpu_mem_usage", True)
-            loader_kwargs.setdefault("use_cache", False)
-
-        attn_impl = model_config.get("attn_implementation")
-        if attn_impl is None:
-            if torch.cuda.is_available():
-                attn_impl = "flash_attention_2"
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                attn_impl = "sdpa"
-
-        if attn_impl:
-            loader_kwargs["attn_implementation"] = attn_impl
-
-        try:
-            self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **loader_kwargs)
-            self._attention_impl = loader_kwargs.get("attn_implementation")
-        except TypeError:
-            loader_kwargs.pop("attn_implementation", None)
-            self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **loader_kwargs)
-            self._attention_impl = None
-
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name,
-            padding_side="left",
-            add_eos_token=False,
-            add_bos_token=False,
+        # Load HuggingFace model and tokenizer using utility
+        self.model, self.tokenizer = load_huggingface_model_and_tokenizer(
+            self.model_name, config
         )
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model.config.pad_token_id = self.tokenizer.eos_token_id
-        self.model.config.eos_token_id = self.tokenizer.eos_token_id
+
+        # Set up tokenizer and model config
+        setup_tokenizer_and_model_config(self.model, self.tokenizer)
 
         # For decoder-only models, use left padding by default
         # But we'll switch to right padding for batched generation to avoid inf/nan issues
@@ -102,20 +59,20 @@ class LanguageModel(nn.Module):
         self.hidden_size = self.model.config.hidden_size
 
         # Track compile state / optimizations
-        self._compiled_device_type: Optional[str] = None
+        self._compilation_manager = ModelCompilationManager(config)
         self._using_bettertransformer: bool = False
 
-        # Resolve initial device placement and apply once
+        # Resolve initial device placement and apply optimizations
         super().to(target_device)
         self._ensure_compiled()
-        self._apply_device_optimizations()
+        apply_device_optimizations()
 
     def to(self, *args, **kwargs):
         """Override to() to re-run backend-specific setup after device moves."""
 
         module = super().to(*args, **kwargs)
         self._ensure_compiled()
-        self._apply_device_optimizations()
+        apply_device_optimizations()
         return module
 
 
@@ -147,89 +104,9 @@ class LanguageModel(nn.Module):
 
     def _ensure_compiled(self) -> None:
         """Compile the underlying model based on available backends."""
+        # Use the compilation manager
+        self.model = self._compilation_manager.ensure_compiled(self.model, self.device)
 
-        # Check if compile is enabled in config
-        compile_cfg = self.config.get("model", {}).get("compile", {})
-        compile_enabled = compile_cfg.get("enabled", True)
-
-        if not compile_enabled:
-            self._compiled_device_type = "disabled"
-            return
-
-        # Determine current target
-        param_device = self.device
-        target_type = getattr(param_device, "type", None)
-
-        if target_type == "cpu":
-            # Defer compilation until the module is moved to an accelerated backend
-            self._compiled_device_type = None
-            return
-
-        if self._compiled_device_type in (target_type, "disabled", "failed"):
-            return
-
-        compile_kwargs: Dict[str, Any] = {}
-
-        # torch.compile support varies per backend
-        if target_type == "mps":
-            # Use the recommended AOT eager backend for MPS
-            compile_kwargs["backend"] = compile_cfg.get("backend", "aot_eager")
-        elif target_type == "cuda":
-            # Use max-autotune for best perf on CUDA; enable cudagraphs if possible
-            compile_kwargs["mode"] = compile_cfg.get("mode", "max-autotune")
-            compile_kwargs["options"] = {
-                "triton.cudagraphs": True,
-                "shape_padding": True,
-            }
-        else:
-            # Skip compile for CPU or unsupported devices
-            self._compiled_device_type = "disabled"
-            return
-
-        try:
-            self.model = torch.compile(self.model, **compile_kwargs)
-            self.model.to(param_device)
-            self._compiled_device_type = target_type
-        except Exception:
-            self._compiled_device_type = "failed"
-
-    def _apply_device_optimizations(self) -> None:
-        """Enable backend-specific performance knobs."""
-
-        if hasattr(torch, "set_float32_matmul_precision"):
-            torch.set_float32_matmul_precision("high")
-
-        if torch.cuda.is_available():
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
-            try:
-                torch.backends.cuda.enable_flash_sdp(True)
-                torch.backends.cuda.enable_mem_efficient_sdp(True)
-                torch.backends.cuda.enable_math_sdp(True)
-            except AttributeError:
-                pass
-
-        if hasattr(torch.cuda, "empty_cache"):
-            torch.cuda.empty_cache()
-
-        if hasattr(torch.cuda, "set_per_process_memory_fraction"):
-            try:
-                torch.cuda.set_per_process_memory_fraction(0.95)
-            except Exception:
-                pass
-
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            try:
-                torch.backends.mps.matmul.allow_tf32 = True
-            except AttributeError:
-                pass
-
-            try:
-                torch.mps.empty_cache()
-            except AttributeError:
-                pass
 
     def generate(
         self,
@@ -345,7 +222,7 @@ class LanguageModel(nn.Module):
             texts, return_tensors=return_tensors, padding=True, padding_side=padding_side
         )
 
-        return tokenized.to(self.device)
+        return tokenized
 
     def decode(
         self, token_ids: torch.Tensor, skip_special_tokens: bool = True

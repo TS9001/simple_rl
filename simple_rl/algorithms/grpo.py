@@ -19,12 +19,18 @@ from sympy import N
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import wandb
-from torch.cuda.amp import GradScaler
 from torch.nn.utils.rnn import pad_sequence
 
 from simple_rl.algorithms.base import BaseAlgorithm
 from simple_rl.utils.huggingface_wrappers import LanguageModel
+from simple_rl.utils.device import get_target_device, clear_device_cache
+from simple_rl.utils.amp import create_amp_config
+from simple_rl.utils.optimization import configure_optimizer
+from simple_rl.utils.timing import TimingManager
+from simple_rl.utils.training_config import create_training_config
+from simple_rl.utils.math_ops import compute_advantages, compute_policy_gradient_loss, compute_total_loss, normalize_rewards
+from simple_rl.utils.checkpointing import save_checkpoint, load_checkpoint
+from simple_rl.utils.logging_utils import create_logger
 
 
 class GRPO(BaseAlgorithm):
@@ -54,16 +60,10 @@ class GRPO(BaseAlgorithm):
         # Store config and setup device
         self.config = config or {}
         self.use_wandb = use_wandb
-        # Prefer CUDA, then MPS, else CPU
-        self.device = config.get("device", None)
-        if self.device is None:
-            print("No device specified, using CUDA if available, then MPS, else CPU")
-            if torch.cuda.is_available():
-                self.device = torch.device("cuda")
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                self.device = torch.device("mps")
-            else:
-                self.device = torch.device("cpu")
+
+        # Determine target device
+        device_config = self.config.get("device", None)
+        self.device = get_target_device(device_config)
 
         # Initialize or create model
 
@@ -96,260 +96,68 @@ class GRPO(BaseAlgorithm):
         ), f"Not all parameters frozen: {frozen_params}/{total_params}"
         print(f"✓ Reference model frozen: {frozen_params} parameters")
 
-        # GRPO-specific parameters
-        algo_config = self.config.get("algorithm", {})
-        self.group_size = algo_config.get("group_size", 4)
-        self.kl_coef = algo_config.get("kl_coef", 0.05)
-        self.normalize_rewards = algo_config.get("normalize_rewards", True)
-        self.clip_epsilon = algo_config.get("clip_epsilon", 0.2)
-        self.store_completions = algo_config.get("store_completions", True)
+        # Use training config utility
+        self.training_config = create_training_config(self.config)
 
-        # Training parameters
-        training_config = self.config.get("training", {})
-        self.learning_rate = training_config.get("learning_rate", 1e-5)
-        self.batch_size = training_config.get("batch_size", 8)
-        self.minibatch_size = training_config.get("minibatch_size", self.batch_size)
-        if self.minibatch_size in (None, 0):
-            self.minibatch_size = self.batch_size
-        self.max_new_tokens = training_config.get("max_new_tokens", 128)
-        self.temperature = training_config.get("temperature", 0.9)
-        self.top_k = training_config.get("top_k", None)
-        self.top_p = training_config.get("top_p", 0.9)
-        self.gradient_clip = training_config.get("gradient_clip", 1.0)
+        # GRPO-specific parameters (from training config)
+        self.group_size = self.training_config.group_size
+        self.kl_coef = self.training_config.kl_coef
+        self.normalize_rewards = self.training_config.normalize_rewards
+        self.clip_epsilon = self.training_config.clip_epsilon
+        self.store_completions = self.training_config.store_completions
 
-        # Determine precision/AMP settings
-        self._amp_enabled = False
-        self._amp_device = None
-        self._grad_scaler: Optional[torch.cuda.amp.GradScaler] = None
-        self._autocast: Callable = nullcontext
+        # Training parameters (from training config)
+        self.learning_rate = self.training_config.learning_rate
+        self.batch_size = self.training_config.batch_size
+        self.minibatch_size = self.training_config.minibatch_size
+        self.max_new_tokens = self.training_config.max_new_tokens
+        self.temperature = self.training_config.temperature
+        self.top_k = self.training_config.top_k
+        self.top_p = self.training_config.top_p
+        self.gradient_clip = self.training_config.gradient_clip
 
+        # Set up AMP configuration
+        self._amp_config = create_amp_config(self.config)
+
+        # Set up training components using utilities
         self._configure_training_components()
 
         # Reward function
         self.batch_reward_fn = batch_reward_fn
         self.old_log_probs = None
 
-        # Initialize wandb if requested
+        # Initialize logger
+        self.logger = create_logger(self.config)
         if self.use_wandb:
-            wandb.init(
-                project=self.config.get("project_name", "grpo"),
-                config=self.config,
-                name=self.config.get("run_name", None),
-            )
+            self.logger.init_wandb()
 
         # Training statistics
         self.total_steps = 0
         self.episode = 0
 
         # Timing infrastructure
-        self.timings = defaultdict(list)
-        self.current_timings = {}
-        self.timing_enabled = True
+        self.timing_manager = TimingManager()
 
     def _configure_training_components(self) -> None:
         """Initialize optimizer, AMP scaler, and autocast context."""
-
-        optimizer_cfg = self.config.get("optimizer", {})
-        optimizer_type = str(optimizer_cfg.get("type", "adam")).lower()
-        lr = optimizer_cfg.get("lr", self.learning_rate)
-        betas = optimizer_cfg.get("betas", (0.9, 0.999))
-        eps = optimizer_cfg.get("eps", 1e-8)
-
-        fused_requested = optimizer_cfg.get("fused", True)
-        optimizer_kwargs: Dict[str, Any] = {"lr": lr, "betas": betas, "eps": eps}
-
-        if optimizer_type == "adamw":
-            optimizer_kwargs["weight_decay"] = optimizer_cfg.get("weight_decay", 0.0)
-            optimizer_class = torch.optim.AdamW
-        else:
-            optimizer_class = torch.optim.Adam
-
-        if torch.cuda.is_available() and fused_requested:
-            optimizer_kwargs["fused"] = True
-
-        try:
-            self.optimizer = optimizer_class(self.policy.parameters(), **optimizer_kwargs)
-        except TypeError:
-            optimizer_kwargs.pop("fused", None)
-            self.optimizer = optimizer_class(self.policy.parameters(), **optimizer_kwargs)
-
-        # Mixed precision configuration
-        optim_section = self.config.get("optimization", {})
-        mp_config = optim_section.get("mixed_precision", {})
-        device_type = getattr(self.device, "type", str(self.device))
-
-        self._amp_enabled = False
-        self._amp_device = None
-        self._grad_scaler = None
-        self._autocast = nullcontext
-
-        # Normalize mp_config into dict form
-        if isinstance(mp_config, str):
-            mp_config = {"mode": mp_config}
-
-        if not isinstance(mp_config, dict):
-            mp_config = {"mode": "auto"}
-
-        mode = mp_config.get("mode", "auto")
-        mp_enabled = mp_config.get("enabled", True)
-
-        if device_type == "cuda" and mp_enabled and mode != "off":
-            dtype_key = mp_config.get("dtype", "fp16")
-            # Same logic as model wrapper
-            alias_map: Dict[str, torch.dtype] = {
-                "fp16": torch.float16,
-                "bf16": torch.bfloat16,
-                "fp32": torch.float32,
-            }
-            if isinstance(dtype_key, str):
-                target_dtype = alias_map.get(dtype_key.lower())
-                if target_dtype is None:
-                    raise ValueError(f"Unsupported dtype specification: {dtype_key!r}")
-            elif isinstance(dtype_key, torch.dtype):
-                target_dtype = dtype_key
-            else:
-                target_dtype = torch.float16  # fallback
-
-            self._autocast = partial(torch.cuda.amp.autocast, dtype=target_dtype)
-            self._grad_scaler = GradScaler(
-                enabled=True,
-                growth_factor=mp_config.get("growth_factor", 2.0),
-                backoff_factor=mp_config.get("backoff_factor", 0.5),
-                growth_interval=mp_config.get("growth_interval", 2000),
-            )
-            self._amp_enabled = True
-            self._amp_device = "cuda"
-
-        elif device_type == "mps" and mp_enabled:
-            # PyTorch nightly adds experimental autocast for MPS; keep opt-in only
-            requested = mode in {"fp16", "mps_fp16", "enable"}
-            if requested:
-                try:
-                    # Same logic as model wrapper for dtype handling
-                    dtype_key = mp_config.get("dtype", "fp16")
-                    alias_map: Dict[str, torch.dtype] = {
-                        "fp16": torch.float16,
-                        "bf16": torch.bfloat16,
-                        "fp32": torch.float32,
-                    }
-                    if isinstance(dtype_key, str):
-                        target_dtype = alias_map.get(dtype_key.lower())
-                        if target_dtype is None:
-                            raise ValueError(f"Unsupported dtype specification: {dtype_key!r}")
-                    elif isinstance(dtype_key, torch.dtype):
-                        target_dtype = dtype_key
-                    else:
-                        target_dtype = torch.float16  # fallback
-
-                    self._autocast = partial(
-                        torch.autocast, device_type="mps", dtype=target_dtype
-                    )
-                    self._amp_enabled = True
-                    self._amp_device = "mps"
-                except RuntimeError:
-                    print(
-                        "Mixed precision autocast on MPS failed to initialize. Falling back to full precision."
-                    )
-                    self._autocast = nullcontext
-                    self._amp_enabled = False
-            else:
-                if mode not in {"off", "disable"}:
-                    print(
-                        "Mixed precision on MPS remains experimental in the latest PyTorch nightly; keeping full precision."
-                    )
-
-        else:
-            # CPU or other devices
-            self._autocast = nullcontext
-            self._amp_enabled = False
+        # Configure optimizer using utility
+        self.optimizer = configure_optimizer(self.policy, self.config)
 
     def _start_timer(self, operation_name: str):
         """Start timing an operation."""
-        if self.timing_enabled:
-            self.current_timings[operation_name] = time.perf_counter()
+        self.timing_manager.start_timer(operation_name)
 
     def _end_timer(self, operation_name: str) -> float:
         """End timing an operation and return elapsed time."""
-        if not self.timing_enabled or operation_name not in self.current_timings:
-            return 0.0
-
-        elapsed = time.perf_counter() - self.current_timings[operation_name]
-        self.timings[operation_name].append(elapsed)
-        del self.current_timings[operation_name]
-        return elapsed
+        return self.timing_manager.end_timer(operation_name)
 
     def _print_timing_summary(self, title: str = "GRPO Operation Timings"):
         """Print a technical timing summary with detailed statistics."""
-        if not self.timings:
-            return
-
-        print(f"\n[TIMING] {title}")
-        print("-" * 120)
-
-        # Calculate statistics for each operation
-        timing_stats = OrderedDict()
-        total_time = 0
-        total_calls = 0
-
-        for op_name, times in self.timings.items():
-            if times:
-                mean_time = np.mean(times)
-                total_time += np.sum(times)
-                total_calls += len(times)
-                timing_stats[op_name] = {
-                    "mean": mean_time,
-                    "median": np.median(times),
-                    "min": np.min(times),
-                    "max": np.max(times),
-                    "std": np.std(times),
-                    "var": np.var(times),
-                    "count": len(times),
-                    "total": np.sum(times),
-                    "p95": np.percentile(times, 95),
-                    "p99": np.percentile(times, 99),
-                }
-
-        # Sort by total time (descending)
-        timing_stats = OrderedDict(
-            sorted(timing_stats.items(), key=lambda x: x[1]["total"], reverse=True)
-        )
-
-        # Print header
-        print(
-            f"{'Operation':<25} {'Total(s)':<9} {'Mean(s)':<9} {'Median(s)':<10} {'Min(s)':<8} {'Max(s)':<8} "
-            f"{'StdDev(s)':<10} {'Var(s)':<9} {'P95(s)':<8} {'P99(s)':<8} {'Count':<6} {'%Total':<7}"
-        )
-        print("-" * 120)
-
-        # Print each operation with detailed statistics
-        for op_name, stats in timing_stats.items():
-            percentage = (stats["total"] / total_time * 100) if total_time > 0 else 0
-
-            print(
-                f"{op_name:<25} {stats['total']:<9.6f} {stats['mean']:<9.6f} {stats['median']:<10.6f} "
-                f"{stats['min']:<8.6f} {stats['max']:<8.6f} {stats['std']:<10.6f} {stats['var']:<9.6f} "
-                f"{stats['p95']:<8.6f} {stats['p99']:<8.6f} {stats['count']:<6} {percentage:<7.2f}"
-            )
-
-        print("-" * 120)
-        print(
-            f"SUMMARY: Total execution time: {total_time:.6f}s | Total operations: {total_calls} | Operations tracked: {len(timing_stats)}"
-        )
-
-        # Additional technical metrics
-        if len(timing_stats) > 0:
-            times_per_op = [stats["mean"] for stats in timing_stats.values()]
-            print(
-                f"STATS: Mean operation time: {np.mean(times_per_op):.6f}s | "
-                f"Operation time stddev: {np.std(times_per_op):.6f}s | "
-                f"Slowest operation: {max(timing_stats.keys(), key=lambda x: timing_stats[x]['total'])}"
-            )
-        print()
+        self.timing_manager.print_timing_summary(title)
 
     def reset_timings(self):
         """Reset all timing data."""
-        self.timings.clear()
-        self.current_timings.clear()
+        self.timing_manager.reset_timings()
 
     def _create_completion_mask(self, completion_ids):
         """
@@ -656,49 +464,27 @@ class GRPO(BaseAlgorithm):
         Returns:
             Advantages [batch_size]
         """
-        batch_size = adjusted_rewards.shape[0]
-
         self._start_timer("advantage_computation")
-        # Normalize rewards within groups if configured
-        if self.normalize_rewards and self.group_size > 1:
-            # Reshape to groups
-            num_groups = batch_size // self.group_size
-            grouped_rewards = adjusted_rewards.view(num_groups, self.group_size)
-
-            # Normalize within each group
-            group_mean = grouped_rewards.mean(dim=1, keepdim=True)
-            group_std = grouped_rewards.std(dim=1, keepdim=True)
-            normalized_rewards = (grouped_rewards - group_mean) / (group_std + 1e-8)
-
-            # Flatten back
-            advantages = normalized_rewards.view(-1)
-        else:
-            # Global normalization
-            advantages = (adjusted_rewards - adjusted_rewards.mean()) / (
-                adjusted_rewards.std() + 1e-8
-            )
-
+        # Use math operations utility
+        advantages = normalize_rewards(
+            adjusted_rewards,
+            self.group_size,
+            self.normalize_rewards
+        )
         self._end_timer("advantage_computation")
         return advantages
 
     def compute_loss(self, log_probs, advantages, ref_log_probs, completion_mask):
 
         self._start_timer("loss_computation")
-        # Get sequence-level log probabilities by summing
-        log_probs_sum = log_probs.sum(dim=-1)
-
-        # Policy gradient loss (using summed log probs)
-        pg_loss = -(log_probs_sum * advantages.detach()).mean()
-
-        # TRL adds KL at the per-token level, then averages
-        delta = log_probs - ref_log_probs
-        per_token_kl = torch.exp(delta) - delta - 1.0  # Schulman approx
-        kl_penalty = (per_token_kl * completion_mask).sum() / (
-            completion_mask.sum() + 1e-8
+        # Use math operations utilities
+        advantages, kl_penalty = compute_advantages(
+            advantages, log_probs, ref_log_probs, completion_mask,
+            self.group_size, self.normalize_rewards
         )
 
-        # Total loss
-        loss = pg_loss + (self.kl_coef * kl_penalty)
+        pg_loss = compute_policy_gradient_loss(log_probs, advantages, completion_mask)
+        loss = compute_total_loss(pg_loss, kl_penalty, self.kl_coef)
 
         metrics = {
             "pg_loss": pg_loss.item(),
@@ -743,7 +529,7 @@ class GRPO(BaseAlgorithm):
         total_sequences = len(prompts) * self.group_size
 
         # Process minibatches
-        autocast_ctx = self._autocast() if callable(self._autocast) else self._autocast
+        autocast_ctx = self._amp_config.autocast
 
         for i in range(0, len(prompts), self.minibatch_size):
             end_idx = min(i + self.minibatch_size, len(prompts))
@@ -780,8 +566,8 @@ class GRPO(BaseAlgorithm):
 
             # Backward pass (accumulate gradients)
             self._start_timer("backward_pass")
-            if self._amp_enabled and self._grad_scaler is not None:
-                self._grad_scaler.scale(scaled_loss).backward()
+            if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
+                self._amp_config.grad_scaler.scale(scaled_loss).backward()
             else:
                 scaled_loss.backward()
             self._end_timer("backward_pass")
@@ -807,16 +593,13 @@ class GRPO(BaseAlgorithm):
                 loss,
                 scaled_loss,
             )
-            if torch.backends.mps.is_available():
-                torch.mps.empty_cache()
-            elif torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            clear_device_cache(self.device)
             self._end_timer("memory_cleanup")
 
         # Gradient clipping on accumulated gradients
         self._start_timer("gradient_clipping")
-        if self._amp_enabled and self._grad_scaler is not None:
-            self._grad_scaler.unscale_(self.optimizer)
+        if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
+            self._amp_config.grad_scaler.unscale_(self.optimizer)
 
         torch.nn.utils.clip_grad_norm_(
             self.policy.parameters(), max_norm=self.gradient_clip
@@ -825,9 +608,9 @@ class GRPO(BaseAlgorithm):
 
         # Update parameters
         self._start_timer("parameter_update")
-        if self._amp_enabled and self._grad_scaler is not None:
-            self._grad_scaler.step(self.optimizer)
-            self._grad_scaler.update()
+        if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
+            self._amp_config.grad_scaler.step(self.optimizer)
+            self._amp_config.grad_scaler.update()
         else:
             self.optimizer.step()
         self._end_timer("parameter_update")
@@ -845,9 +628,8 @@ class GRPO(BaseAlgorithm):
             "tokens_generated": total_tokens,  # Total tokens, not averaged
         }
 
-        # Log to wandb if enabled
-        if self.use_wandb:
-            wandb.log(metrics, step=self.total_steps)
+        # Log to logger
+        self.logger.log_metrics(metrics, self.total_steps)
 
         return metrics
 
@@ -912,12 +694,7 @@ class GRPO(BaseAlgorithm):
 
             # Print progress and timing summary
             if episode % max(1, num_episodes // 10) == 0:
-                print(
-                    f"Episode {episode}/{num_episodes} - "
-                    f"Loss: {metrics['total_loss']:.4f}, "
-                    f"Reward: {metrics['reward_mean']:.4f}, "
-                    f"KL: {metrics['kl_divergence']:.4f}"
-                )
+                self.logger.print_progress(episode, num_episodes, metrics)
 
                 # Print timing summary every few episodes
                 if episode > 0:
@@ -928,7 +705,15 @@ class GRPO(BaseAlgorithm):
             # Save checkpoint periodically
             if episode % max(1, num_episodes // 5) == 0:
                 checkpoint_path = f"checkpoints/grpo_episode_{episode}.pt"
-                self.save_checkpoint(checkpoint_path)
+                save_checkpoint(
+                    checkpoint_path,
+                    self.policy.state_dict(),
+                    self.ref_policy.state_dict(),
+                    self.optimizer.state_dict(),
+                    self.config,
+                    self.total_steps,
+                    episode,
+                )
 
         # Print final comprehensive timing summary
         print(f"\n[TRAINING] Completed {num_episodes} episodes")
@@ -968,21 +753,19 @@ class GRPO(BaseAlgorithm):
 
     def save_checkpoint(self, path: str):
         """Save model checkpoint."""
-        checkpoint = {
-            "policy_state_dict": self.policy.state_dict(),
-            "ref_policy_state_dict": self.ref_policy.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "config": self.config,
-            "total_steps": self.total_steps,
-            "episode": self.episode,
-        }
-
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save(checkpoint, path)
+        save_checkpoint(
+            path,
+            self.policy.state_dict(),
+            self.ref_policy.state_dict(),
+            self.optimizer.state_dict(),
+            self.config,
+            self.total_steps,
+            self.episode,
+        )
 
     def load_checkpoint(self, path: str):
         """Load model checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = load_checkpoint(path, self.device)
         self.policy.load_state_dict(checkpoint["policy_state_dict"])
         self.ref_policy.load_state_dict(checkpoint["ref_policy_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
