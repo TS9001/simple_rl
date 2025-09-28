@@ -1,13 +1,15 @@
-"""
-HuggingFace model wrappers and utilities.
-"""
+"""HuggingFace model wrappers and utilities."""
 
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 class LanguageModel(nn.Module):
@@ -27,17 +29,40 @@ class LanguageModel(nn.Module):
         """
         super().__init__()
 
+        self.config = config
+
         model_config = config.get("model", {})
         self.model_name = model_config.get("model_name")
         self.max_length = model_config.get("max_length", 512)
 
         # Load HuggingFace model and tokenizer
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto" if torch.cuda.is_available() else None,
-            trust_remote_code=True
-            )
+        loader_kwargs: Dict[str, Any] = {
+            "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
+            "trust_remote_code": True,
+        }
+
+        if torch.cuda.is_available():
+            loader_kwargs["device_map"] = "auto"
+            loader_kwargs.setdefault("low_cpu_mem_usage", True)
+            loader_kwargs.setdefault("use_cache", False)
+
+        attn_impl = model_config.get("attn_implementation")
+        if attn_impl is None:
+            if torch.cuda.is_available():
+                attn_impl = "flash_attention_2"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                attn_impl = "sdpa"
+
+        if attn_impl:
+            loader_kwargs["attn_implementation"] = attn_impl
+
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **loader_kwargs)
+            self._attention_impl = loader_kwargs.get("attn_implementation")
+        except TypeError:
+            loader_kwargs.pop("attn_implementation", None)
+            self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **loader_kwargs)
+            self._attention_impl = None
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name,
             padding_side="left",
@@ -55,6 +80,13 @@ class LanguageModel(nn.Module):
         # Get model config
         self.vocab_size = self.model.config.vocab_size
         self.hidden_size = self.model.config.hidden_size
+
+        # Track compile state / optimizations
+        self._compiled_device_type: Optional[str] = None
+        self._using_bettertransformer: bool = False
+
+        self._apply_device_optimizations()
+        self._maybe_enable_bettertransformer()
 
     @property
     def device(self) -> torch.device:
@@ -77,10 +109,113 @@ class LanguageModel(nn.Module):
         Returns:
             Logits [batch_size, seq_len, vocab_size]
         """
+        self._ensure_compiled()
         outputs = self.model(
             input_ids=input_ids, attention_mask=attention_mask, **kwargs
         )
         return outputs.logits
+
+    def _ensure_compiled(self) -> None:
+        """Compile the underlying model based on available backends."""
+
+        # Determine current target
+        param_device = self.device
+        target_type = getattr(param_device, "type", None)
+
+        if target_type is None or self._compiled_device_type in (target_type, "disabled", "failed"):
+            return
+
+        if not hasattr(torch, "compile"):
+            self._compiled_device_type = "disabled"
+            return
+
+        compile_kwargs: Dict[str, Any] = {}
+
+        # torch.compile support varies per backend
+        if target_type == "mps":
+            # Use the recommended AOT eager backend for MPS
+            compile_kwargs["backend"] = "aot_eager"
+        elif target_type == "cuda":
+            # Use max-autotune for best perf on CUDA; enable cudagraphs if possible
+            compile_kwargs["mode"] = "max-autotune"
+            compile_kwargs["options"] = {
+                "triton.cudagraphs": True,
+                "shape_padding": True,
+            }
+        else:
+            # Skip compile for CPU or unsupported devices
+            self._compiled_device_type = "disabled"
+            return
+
+        try:
+            self.model = torch.compile(self.model, **compile_kwargs)
+            self.model.to(param_device)
+            self._compiled_device_type = target_type
+        except Exception:
+            self._compiled_device_type = "failed"
+
+    def _apply_device_optimizations(self) -> None:
+        """Enable backend-specific performance knobs."""
+
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+            try:
+                torch.backends.cuda.enable_flash_sdp(True)
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
+                torch.backends.cuda.enable_math_sdp(True)
+            except AttributeError:
+                pass
+
+        if hasattr(torch.cuda, "empty_cache"):
+            torch.cuda.empty_cache()
+
+        if hasattr(torch.cuda, "set_per_process_memory_fraction"):
+            try:
+                torch.cuda.set_per_process_memory_fraction(0.95)
+            except Exception:
+                pass
+
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            try:
+                torch.backends.mps.matmul.allow_tf32 = True
+            except AttributeError:
+                pass
+
+            try:
+                torch.mps.empty_cache()
+            except AttributeError:
+                pass
+
+    def _maybe_enable_bettertransformer(self) -> None:
+        """Switch to BetterTransformer if available for faster attention kernels."""
+
+        if self._using_bettertransformer:
+            return
+
+        optim_cfg = self.config.get("optimization", {}) if hasattr(self, "config") else {}
+        if optim_cfg.get("enable_bettertransformer", True) is False:
+            return
+
+        if getattr(self, "_attention_impl", None) in {"flash_attention_2", "flash_attention"}:
+            return
+
+        if not hasattr(self.model, "to_bettertransformer"):
+            return
+
+        if not (torch.cuda.is_available() or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())):
+            return
+
+        try:
+            self.model = self.model.to_bettertransformer()
+            self._using_bettertransformer = True
+        except (RuntimeError, ValueError):
+            self._using_bettertransformer = False
 
     def generate(
         self,
@@ -108,6 +243,8 @@ class LanguageModel(nn.Module):
         Returns:
             Tuple of (generated_ids, attention_mask)
         """
+        self._ensure_compiled()
+
         with torch.no_grad():
             outputs = self.model.generate(
                 input_ids=prompt_ids,
