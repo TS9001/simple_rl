@@ -285,12 +285,20 @@ class GRPO(BaseAlgorithm):
 
         # Process prompts in batches
         for batch_start in range(0, num_prompts, self.rollout_batch_size):
+            batch_idx = batch_start // self.rollout_batch_size + 1
+            total_batches = (num_prompts + self.rollout_batch_size - 1) // self.rollout_batch_size
+            print(f"[TIMING] Processing batch {batch_idx}/{total_batches}...")
+            self.timing_manager.start_timer(f"batch_{batch_idx}")
+
             batch_end = min(batch_start + self.rollout_batch_size, num_prompts)
             batch_prompts = prompts[batch_start:batch_end]
             batch_answers = answers[batch_start:batch_end] if answers else None
 
             # Generate for this batch
+            self.timing_manager.start_timer(f"batch_{batch_idx}_generation")
             generation = self._generate_grouped_completions(batch_prompts)
+            gen_time = self.timing_manager.end_timer(f"batch_{batch_idx}_generation")
+            print(f"[TIMING]   Generation: {gen_time:.2f}s")
             generated_ids = generation["generated_ids"]
             generated_mask = generation["generated_mask"]
             completion_ids = generation["completion_ids"]
@@ -305,10 +313,10 @@ class GRPO(BaseAlgorithm):
             all_prompt_end_positions.append(replicated_prompt_end_positions.detach())
 
             # Compute log probs for this batch
-            self.timing_manager.start_timer("batch_policy_log_probs")
+            self.timing_manager.start_timer(f"batch_{batch_idx}_policy_log_probs")
             prev_mode = self.policy.training
             self.policy.eval()
-            with torch.enable_grad():
+            with torch.no_grad():  # No gradients needed during trajectory generation
                 prev_cache = getattr(self.policy.model.config, "use_cache", None)
                 if prev_cache is not None:
                     self.policy.model.config.use_cache = False
@@ -323,10 +331,11 @@ class GRPO(BaseAlgorithm):
                         self.policy.model.config.use_cache = prev_cache
             if prev_mode:
                 self.policy.train()
-            self.timing_manager.end_timer("batch_policy_log_probs")
+            policy_time = self.timing_manager.end_timer(f"batch_{batch_idx}_policy_log_probs")
+            print(f"[TIMING]   Policy log probs: {policy_time:.2f}s")
 
             # Compute reference log probs for this batch
-            self.timing_manager.start_timer("batch_ref_log_probs")
+            self.timing_manager.start_timer(f"batch_{batch_idx}_ref_log_probs")
             with torch.no_grad():
                 prev_cache = getattr(self.ref_policy.model.config, "use_cache", None)
                 if prev_cache is not None:
@@ -340,10 +349,11 @@ class GRPO(BaseAlgorithm):
                 finally:
                     if prev_cache is not None:
                         self.ref_policy.model.config.use_cache = prev_cache
-            self.timing_manager.end_timer("batch_ref_log_probs")
+            ref_time = self.timing_manager.end_timer(f"batch_{batch_idx}_ref_log_probs")
+            print(f"[TIMING]   Reference log probs: {ref_time:.2f}s")
 
             # Extract completion log probs for this batch
-            self.timing_manager.start_timer("mask_and_extract_completions")
+            self.timing_manager.start_timer(f"batch_{batch_idx}_extract_completions")
             completion_mask = self._create_completion_mask(completion_ids)
 
             for seq_idx in range(total_sequences):
@@ -374,10 +384,11 @@ class GRPO(BaseAlgorithm):
                 all_log_probs.append(seq_policy_log_probs)
                 all_ref_log_probs.append(seq_ref_log_probs)
                 all_completion_mask.append(seq_completion_mask)
-            self.timing_manager.end_timer("mask_and_extract_completions")
+            extract_time = self.timing_manager.end_timer(f"batch_{batch_idx}_extract_completions")
+            print(f"[TIMING]   Extract completions: {extract_time:.2f}s")
 
             # Compute rewards for this batch
-            self.timing_manager.start_timer("batch_reward_computation")
+            self.timing_manager.start_timer(f"batch_{batch_idx}_rewards")
             for prompt_idx, (prompt, answer) in enumerate(zip(batch_prompts, batch_answers)):
                 start_idx = prompt_idx * self.group_size
                 end_idx = start_idx + self.group_size
@@ -391,11 +402,15 @@ class GRPO(BaseAlgorithm):
                 if store:
                     all_prompts.extend([prompt] * self.group_size)
                     all_completions.extend(group_completions)
-            self.timing_manager.end_timer("batch_reward_computation")
+            reward_time = self.timing_manager.end_timer(f"batch_{batch_idx}_rewards")
+            print(f"[TIMING]   Reward computation: {reward_time:.2f}s")
 
             # Cleanup batch data
             del generated_ids, generated_mask, completion_ids, policy_log_probs, ref_log_probs
             clear_device_cache(self.device)
+
+            batch_time = self.timing_manager.end_timer(f"batch_{batch_idx}")
+            print(f"[TIMING] Batch {batch_idx} total: {batch_time:.2f}s\n")
 
         # Concatenate all batches (pad to same length first)
         # Find max sequence length across all batches
@@ -574,6 +589,7 @@ class GRPO(BaseAlgorithm):
         answers = batch["answers"]
 
         self.timing_manager.start_timer("trajectory_generation")
+        print(f"[TIMING] Starting trajectory generation for {len(prompts)} prompts (batch size: {self.rollout_batch_size})...")
         (
             _,
             _,
@@ -584,7 +600,8 @@ class GRPO(BaseAlgorithm):
         ) = self.generate_trajectories(
             prompts, answers=answers, store_outputs=False
         )
-        self.timing_manager.end_timer("trajectory_generation")
+        traj_time = self.timing_manager.end_timer("trajectory_generation")
+        print(f"[TIMING] Trajectory generation completed in {traj_time:.2f}s")
 
         self.timing_manager.start_timer("advantage_computation")
         advantages = self.compute_advantages(
@@ -592,7 +609,11 @@ class GRPO(BaseAlgorithm):
             group_size=self.group_size,
             normalize_within_groups=self.normalize_rewards
         )
-        self.timing_manager.end_timer("advantage_computation")
+        adv_time = self.timing_manager.end_timer("advantage_computation")
+        print(f"[TIMING] Advantage computation completed in {adv_time:.2f}s")
+
+        self.timing_manager.start_timer("optimization")
+        print(f"[TIMING] Starting optimization phase...")
 
         total_sequences = rewards.shape[0]
 
@@ -611,7 +632,11 @@ class GRPO(BaseAlgorithm):
         indices = torch.randperm(total_sequences, device=self.device)
 
         # Iterate through minibatches
-        for mb_start in range(0, total_sequences, self.minibatch_size):
+        num_minibatches = (total_sequences + self.minibatch_size - 1) // self.minibatch_size
+        for mb_idx, mb_start in enumerate(range(0, total_sequences, self.minibatch_size), 1):
+            print(f"[TIMING] Processing minibatch {mb_idx}/{num_minibatches}...")
+            self.timing_manager.start_timer(f"minibatch_{mb_idx}")
+
             mb_end = min(mb_start + self.minibatch_size, total_sequences)
             mb_indices = indices[mb_start:mb_end]
 
@@ -622,7 +647,7 @@ class GRPO(BaseAlgorithm):
             mb_completion_mask = completion_mask[mb_indices]
 
             # Recompute log probs with CURRENT policy
-            self.timing_manager.start_timer("recompute_log_probs")
+            self.timing_manager.start_timer(f"minibatch_{mb_idx}_recompute")
             mb_generated_ids = self.stored_generated_ids[mb_indices]
             mb_attention_mask = self.stored_attention_mask[mb_indices]
 
@@ -669,12 +694,14 @@ class GRPO(BaseAlgorithm):
             mb_new_log_probs = torch.stack(mb_new_log_probs_list)
             mb_new_log_probs = mb_new_log_probs * mb_completion_mask
 
-            self.timing_manager.end_timer("recompute_log_probs")
+            recomp_time = self.timing_manager.end_timer(f"minibatch_{mb_idx}_recompute")
+            print(f"[TIMING]   Recompute log probs: {recomp_time:.2f}s")
 
             # Zero gradients
             self.optimizer.zero_grad()
 
             # Compute loss
+            self.timing_manager.start_timer(f"minibatch_{mb_idx}_loss")
             autocast_ctx = self._amp_config.autocast
             with autocast_ctx:
                 loss, mb_metrics = self.compute_loss(
@@ -684,33 +711,38 @@ class GRPO(BaseAlgorithm):
                     mb_ref_log_probs,
                     mb_completion_mask,
                 )
+            loss_time = self.timing_manager.end_timer(f"minibatch_{mb_idx}_loss")
+            print(f"[TIMING]   Loss computation: {loss_time:.2f}s")
 
             # Backward pass
-            self.timing_manager.start_timer("backward_pass")
+            self.timing_manager.start_timer(f"minibatch_{mb_idx}_backward")
             if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
                 self._amp_config.grad_scaler.scale(loss).backward()
             else:
                 loss.backward()
-            self.timing_manager.end_timer("backward_pass")
+            backward_time = self.timing_manager.end_timer(f"minibatch_{mb_idx}_backward")
+            print(f"[TIMING]   Backward pass: {backward_time:.2f}s")
 
             # Gradient clipping
-            self.timing_manager.start_timer("gradient_clipping")
+            self.timing_manager.start_timer(f"minibatch_{mb_idx}_clip")
             if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
                 self._amp_config.grad_scaler.unscale_(self.optimizer)
 
             torch.nn.utils.clip_grad_norm_(
                 self.policy.parameters(), max_norm=self.gradient_clip
             )
-            self.timing_manager.end_timer("gradient_clipping")
+            clip_time = self.timing_manager.end_timer(f"minibatch_{mb_idx}_clip")
+            print(f"[TIMING]   Gradient clipping: {clip_time:.2f}s")
 
             # Parameter update
-            self.timing_manager.start_timer("parameter_update")
+            self.timing_manager.start_timer(f"minibatch_{mb_idx}_update")
             if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
                 self._amp_config.grad_scaler.step(self.optimizer)
                 self._amp_config.grad_scaler.update()
             else:
                 self.optimizer.step()
-            self.timing_manager.end_timer("parameter_update")
+            update_time = self.timing_manager.end_timer(f"minibatch_{mb_idx}_update")
+            print(f"[TIMING]   Parameter update: {update_time:.2f}s")
 
             # Accumulate metrics
             for key in epoch_metrics:
@@ -719,10 +751,25 @@ class GRPO(BaseAlgorithm):
             num_updates += 1
 
             # Cleanup
-            self.timing_manager.start_timer("memory_cleanup")
+            self.timing_manager.start_timer(f"minibatch_{mb_idx}_cleanup")
             del mb_new_log_probs, mb_full_log_probs, loss
             clear_device_cache(self.device)
-            self.timing_manager.end_timer("memory_cleanup")
+            cleanup_time = self.timing_manager.end_timer(f"minibatch_{mb_idx}_cleanup")
+            print(f"[TIMING]   Cleanup: {cleanup_time:.2f}s")
+
+            mb_total_time = self.timing_manager.end_timer(f"minibatch_{mb_idx}")
+            print(f"[TIMING] Minibatch {mb_idx} total: {mb_total_time:.2f}s\n")
+
+        optim_time = self.timing_manager.end_timer("optimization")
+        print(f"[TIMING] Optimization phase completed in {optim_time:.2f}s")
+        print(f"[TIMING] ====================================")
+        print(f"[TIMING] TRAIN STEP SUMMARY:")
+        print(f"[TIMING]   Trajectory generation: {traj_time:.2f}s")
+        print(f"[TIMING]   Advantage computation: {adv_time:.2f}s")
+        print(f"[TIMING]   Optimization ({num_minibatches} minibatches): {optim_time:.2f}s")
+        total_train_time = traj_time + adv_time + optim_time
+        print(f"[TIMING]   TOTAL: {total_train_time:.2f}s")
+        print(f"[TIMING] ====================================\n")
 
         # Average metrics
         for key in epoch_metrics:
