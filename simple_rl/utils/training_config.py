@@ -41,13 +41,21 @@ class TrainingConfig:
             "clip_epsilon": algo_config.get("clip_epsilon", 0.2),
             "store_completions": algo_config.get("store_completions", True),
 
+            # Rollout generation batching (to avoid OOM during generation)
+            "rollout_batch_size": training_config.get("rollout_batch_size", None),  # Number of prompts to generate at once
+
             # Update parameters
-            "update_epochs": training_config.get("update_epochs", 1),
+            "update_epochs": training_config.get("update_epochs", 1),  # GRPO uses single epoch (DeepSeekMath)
         }
 
         # Handle minibatch_size default
         if parsed["minibatch_size"] is None or parsed["minibatch_size"] == 0:
             parsed["minibatch_size"] = parsed["batch_size"]
+
+        # Handle rollout_batch_size default
+        if parsed["rollout_batch_size"] is None or parsed["rollout_batch_size"] == 0:
+            # Default: generate 2 prompts at a time (conservative to avoid OOM)
+            parsed["rollout_batch_size"] = min(2, parsed["batch_size"])
 
         return parsed
 
@@ -136,6 +144,11 @@ class TrainingConfig:
     def update_epochs(self) -> int:
         """Get number of update epochs."""
         return self._parsed_config["update_epochs"]
+
+    @property
+    def rollout_batch_size(self) -> int:
+        """Get rollout batch size for generation."""
+        return self._parsed_config["rollout_batch_size"]
 
 
 def create_training_config(config: Dict[str, Any]) -> TrainingConfig:

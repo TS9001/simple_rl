@@ -1,0 +1,838 @@
+"""
+GRPO (Group Relative Policy Optimization) - Proper Implementation.
+
+Based on DeepSeekMath paper (arxiv.org/abs/2402.03300).
+
+Key features:
+- PPO-style clipped surrogate objective (NOT REINFORCE)
+- Multiple epochs of updates on collected trajectories
+- Group-based advantage normalization (no value network)
+- KL divergence penalty with reference model
+- Proper minibatch updates with log prob recomputation
+"""
+
+import copy
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
+
+from simple_rl.algorithms.base import BaseAlgorithm
+from simple_rl.utils.huggingface_wrappers import LanguageModel
+from simple_rl.utils.device import get_target_device, clear_device_cache
+from simple_rl.utils.amp import create_amp_config
+from simple_rl.utils.optimization import configure_optimizer
+from simple_rl.utils.timing import TimingManager
+from simple_rl.utils.training_config import create_training_config
+from simple_rl.utils.checkpointing import save_checkpoint, load_checkpoint
+from simple_rl.utils.logging_utils import create_logger
+
+
+class GRPO(BaseAlgorithm):
+    """
+    Proper Group Relative Policy Optimization (GRPO) algorithm.
+
+    Implements PPO-style clipped objective with group-based advantages.
+    No value network - baseline comes from group mean rewards.
+
+    Reference: DeepSeekMath paper (https://arxiv.org/abs/2402.03300)
+    """
+
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        batch_reward_fn: Optional[Callable] = None,
+        use_wandb: bool = False,
+    ):
+        """Initialize GRPO algorithm."""
+        self.config = config or {}
+        self.use_wandb = use_wandb
+
+        # Device setup
+        device_config = self.config.get("device", None)
+        self.device = get_target_device(device_config)
+
+        # Initialize model
+        if not config:
+            raise ValueError("Config must be provided")
+
+        self.policy = LanguageModel(config)
+        self.policy = self.policy.to(self.device)
+
+        # Create frozen reference model for KL penalty
+        self.ref_policy = copy.deepcopy(self.policy)
+        self.ref_policy = self.ref_policy.to(self.device)
+
+        # Freeze reference model
+        for param in self.ref_policy.parameters():
+            param.requires_grad = False
+        self.ref_policy.eval()
+
+        # Verify freezing
+        frozen_params = sum(1 for p in self.ref_policy.parameters() if not p.requires_grad)
+        total_params = sum(1 for _ in self.ref_policy.parameters())
+        assert frozen_params == total_params, "Not all reference parameters frozen"
+        print(f"✓ Reference model frozen: {frozen_params} parameters")
+
+        # Training config
+        self.training_config = create_training_config(self.config)
+
+        # GRPO parameters
+        self.group_size = self.training_config.group_size
+        self.kl_coef = self.training_config.kl_coef
+        self.normalize_rewards = self.training_config.normalize_rewards
+        self.clip_epsilon = self.training_config.clip_epsilon
+        self.store_completions = self.training_config.store_completions
+        self.update_epochs = self.training_config.update_epochs
+
+        # Training parameters
+        self.learning_rate = self.training_config.learning_rate
+        self.batch_size = self.training_config.batch_size
+        self.minibatch_size = self.training_config.minibatch_size
+        self.rollout_batch_size = self.training_config.rollout_batch_size
+        self.max_new_tokens = self.training_config.max_new_tokens
+        self.temperature = self.training_config.temperature
+        self.top_k = self.training_config.top_k
+        self.top_p = self.training_config.top_p
+        self.gradient_clip = self.training_config.gradient_clip
+
+        # AMP setup
+        self._amp_config = create_amp_config(self.config)
+
+        # Optimizer
+        self.optimizer = configure_optimizer(self.policy, self.config)
+
+        # Reward function
+        self.batch_reward_fn = batch_reward_fn
+
+        # Logger
+        self.logger = create_logger(self.config)
+        if self.use_wandb:
+            self.logger.init_wandb()
+
+        # Statistics
+        self.total_steps = 0
+        self.episode = 0
+
+        # Timing
+        self.timing_manager = TimingManager()
+
+        # Storage for trajectory data (needed for multiple epochs)
+        self.stored_generated_ids = None
+        self.stored_attention_mask = None
+        self.stored_prompt_end_positions = None
+
+    def reset_timings(self):
+        """Reset timing data."""
+        self.timing_manager.reset_timings()
+
+    def _print_timing_summary(self, title: str):
+        """Print timing summary."""
+        self.timing_manager.print_timing_summary(title)
+
+    def _create_completion_mask(self, completion_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Create mask for completion tokens, excluding tokens after EOS.
+
+        Args:
+            completion_ids: Token IDs [batch_size, seq_len]
+
+        Returns:
+            Binary mask [batch_size, seq_len]
+        """
+        eos_token_id = self.policy.tokenizer.eos_token_id
+        is_eos = completion_ids == eos_token_id
+
+        # Find first EOS position
+        eos_idx = torch.full(
+            (is_eos.size(0),),
+            is_eos.size(1),
+            dtype=torch.long,
+            device=completion_ids.device,
+        )
+
+        mask_exists = is_eos.any(dim=1)
+        eos_idx[mask_exists] = is_eos.int().argmax(dim=1)[mask_exists]
+
+        # Create mask
+        sequence_indices = torch.arange(
+            is_eos.size(1), device=completion_ids.device
+        ).expand(is_eos.size(0), -1)
+
+        return (sequence_indices <= eos_idx.unsqueeze(1)).float()
+
+    def _generate_grouped_completions(
+        self, prompts: List[str]
+    ) -> Dict[str, torch.Tensor]:
+        """Generate group_size completions for each prompt."""
+
+        self.timing_manager.start_timer("batch_tokenization")
+        tokenized = self.policy.tokenize(prompts, padding_side="left")
+        batch_prompt_ids = tokenized["input_ids"].to(self.device)
+        batch_prompt_mask = tokenized["attention_mask"].to(self.device)
+        self.timing_manager.end_timer("batch_tokenization")
+
+        self.timing_manager.start_timer("prompt_replication")
+        num_prompts = len(prompts)
+        total_sequences = num_prompts * self.group_size
+
+        # Replicate for group sampling
+        replicated_prompt_ids = batch_prompt_ids.repeat_interleave(
+            self.group_size, dim=0
+        )
+        replicated_prompt_mask = batch_prompt_mask.repeat_interleave(
+            self.group_size, dim=0
+        )
+        self.timing_manager.end_timer("prompt_replication")
+
+        self.timing_manager.start_timer("batch_text_generation")
+        prev_mode = self.policy.training
+        self.policy.eval()
+        with torch.no_grad():
+            generated_ids, generated_mask = self.policy.generate(
+                replicated_prompt_ids,
+                attention_mask=replicated_prompt_mask,
+                max_new_tokens=self.max_new_tokens,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                num_return_sequences=1,
+                min_new_tokens=1,
+            )
+        self.policy.train(prev_mode)
+        self.timing_manager.end_timer("batch_text_generation")
+
+        self.timing_manager.start_timer("completion_extraction")
+        # Extract completion IDs
+        prompt_lengths = batch_prompt_mask.sum(dim=-1)
+        prompt_start_positions = torch.argmax(batch_prompt_mask, dim=-1)
+        prompt_end_positions = prompt_start_positions + prompt_lengths
+        replicated_prompt_end_positions = prompt_end_positions.repeat_interleave(
+            self.group_size, dim=0
+        )
+
+        all_completion_ids = []
+        for seq_idx in range(total_sequences):
+            prompt_end = int(replicated_prompt_end_positions[seq_idx])
+            seq_completion_ids = generated_ids[seq_idx, prompt_end:]
+            all_completion_ids.append(seq_completion_ids)
+
+        max_completion_length = max(
+            comp_ids.size(0) for comp_ids in all_completion_ids
+        ) if all_completion_ids else 0
+
+        completion_ids = torch.stack([
+            F.pad(
+                comp_ids,
+                (0, max_completion_length - comp_ids.size(0)),
+                value=self.policy.tokenizer.pad_token_id,
+            )
+            for comp_ids in all_completion_ids
+        ])
+
+        completion_texts = self.policy.decode(completion_ids)
+        self.timing_manager.end_timer("completion_extraction")
+
+        return {
+            "generated_ids": generated_ids,
+            "generated_mask": generated_mask,
+            "completion_ids": completion_ids,
+            "completion_texts": completion_texts,
+            "all_completion_ids": all_completion_ids,
+            "prompt_end_positions": replicated_prompt_end_positions,
+            "total_sequences": total_sequences,
+        }
+
+    def generate_trajectories(
+        self,
+        prompts: List[str],
+        answers: Optional[List[str]] = None,
+        store_outputs: Optional[bool] = None,
+    ) -> Tuple[
+        Optional[List[str]],
+        Optional[List[str]],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """
+        Generate trajectories in batches to avoid OOM.
+
+        Processes prompts in batches of size rollout_batch_size to avoid
+        memory issues during generation.
+
+        Returns:
+            (prompts, completions, rewards, old_log_probs, ref_log_probs, completion_mask)
+        """
+        store = self.store_completions if store_outputs is None else store_outputs
+
+        # Storage for aggregated results across batches
+        all_prompts = [] if store else None
+        all_completions = [] if store else None
+        all_rewards = []
+        all_log_probs = []
+        all_ref_log_probs = []
+        all_completion_mask = []
+
+        all_generated_ids = []
+        all_generated_mask = []
+        all_prompt_end_positions = []
+
+        num_prompts = len(prompts)
+
+        # Process prompts in batches
+        for batch_start in range(0, num_prompts, self.rollout_batch_size):
+            batch_end = min(batch_start + self.rollout_batch_size, num_prompts)
+            batch_prompts = prompts[batch_start:batch_end]
+            batch_answers = answers[batch_start:batch_end] if answers else None
+
+            # Generate for this batch
+            generation = self._generate_grouped_completions(batch_prompts)
+            generated_ids = generation["generated_ids"]
+            generated_mask = generation["generated_mask"]
+            completion_ids = generation["completion_ids"]
+            completion_texts = generation["completion_texts"]
+            batch_completion_ids = generation["all_completion_ids"]
+            replicated_prompt_end_positions = generation["prompt_end_positions"]
+            total_sequences = generation["total_sequences"]
+
+            # Store for later recomputation
+            all_generated_ids.append(generated_ids.detach())
+            all_generated_mask.append(generated_mask.detach())
+            all_prompt_end_positions.append(replicated_prompt_end_positions.detach())
+
+            # Compute log probs for this batch
+            self.timing_manager.start_timer("batch_policy_log_probs")
+            prev_mode = self.policy.training
+            self.policy.eval()
+            with torch.enable_grad():
+                prev_cache = getattr(self.policy.model.config, "use_cache", None)
+                if prev_cache is not None:
+                    self.policy.model.config.use_cache = False
+                try:
+                    policy_log_probs = self.policy.compute_log_probs(
+                        generated_ids,
+                        attention_mask=generated_mask,
+                        target_mask=None,
+                    )
+                finally:
+                    if prev_cache is not None:
+                        self.policy.model.config.use_cache = prev_cache
+            if prev_mode:
+                self.policy.train()
+            self.timing_manager.end_timer("batch_policy_log_probs")
+
+            # Compute reference log probs for this batch
+            self.timing_manager.start_timer("batch_ref_log_probs")
+            with torch.no_grad():
+                prev_cache = getattr(self.ref_policy.model.config, "use_cache", None)
+                if prev_cache is not None:
+                    self.ref_policy.model.config.use_cache = False
+                try:
+                    ref_log_probs = self.ref_policy.compute_log_probs(
+                        generated_ids,
+                        attention_mask=generated_mask,
+                        target_mask=None,
+                    )
+                finally:
+                    if prev_cache is not None:
+                        self.ref_policy.model.config.use_cache = prev_cache
+            self.timing_manager.end_timer("batch_ref_log_probs")
+
+            # Extract completion log probs for this batch
+            self.timing_manager.start_timer("mask_and_extract_completions")
+            completion_mask = self._create_completion_mask(completion_ids)
+
+            for seq_idx in range(total_sequences):
+                seq_completion_ids = batch_completion_ids[seq_idx]
+                actual_completion_length = seq_completion_ids.size(0)
+                prompt_end = int(replicated_prompt_end_positions[seq_idx])
+
+                completion_start = max(prompt_end - 1, 0)
+                completion_end = completion_start + actual_completion_length
+
+                seq_policy_log_probs = policy_log_probs[seq_idx, completion_start:completion_end]
+                seq_ref_log_probs = ref_log_probs[seq_idx, completion_start:completion_end]
+                seq_completion_mask = completion_mask[seq_idx, :actual_completion_length]
+
+                min_length = min(
+                    len(seq_policy_log_probs),
+                    len(seq_ref_log_probs),
+                    len(seq_completion_mask)
+                )
+
+                seq_policy_log_probs = seq_policy_log_probs[:min_length]
+                seq_ref_log_probs = seq_ref_log_probs[:min_length]
+                seq_completion_mask = seq_completion_mask[:min_length]
+
+                seq_policy_log_probs = seq_policy_log_probs * seq_completion_mask
+                seq_ref_log_probs = seq_ref_log_probs * seq_completion_mask
+
+                all_log_probs.append(seq_policy_log_probs)
+                all_ref_log_probs.append(seq_ref_log_probs)
+                all_completion_mask.append(seq_completion_mask)
+            self.timing_manager.end_timer("mask_and_extract_completions")
+
+            # Compute rewards for this batch
+            self.timing_manager.start_timer("batch_reward_computation")
+            for prompt_idx, (prompt, answer) in enumerate(zip(batch_prompts, batch_answers)):
+                start_idx = prompt_idx * self.group_size
+                end_idx = start_idx + self.group_size
+                group_completions = completion_texts[start_idx:end_idx]
+
+                group_rewards = self.batch_reward_fn(
+                    group_completions, [answer] * self.group_size, self.device
+                )
+                all_rewards.append(group_rewards)
+
+                if store:
+                    all_prompts.extend([prompt] * self.group_size)
+                    all_completions.extend(group_completions)
+            self.timing_manager.end_timer("batch_reward_computation")
+
+            # Cleanup batch data
+            del generated_ids, generated_mask, completion_ids, policy_log_probs, ref_log_probs
+            clear_device_cache(self.device)
+
+        # Concatenate all batches (pad to same length first)
+        # Find max sequence length across all batches
+        max_seq_len = max(tensor.size(1) for tensor in all_generated_ids)
+
+        # Pad all tensors to same length
+        padded_generated_ids = []
+        padded_generated_mask = []
+        for gen_ids, gen_mask in zip(all_generated_ids, all_generated_mask):
+            if gen_ids.size(1) < max_seq_len:
+                # Pad sequences to max_seq_len
+                pad_len = max_seq_len - gen_ids.size(1)
+                gen_ids = F.pad(gen_ids, (0, pad_len), value=self.policy.tokenizer.pad_token_id)
+                gen_mask = F.pad(gen_mask, (0, pad_len), value=0)
+            padded_generated_ids.append(gen_ids)
+            padded_generated_mask.append(gen_mask)
+
+        self.stored_generated_ids = torch.cat(padded_generated_ids, dim=0)
+        self.stored_attention_mask = torch.cat(padded_generated_mask, dim=0)
+        self.stored_prompt_end_positions = torch.cat(all_prompt_end_positions, dim=0)
+
+        # Stack into tensors (OLD log probs from generation - won't change)
+        self.timing_manager.start_timer("tensor_stacking")
+        all_log_probs = pad_sequence(all_log_probs, batch_first=True, padding_value=0.0).detach()
+        all_ref_log_probs = pad_sequence(all_ref_log_probs, batch_first=True, padding_value=0.0).detach()
+        all_completion_mask = pad_sequence(all_completion_mask, batch_first=True, padding_value=0.0)
+        all_rewards = torch.cat(all_rewards, dim=0)
+        self.timing_manager.end_timer("tensor_stacking")
+
+        if store:
+            return (
+                all_prompts,
+                all_completions,
+                all_rewards,
+                all_log_probs,
+                all_ref_log_probs,
+                all_completion_mask,
+            )
+        return (
+            None,
+            None,
+            all_rewards,
+            all_log_probs,
+            all_ref_log_probs,
+            all_completion_mask,
+        )
+
+    def compute_advantages(
+        self,
+        rewards: torch.Tensor,
+        group_size: int = 1,
+        normalize_within_groups: bool = True
+    ) -> torch.Tensor:
+        """
+        Compute group-normalized advantages (GRPO's key innovation).
+
+        Args:
+            rewards: Reward tensor [batch_size]
+            group_size: Number of samples per prompt
+            normalize_within_groups: Whether to normalize per group
+
+        Returns:
+            Advantages tensor [batch_size]
+        """
+        if normalize_within_groups and group_size > 1:
+            batch_size = rewards.shape[0]
+            num_groups = batch_size // group_size
+
+            # Reshape to groups
+            grouped_rewards = rewards.view(num_groups, group_size)
+
+            # Normalize within each group (baseline = group mean)
+            group_mean = grouped_rewards.mean(dim=1, keepdim=True)
+            group_std = grouped_rewards.std(dim=1, keepdim=True)
+
+            normalized_rewards = (grouped_rewards - group_mean) / (group_std + 1e-8)
+
+            # Flatten back
+            advantages = normalized_rewards.view(-1)
+        else:
+            # Global normalization
+            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
+        return advantages
+
+    def compute_loss(
+        self,
+        new_log_probs: torch.Tensor,
+        old_log_probs: torch.Tensor,
+        advantages: torch.Tensor,
+        ref_log_probs: torch.Tensor,
+        completion_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute GRPO loss with PPO-style clipping.
+
+        Loss = E[min(ratio * A, clip(ratio, 1-ε, 1+ε) * A)] - β * KL
+
+        Args:
+            new_log_probs: Current policy log probs [batch, seq_len]
+            old_log_probs: Old policy log probs (from generation) [batch, seq_len]
+            advantages: Group-normalized advantages [batch]
+            ref_log_probs: Reference model log probs [batch, seq_len]
+            completion_mask: Valid token mask [batch, seq_len]
+
+        Returns:
+            (loss, metrics)
+        """
+        self.timing_manager.start_timer("loss_computation")
+
+        # Sum log probs over sequence (per-sequence log prob)
+        new_log_probs_sum = (new_log_probs * completion_mask).sum(dim=-1) / (
+            completion_mask.sum(dim=-1) + 1e-8
+        )
+        old_log_probs_sum = (old_log_probs * completion_mask).sum(dim=-1) / (
+            completion_mask.sum(dim=-1) + 1e-8
+        )
+
+        # Compute ratio: π_new / π_old
+        ratio = torch.exp(new_log_probs_sum - old_log_probs_sum)
+
+        # PPO clipped surrogate objective
+        surr1 = ratio * advantages.detach()
+        surr2 = torch.clamp(
+            ratio,
+            1.0 - self.clip_epsilon,
+            1.0 + self.clip_epsilon
+        ) * advantages.detach()
+        policy_loss = -torch.min(surr1, surr2).mean()
+
+        # KL divergence penalty (per-token)
+        # NOTE: Detach ref_log_probs - no backprop through reference model!
+        delta = new_log_probs - ref_log_probs.detach()
+        per_token_kl = torch.exp(delta) - delta - 1.0  # Schulman approximation
+        kl_penalty = (per_token_kl * completion_mask).sum() / (completion_mask.sum() + 1e-8)
+
+        # Total GRPO loss
+        loss = policy_loss + self.kl_coef * kl_penalty
+
+        # Metrics
+        metrics = {
+            "policy_loss": policy_loss.item(),
+            "kl_divergence": kl_penalty.item(),
+            "ratio_mean": ratio.mean().item(),
+            "ratio_min": ratio.min().item(),
+            "ratio_max": ratio.max().item(),
+            "ratio_clipped_frac": (
+                (ratio < 1.0 - self.clip_epsilon) | (ratio > 1.0 + self.clip_epsilon)
+            ).float().mean().item(),
+            "advantages_mean": advantages.mean().item(),
+            "advantages_std": advantages.std().item(),
+            "tokens_generated": completion_mask.sum().item(),
+        }
+
+        self.timing_manager.end_timer("loss_computation")
+        return loss, metrics
+
+    def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Perform proper GRPO training step (single epoch as per DeepSeekMath).
+
+        Training procedure:
+        1. Collect all rollouts/trajectories (store in RAM)
+        2. Compute group-normalized advantages
+        3. Single epoch: shuffle, iterate minibatches, update policy
+        4. Minibatch = subset of rollouts per optimization step
+
+        Args:
+            batch: Dictionary with 'prompts' and 'answers'
+
+        Returns:
+            Dictionary of training metrics
+        """
+        self.policy.train()
+        prompts = batch["prompts"]
+        answers = batch["answers"]
+
+        self.timing_manager.start_timer("trajectory_generation")
+        (
+            _,
+            _,
+            rewards,
+            old_log_probs,
+            ref_log_probs,
+            completion_mask,
+        ) = self.generate_trajectories(
+            prompts, answers=answers, store_outputs=False
+        )
+        self.timing_manager.end_timer("trajectory_generation")
+
+        self.timing_manager.start_timer("advantage_computation")
+        advantages = self.compute_advantages(
+            rewards,
+            group_size=self.group_size,
+            normalize_within_groups=self.normalize_rewards
+        )
+        self.timing_manager.end_timer("advantage_computation")
+
+        total_sequences = rewards.shape[0]
+
+        # Aggregate metrics across all minibatch updates
+        epoch_metrics = {
+            "policy_loss": 0.0,
+            "kl_divergence": 0.0,
+            "ratio_mean": 0.0,
+            "ratio_clipped_frac": 0.0,
+            "ratio_min": 0.0,
+            "ratio_max": 0.0,
+        }
+        num_updates = 0
+
+        # Shuffle rollouts once (single epoch)
+        indices = torch.randperm(total_sequences, device=self.device)
+
+        # Iterate through minibatches
+        for mb_start in range(0, total_sequences, self.minibatch_size):
+            mb_end = min(mb_start + self.minibatch_size, total_sequences)
+            mb_indices = indices[mb_start:mb_end]
+
+            # Extract minibatch data
+            mb_old_log_probs = old_log_probs[mb_indices]
+            mb_ref_log_probs = ref_log_probs[mb_indices]
+            mb_advantages = advantages[mb_indices]
+            mb_completion_mask = completion_mask[mb_indices]
+
+            # Recompute log probs with CURRENT policy
+            self.timing_manager.start_timer("recompute_log_probs")
+            mb_generated_ids = self.stored_generated_ids[mb_indices]
+            mb_attention_mask = self.stored_attention_mask[mb_indices]
+
+            prev_mode = self.policy.training
+            self.policy.eval()
+            with torch.enable_grad():
+                prev_cache = getattr(self.policy.model.config, "use_cache", None)
+                if prev_cache is not None:
+                    self.policy.model.config.use_cache = False
+                try:
+                    mb_full_log_probs = self.policy.compute_log_probs(
+                        mb_generated_ids,
+                        attention_mask=mb_attention_mask,
+                        target_mask=None,
+                    )
+                finally:
+                    if prev_cache is not None:
+                        self.policy.model.config.use_cache = prev_cache
+            self.policy.train(prev_mode)
+
+            # Extract completion log probs (same indexing as during generation)
+            mb_prompt_ends = self.stored_prompt_end_positions[mb_indices]
+            mb_new_log_probs_list = []
+
+            for i in range(len(mb_indices)):
+                prompt_end = int(mb_prompt_ends[i])
+                completion_start = max(prompt_end - 1, 0)
+                completion_len = mb_completion_mask[i].sum().int().item()
+
+                seq_new_log_probs = mb_full_log_probs[i, completion_start:completion_start + completion_len]
+
+                # Pad to match completion_mask size
+                if seq_new_log_probs.size(0) < mb_completion_mask.size(1):
+                    seq_new_log_probs = F.pad(
+                        seq_new_log_probs,
+                        (0, mb_completion_mask.size(1) - seq_new_log_probs.size(0)),
+                        value=0.0
+                    )
+                else:
+                    seq_new_log_probs = seq_new_log_probs[:mb_completion_mask.size(1)]
+
+                mb_new_log_probs_list.append(seq_new_log_probs)
+
+            mb_new_log_probs = torch.stack(mb_new_log_probs_list)
+            mb_new_log_probs = mb_new_log_probs * mb_completion_mask
+
+            self.timing_manager.end_timer("recompute_log_probs")
+
+            # Zero gradients
+            self.optimizer.zero_grad()
+
+            # Compute loss
+            autocast_ctx = self._amp_config.autocast
+            with autocast_ctx:
+                loss, mb_metrics = self.compute_loss(
+                    mb_new_log_probs,
+                    mb_old_log_probs,
+                    mb_advantages,
+                    mb_ref_log_probs,
+                    mb_completion_mask,
+                )
+
+            # Backward pass
+            self.timing_manager.start_timer("backward_pass")
+            if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
+                self._amp_config.grad_scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            self.timing_manager.end_timer("backward_pass")
+
+            # Gradient clipping
+            self.timing_manager.start_timer("gradient_clipping")
+            if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
+                self._amp_config.grad_scaler.unscale_(self.optimizer)
+
+            torch.nn.utils.clip_grad_norm_(
+                self.policy.parameters(), max_norm=self.gradient_clip
+            )
+            self.timing_manager.end_timer("gradient_clipping")
+
+            # Parameter update
+            self.timing_manager.start_timer("parameter_update")
+            if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
+                self._amp_config.grad_scaler.step(self.optimizer)
+                self._amp_config.grad_scaler.update()
+            else:
+                self.optimizer.step()
+            self.timing_manager.end_timer("parameter_update")
+
+            # Accumulate metrics
+            for key in epoch_metrics:
+                if key in mb_metrics:
+                    epoch_metrics[key] += mb_metrics[key]
+            num_updates += 1
+
+            # Cleanup
+            self.timing_manager.start_timer("memory_cleanup")
+            del mb_new_log_probs, mb_full_log_probs, loss
+            clear_device_cache(self.device)
+            self.timing_manager.end_timer("memory_cleanup")
+
+        # Average metrics
+        for key in epoch_metrics:
+            epoch_metrics[key] /= max(1, num_updates)
+
+        # Final metrics
+        metrics = {
+            "total_loss": epoch_metrics["policy_loss"] + self.kl_coef * epoch_metrics["kl_divergence"],
+            "pg_loss": epoch_metrics["policy_loss"],
+            "kl_divergence": epoch_metrics["kl_divergence"],
+            "reward_mean": rewards.mean().item(),
+            "reward_std": rewards.std().item(),
+            "ratio_mean": epoch_metrics["ratio_mean"],
+            "ratio_min": epoch_metrics["ratio_min"],
+            "ratio_max": epoch_metrics["ratio_max"],
+            "ratio_clipped_frac": epoch_metrics["ratio_clipped_frac"],
+            "tokens_generated": completion_mask.sum().item(),
+        }
+
+        # Update statistics
+        self.total_steps += 1
+
+        # Log metrics
+        self.logger.log_metrics(metrics, self.total_steps)
+
+        # Cleanup
+        del old_log_probs, ref_log_probs, advantages, completion_mask, rewards
+        clear_device_cache(self.device)
+
+        return metrics
+
+    def train(self, num_episodes: int) -> Dict[str, float]:
+        """Train for specified number of episodes."""
+        print(f"Starting proper GRPO training for {num_episodes} episodes...")
+        print(f"  - Using PPO clipped objective (clip_epsilon={self.clip_epsilon})")
+        print(f"  - Single epoch per batch (as per DeepSeekMath)")
+        print(f"  - Group size: {self.group_size}")
+        print(f"  - Rollout batch size: {self.rollout_batch_size} prompts (OOM prevention)")
+        print(f"  - Minibatch size: {self.minibatch_size} rollouts per update")
+
+        final_metrics = {}
+
+        for episode in range(num_episodes):
+            self.episode = episode
+
+            # Generate demo prompts (replace with actual data)
+            prompts = [
+                f"Question {i}: What is {i}+{i}?" for i in range(self.batch_size)
+            ]
+
+            batch = {"prompts": prompts, "answers": [str(i*2) for i in range(self.batch_size)]}
+            metrics = self.train_step(batch)
+
+            # Print progress
+            log_interval = self.config.get("logging", {}).get("log_interval", 1)
+
+            if episode % log_interval == 0:
+                self.logger.print_progress(episode, num_episodes, metrics)
+
+                if episode > 0 and episode % 10 == 0:
+                    self.timing_manager.print_timing_summary(f"Episode {episode} Summary")
+
+            final_metrics = metrics
+
+            # Save checkpoint
+            save_interval = self.config.get("logging", {}).get("save_interval", 100)
+            if episode % save_interval == 0 and episode > 0:
+                checkpoint_path = f"checkpoints/grpo_episode_{episode}.pt"
+                self.save_checkpoint(checkpoint_path)
+
+        print(f"\n[TRAINING] Completed {num_episodes} episodes")
+        self.timing_manager.print_timing_summary("FINAL TRAINING PERFORMANCE")
+
+        return final_metrics
+
+    def evaluate(self, num_episodes: int = 1) -> Dict[str, float]:
+        """Evaluate the policy."""
+        self.policy.eval()
+        total_rewards = []
+
+        with torch.no_grad():
+            for _ in range(num_episodes):
+                prompts = [f"Test {i}: Calculate {i}*2" for i in range(4)]
+                _, _, rewards, _, _, _ = self.generate_trajectories(prompts)
+                total_rewards.extend(rewards.cpu().numpy())
+
+        self.policy.train()
+
+        return {
+            "eval_reward_mean": np.mean(total_rewards),
+            "eval_reward_std": np.std(total_rewards),
+        }
+
+    def save_checkpoint(self, path: str):
+        """Save model checkpoint."""
+        save_checkpoint(
+            path,
+            self.policy.state_dict(),
+            self.ref_policy.state_dict(),
+            self.optimizer.state_dict(),
+            self.config,
+            self.total_steps,
+            self.episode,
+        )
+
+    def load_checkpoint(self, path: str):
+        """Load model checkpoint."""
+        checkpoint = load_checkpoint(path, self.device)
+        self.policy.load_state_dict(checkpoint["policy_state_dict"])
+        self.ref_policy.load_state_dict(checkpoint["ref_policy_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.total_steps = checkpoint.get("total_steps", 0)
+        self.episode = checkpoint.get("episode", 0)
