@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from simple_rl.algorithms.grpo import GRPO
+from simple_rl.algorithms.grpo import GRPO_Reinforce
 
 
 class TestGRPONumericalStability:
@@ -32,7 +32,7 @@ class TestGRPONumericalStability:
 
     def test_log_prob_stability(self, config):
         """Test numerical stability of log probability computations."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         batch_size = 4
         seq_len = 20
@@ -56,7 +56,7 @@ class TestGRPONumericalStability:
 
     def test_kl_divergence_stability(self, config):
         """Test KL divergence computation stability with extreme values."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         # Test with very similar distributions (KL should be near 0)
         log_probs = torch.tensor([[-2.0, -2.0, -2.0]])
@@ -77,7 +77,7 @@ class TestGRPONumericalStability:
 
     def test_reward_normalization_stability(self, config):
         """Test reward normalization with edge cases."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         # Test with identical rewards (std = 0)
         identical_rewards = torch.tensor([1.0, 1.0, 1.0, 1.0])
@@ -99,7 +99,7 @@ class TestGRPONumericalStability:
 
     def test_ratio_computation_stability(self, config):
         """Test importance sampling ratio computation stability."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         batch_size = 4
         seq_len = 10
@@ -122,7 +122,7 @@ class TestGRPONumericalStability:
 
     def test_gradient_stability(self, config):
         """Test gradient computation stability."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         batch_size = 4
         seq_len = 10
@@ -150,7 +150,7 @@ class TestGRPONumericalStability:
 
     def test_loss_computation_stability(self, config):
         """Test overall loss computation stability."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         # Test with various edge cases
         test_cases = [

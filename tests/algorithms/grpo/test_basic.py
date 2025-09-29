@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from simple_rl.algorithms.grpo import GRPO
+from simple_rl.algorithms.grpo import GRPO_Reinforce
 from simple_rl.utils.huggingface_wrappers import LanguageModel
 
 
@@ -34,7 +34,7 @@ class TestGRPOBasics:
 
     def test_initialization(self, config):
         """Test GRPO initialization."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         assert isinstance(grpo.policy, LanguageModel)
         assert isinstance(grpo.ref_policy, nn.Module)
@@ -47,18 +47,18 @@ class TestGRPOBasics:
 
     def test_initialization_without_model(self, config):
         """Test GRPO can create its own model from config."""
-        grpo = GRPO(config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(config=config, use_wandb=False)
         assert isinstance(grpo.policy, LanguageModel)
 
     def test_initialization_with_custom_model(self, config):
         """Test GRPO with custom model."""
         custom_model = LanguageModel(config)
-        grpo = GRPO(model=custom_model, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=custom_model, config=config, use_wandb=False)
         assert grpo.policy is custom_model
 
     def test_device_placement(self, config):
         """Test model is placed on correct device."""
-        grpo = GRPO(config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(config=config, use_wandb=False)
         # Account for CUDA, MPS, or CPU
         if torch.cuda.is_available():
             expected_device = torch.device("cuda")

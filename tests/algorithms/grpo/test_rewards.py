@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from simple_rl.algorithms.grpo import GRPO
+from simple_rl.algorithms.grpo import GRPO_Reinforce
 
 
 class TestGRPORewards:
@@ -23,7 +23,7 @@ class TestGRPORewards:
 
     def test_reward_normalization(self, config):
         """Test that rewards are normalized within groups."""
-        grpo = GRPO(config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(config=config, use_wandb=False)
 
         # Create mock rewards
         rewards = torch.tensor(
@@ -53,7 +53,7 @@ class TestGRPORewards:
     def test_kl_penalty(self, config):
         """Test KL divergence penalty is applied correctly."""
         config["algorithm"]["kl_coef"] = 0.5
-        grpo = GRPO(config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(config=config, use_wandb=False)
 
         # Create rewards
         rewards = torch.ones(4, device=grpo.device) * 2.0
@@ -81,7 +81,7 @@ class TestGRPORewards:
         def custom_reward(prompt: str, completion: str) -> float:
             return len(completion) / 100.0
 
-        grpo = GRPO(config=config, reward_fn=custom_reward, use_wandb=False)
+        grpo = GRPO_Reinforce(config=config, reward_fn=custom_reward, use_wandb=False)
 
         # Test the reward function is used
         reward = grpo.reward_fn("test", "a" * 50)
@@ -89,7 +89,7 @@ class TestGRPORewards:
 
     def test_default_reward_function(self, config):
         """Test default reward function."""
-        grpo = GRPO(config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(config=config, use_wandb=False)
 
         # Test default reward based on length
         short_reward = grpo.reward_fn("prompt", "short response")

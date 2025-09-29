@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from simple_rl.algorithms.grpo import GRPO
+from simple_rl.algorithms.grpo import GRPO_Reinforce
 
 
 class TestGRPOPerformance:
@@ -34,7 +34,7 @@ class TestGRPOPerformance:
 
     def test_no_gradient_accumulation_in_eval(self, config):
         """Ensure no gradients are accumulated during trajectory generation."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         # Ensure all gradients are None initially
         for param in grpo.model.parameters():
@@ -57,7 +57,7 @@ class TestGRPOPerformance:
         for batch_size in batch_sizes:
             config["training"]["batch_size"] = batch_size
             config["algorithm"]["group_size"] = min(2, batch_size)
-            grpo = GRPO(model=None, config=config, use_wandb=False)
+            grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
             prompts = ["Test"] * (batch_size // config["algorithm"]["group_size"])
             batch_data = {"prompts": prompts}
@@ -82,7 +82,7 @@ class TestGRPOPerformance:
         """Test handling of large batches."""
         config["training"]["batch_size"] = 16
         config["algorithm"]["group_size"] = 4
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         prompts = ["Large batch test"] * 4  # 4 prompts, 4 samples each = 16 total
         batch_data = {"prompts": prompts}
@@ -93,7 +93,7 @@ class TestGRPOPerformance:
 
     def test_caching_reference_outputs(self, config):
         """Test that reference model outputs are cached properly."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         # Track calls to reference model
         call_count = 0
@@ -121,7 +121,7 @@ class TestGRPOPerformance:
         """Test performance with longer sequences."""
         config["model"]["max_length"] = 256
         config["training"]["max_new_tokens"] = 64
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         prompts = ["Long sequence test " * 10]  # Longer prompt
         batch_data = {"prompts": prompts}

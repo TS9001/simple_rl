@@ -28,12 +28,11 @@ from simple_rl.utils.amp import create_amp_config
 from simple_rl.utils.optimization import configure_optimizer
 from simple_rl.utils.timing import TimingManager
 from simple_rl.utils.training_config import create_training_config
-from simple_rl.utils.math_ops import compute_advantages, compute_policy_gradient_loss, compute_total_loss, normalize_rewards
 from simple_rl.utils.checkpointing import save_checkpoint, load_checkpoint
 from simple_rl.utils.logging_utils import create_logger
 
 
-class GRPO(BaseAlgorithm):
+class GRPO_Reinforce(BaseAlgorithm):
     """
     Group Relative Policy Optimization algorithm.
 
@@ -41,6 +40,7 @@ class GRPO(BaseAlgorithm):
     - Generates multiple completions per prompt
     - Normalizes rewards within groups
     - Uses KL divergence penalty for stability
+    - Reinforce style of loss calculation
     """
 
     def __init__(
@@ -49,14 +49,6 @@ class GRPO(BaseAlgorithm):
         batch_reward_fn: Optional[Callable] | None = None,
         use_wandb: bool = False,
     ):
-        """
-        Initialize GRPO algorithm.
-
-        Args:
-            config: Configuration dictionary
-            batch_reward_fn: Function to compute rewards (prompt, completion, answer) -> float
-            use_wandb: Whether to use Weights & Biases logging
-        """
         # Store config and setup device
         self.config = config or {}
         self.use_wandb = use_wandb
@@ -120,7 +112,7 @@ class GRPO(BaseAlgorithm):
         self._amp_config = create_amp_config(self.config)
 
         # Set up training components using utilities
-        self._configure_training_components()
+        self.optimizer = configure_optimizer(self.policy, self.config)
 
         # Reward function
         self.batch_reward_fn = batch_reward_fn
@@ -137,23 +129,6 @@ class GRPO(BaseAlgorithm):
 
         # Timing infrastructure
         self.timing_manager = TimingManager()
-
-    def _configure_training_components(self) -> None:
-        """Initialize optimizer, AMP scaler, and autocast context."""
-        # Configure optimizer using utility
-        self.optimizer = configure_optimizer(self.policy, self.config)
-
-    def _start_timer(self, operation_name: str):
-        """Start timing an operation."""
-        self.timing_manager.start_timer(operation_name)
-
-    def _end_timer(self, operation_name: str) -> float:
-        """End timing an operation and return elapsed time."""
-        return self.timing_manager.end_timer(operation_name)
-
-    def _print_timing_summary(self, title: str = "GRPO Operation Timings"):
-        """Print a technical timing summary with detailed statistics."""
-        self.timing_manager.print_timing_summary(title)
 
     def reset_timings(self):
         """Reset all timing data."""
@@ -197,13 +172,13 @@ class GRPO(BaseAlgorithm):
     ) -> Dict[str, torch.Tensor]:
         """Generate interleaved completions for a batch of prompts."""
 
-        self._start_timer("batch_tokenization")
+        self.timing_manager.start_timer("batch_tokenization")
         tokenized = self.policy.tokenize(prompts, padding_side="left")
         batch_prompt_ids = tokenized["input_ids"].to(self.device)
         batch_prompt_mask = tokenized["attention_mask"].to(self.device)
-        self._end_timer("batch_tokenization")
+        self.timing_manager.end_timer("batch_tokenization")
 
-        self._start_timer("prompt_replication")
+        self.timing_manager.start_timer("prompt_replication")
         num_prompts = len(prompts)
         total_sequences = num_prompts * self.group_size
 
@@ -213,9 +188,9 @@ class GRPO(BaseAlgorithm):
         replicated_prompt_mask = batch_prompt_mask.repeat_interleave(
             self.group_size, dim=0
         )
-        self._end_timer("prompt_replication")
+        self.timing_manager.end_timer("prompt_replication")
 
-        self._start_timer("batch_text_generation")
+        self.timing_manager.start_timer("batch_text_generation")
         prev = self.policy.training
         self.policy.eval()
         with torch.no_grad():
@@ -230,9 +205,9 @@ class GRPO(BaseAlgorithm):
                 min_new_tokens=1,
             )
         self.policy.train(prev)
-        self._end_timer("batch_text_generation")
+        self.timing_manager.end_timer("batch_text_generation")
 
-        self._start_timer("completion_extraction")
+        self.timing_manager.start_timer("completion_extraction")
         prompt_lengths = batch_prompt_mask.sum(dim=-1)
         prompt_start_positions = torch.argmax(batch_prompt_mask, dim=-1)
         prompt_end_positions = prompt_start_positions + prompt_lengths
@@ -262,7 +237,7 @@ class GRPO(BaseAlgorithm):
             ]
         )
         completion_texts = self.policy.decode(completion_ids)
-        self._end_timer("completion_extraction")
+        self.timing_manager.end_timer("completion_extraction")
 
         return {
             "generated_ids": generated_ids,
@@ -318,7 +293,7 @@ class GRPO(BaseAlgorithm):
         total_sequences = generation["total_sequences"]
 
         # Compute log probabilities for policy (batched)
-        self._start_timer("batch_policy_log_probs")
+        self.timing_manager.start_timer("batch_policy_log_probs")
         prev_mode = self.policy.training
         self.policy.eval()
         with torch.enable_grad():
@@ -336,10 +311,10 @@ class GRPO(BaseAlgorithm):
                     self.policy.model.config.use_cache = prev_cache
         if prev_mode:
             self.policy.train()
-        self._end_timer("batch_policy_log_probs")
+        self.timing_manager.end_timer("batch_policy_log_probs")
 
         # Compute log probabilities for reference model (batched)
-        self._start_timer("batch_ref_log_probs")
+        self.timing_manager.start_timer("batch_ref_log_probs")
         with torch.no_grad():
             prev_cache = getattr(self.ref_policy.model.config, "use_cache", None)
             if prev_cache is not None:
@@ -351,10 +326,10 @@ class GRPO(BaseAlgorithm):
             finally:
                 if prev_cache is not None:
                     self.ref_policy.model.config.use_cache = prev_cache
-        self._end_timer("batch_ref_log_probs")
+        self.timing_manager.end_timer("batch_ref_log_probs")
 
         # Create proper completion masks and extract completion log probs
-        self._start_timer("mask_and_extract_completions")
+        self.timing_manager.start_timer("mask_and_extract_completions")
 
         # Create EOS-aware completion mask
         completion_mask = self._create_completion_mask(completion_ids)
@@ -397,10 +372,10 @@ class GRPO(BaseAlgorithm):
             all_log_probs.append(seq_policy_log_probs)
             all_ref_log_probs.append(seq_ref_log_probs)
             all_completion_mask.append(seq_completion_mask)
-        self._end_timer("mask_and_extract_completions")
+        self.timing_manager.end_timer("mask_and_extract_completions")
 
         # Batch compute rewards by group
-        self._start_timer("batch_reward_computation")
+        self.timing_manager.start_timer("batch_reward_computation")
         for prompt_idx, (prompt, answer) in enumerate(zip(prompts, answers)):
             # Get completions for this prompt (group_size consecutive sequences)
             start_idx = prompt_idx * self.group_size
@@ -417,10 +392,10 @@ class GRPO(BaseAlgorithm):
             if store:
                 all_prompts.extend([prompt] * self.group_size)
                 all_completions.extend(group_completions)
-        self._end_timer("batch_reward_computation")
+        self.timing_manager.end_timer("batch_reward_computation")
 
         # Stack into tensors
-        self._start_timer("tensor_stacking")
+        self.timing_manager.start_timer("tensor_stacking")
         all_log_probs = pad_sequence(all_log_probs, batch_first=True, padding_value=0.0)
         all_ref_log_probs = pad_sequence(
             all_ref_log_probs, batch_first=True, padding_value=0.0
@@ -429,7 +404,7 @@ class GRPO(BaseAlgorithm):
             all_completion_mask, batch_first=True, padding_value=0.0
         )
         all_rewards = torch.cat(all_rewards, dim=0)
-        self._end_timer("tensor_stacking")
+        self.timing_manager.end_timer("tensor_stacking")
 
         if store:
             return (
@@ -449,42 +424,42 @@ class GRPO(BaseAlgorithm):
             all_completion_mask,
         )
 
-    def compute_advantages(
-        self,
-        adjusted_rewards: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compute advantages with group normalization and KL penalty.
+    def compute_advantages(self, rewards: torch.Tensor, group_size: int = 1, normalize_within_groups: bool = True) -> torch.Tensor:
+        
+        if normalize_within_groups and group_size > 1:
+            batch_size = rewards.shape[0]
+            num_groups = batch_size // group_size
 
-        Args:
-            rewards: Reward values [batch_size]
-            log_probs: Policy log probabilities [batch_size, seq_len]
-            ref_log_probs: Reference log probabilities [batch_size, seq_len]
+            # Reshape to groups
+            grouped_rewards = rewards.view(num_groups, group_size)
 
-        Returns:
-            Advantages [batch_size]
-        """
-        self._start_timer("advantage_computation")
-        # Use math operations utility
-        advantages = normalize_rewards(
-            adjusted_rewards,
-            self.group_size,
-            self.normalize_rewards
-        )
-        self._end_timer("advantage_computation")
+            # Normalize within each group
+            group_mean = grouped_rewards.mean(dim=1, keepdim=True)
+            group_std = grouped_rewards.std(dim=1, keepdim=True)
+
+            normalized_rewards = (grouped_rewards - group_mean) / (group_std + 1e-8)
+
+            # Flatten back
+            advantages = normalized_rewards.view(-1)
+        else:
+            # Global normalization
+            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
         return advantages
+
 
     def compute_loss(self, log_probs, advantages, ref_log_probs, completion_mask):
 
-        self._start_timer("loss_computation")
+        self.timing_manager.start_timer("loss_computation")
         # Use math operations utilities
-        advantages, kl_penalty = compute_advantages(
-            advantages, log_probs, ref_log_probs, completion_mask,
-            self.group_size, self.normalize_rewards
-        )
+        advantages = self.compute_advantages(advantages, self.group_size, self.normalize_rewards)
+        delta = log_probs - ref_log_probs
+        per_token_kl = torch.exp(delta) - delta - 1.0  # Schulman approx
+        kl_penalty = (per_token_kl * completion_mask).sum() / (completion_mask.sum() + 1e-8)
 
-        pg_loss = compute_policy_gradient_loss(log_probs, advantages, completion_mask)
-        loss = compute_total_loss(pg_loss, kl_penalty, self.kl_coef)
+        log_probs_sum = log_probs.sum(dim=-1)
+        pg_loss = -(log_probs_sum * advantages.detach()).mean()
+        loss = pg_loss + (self.kl_coef * kl_penalty)
 
         metrics = {
             "pg_loss": pg_loss.item(),
@@ -494,7 +469,7 @@ class GRPO(BaseAlgorithm):
             "tokens_generated": completion_mask.sum().item(),
         }
 
-        self._end_timer("loss_computation")
+        self.timing_manager.end_timer("loss_computation")
         return loss, metrics
 
     def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
@@ -537,7 +512,7 @@ class GRPO(BaseAlgorithm):
             mb_answers = answers[i:end_idx] if answers else None
 
             # Generate trajectories for this minibatch
-            self._start_timer("trajectory_generation")
+            self.timing_manager.start_timer("trajectory_generation")
             (
                 prompts_out,
                 completions_out,
@@ -548,7 +523,7 @@ class GRPO(BaseAlgorithm):
             ) = self.generate_trajectories(
                 mb_prompts, answers=mb_answers, store_outputs=self.store_completions
             )
-            self._end_timer("trajectory_generation")
+            self.timing_manager.end_timer("trajectory_generation")
 
             # Compute advantages
             advantages = self.compute_advantages(rewards)
@@ -565,12 +540,12 @@ class GRPO(BaseAlgorithm):
             scaled_loss = loss * weight
 
             # Backward pass (accumulate gradients)
-            self._start_timer("backward_pass")
+            self.timing_manager.start_timer("backward_pass")
             if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
                 self._amp_config.grad_scaler.scale(scaled_loss).backward()
             else:
                 scaled_loss.backward()
-            self._end_timer("backward_pass")
+            self.timing_manager.end_timer("backward_pass")
 
             # Accumulate metrics (use weighted values to match actual training)
             total_loss += scaled_loss.item()
@@ -581,7 +556,7 @@ class GRPO(BaseAlgorithm):
             total_tokens += mb_metrics.get("tokens_generated", 0)
 
             # Clean up intermediate tensors to prevent memory buildup
-            self._start_timer("memory_cleanup")
+            self.timing_manager.start_timer("memory_cleanup")
             if self.store_completions:
                 del prompts_out, completions_out
             del (
@@ -594,26 +569,26 @@ class GRPO(BaseAlgorithm):
                 scaled_loss,
             )
             clear_device_cache(self.device)
-            self._end_timer("memory_cleanup")
+            self.timing_manager.end_timer("memory_cleanup")
 
         # Gradient clipping on accumulated gradients
-        self._start_timer("gradient_clipping")
+        self.timing_manager.start_timer("gradient_clipping")
         if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
             self._amp_config.grad_scaler.unscale_(self.optimizer)
 
         torch.nn.utils.clip_grad_norm_(
             self.policy.parameters(), max_norm=self.gradient_clip
         )
-        self._end_timer("gradient_clipping")
+        self.timing_manager.end_timer("gradient_clipping")
 
         # Update parameters
-        self._start_timer("parameter_update")
+        self.timing_manager.start_timer("parameter_update")
         if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
             self._amp_config.grad_scaler.step(self.optimizer)
             self._amp_config.grad_scaler.update()
         else:
             self.optimizer.step()
-        self._end_timer("parameter_update")
+        self.timing_manager.end_timer("parameter_update")
 
         # Update statistics
         self.total_steps += 1
@@ -698,7 +673,7 @@ class GRPO(BaseAlgorithm):
 
                 # Print timing summary every few episodes
                 if episode > 0:
-                    self._print_timing_summary(f"Episode {episode} Timing Summary")
+                    self.timing_manager.print_timing_summary(f"Episode {episode} Timing Summary")
 
             final_metrics = metrics
 
@@ -717,7 +692,7 @@ class GRPO(BaseAlgorithm):
 
         # Print final comprehensive timing summary
         print(f"\n[TRAINING] Completed {num_episodes} episodes")
-        self._print_timing_summary("FINAL TRAINING PERFORMANCE ANALYSIS")
+        self.timing_manager.print_timing_summary("FINAL TRAINING PERFORMANCE ANALYSIS")
 
         return final_metrics
 

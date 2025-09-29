@@ -5,7 +5,7 @@ Tests for GRPO edge cases and boundary conditions.
 import pytest
 import torch
 
-from simple_rl.algorithms.grpo import GRPO
+from simple_rl.algorithms.grpo import GRPO_Reinforce
 
 
 class TestGRPOEdgeCases:
@@ -31,7 +31,7 @@ class TestGRPOEdgeCases:
 
     def test_empty_completion(self, config):
         """Test handling of sequences with empty completions (prompt = full sequence)."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         batch_size = 2
         seq_len = 10
@@ -51,7 +51,7 @@ class TestGRPOEdgeCases:
 
     def test_single_token_completion(self, config):
         """Test with single token completions."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         batch_size = 2
         seq_len = 10
@@ -74,7 +74,7 @@ class TestGRPOEdgeCases:
 
     def test_all_padding(self, config):
         """Test handling of fully padded sequences."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         batch_size = 2
         seq_len = 10
@@ -95,7 +95,7 @@ class TestGRPOEdgeCases:
         """Test error handling for batch size not divisible by group size."""
         config["algorithm"]["group_size"] = 3
         config["training"]["batch_size"] = 7  # Not divisible by 3
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         rewards = torch.randn(7)
 
@@ -104,7 +104,7 @@ class TestGRPOEdgeCases:
 
     def test_extreme_reward_values(self, config):
         """Test reward normalization with extreme values."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         # Test with very large rewards
         large_rewards = torch.tensor([1e10, 1e10, 1e10, 1e10], dtype=torch.float32)
@@ -125,7 +125,7 @@ class TestGRPOEdgeCases:
     def test_zero_kl_coefficient(self, config):
         """Test GRPO with KL coefficient set to zero."""
         config["algorithm"]["kl_coef"] = 0.0
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         batch_size = 4
         seq_len = 10
@@ -145,7 +145,7 @@ class TestGRPOEdgeCases:
     def test_no_clip_range(self, config):
         """Test GRPO without PPO-style clipping."""
         config["algorithm"]["clip_range"] = None
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         batch_size = 4
         seq_len = 10
@@ -166,7 +166,7 @@ class TestGRPOEdgeCases:
     def test_batch_divisibility(self, config):
         """Test that batch size must be divisible by group size."""
         config["training"]["batch_size"] = 7  # Not divisible by 4
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         rewards = torch.randn(7)
 
@@ -176,7 +176,7 @@ class TestGRPOEdgeCases:
     def test_extreme_kl_coefficient(self, config):
         """Test GRPO with very large KL coefficient."""
         config["algorithm"]["kl_coef"] = 100.0  # Very large
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         batch_size = 4
         seq_len = 10
@@ -197,7 +197,7 @@ class TestGRPOEdgeCases:
 
     def test_negative_rewards(self, config):
         """Test handling of negative rewards."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         # All negative rewards
         negative_rewards = torch.tensor([-1.0, -2.0, -3.0, -4.0])
@@ -209,7 +209,7 @@ class TestGRPOEdgeCases:
 
     def test_zero_rewards(self, config):
         """Test handling of all-zero rewards."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         zero_rewards = torch.zeros(4)
         normalized = grpo.compute_relative_rewards(zero_rewards, group_size=2)
@@ -223,7 +223,7 @@ class TestGRPOEdgeCases:
         """Test different temperature settings in generation."""
         for temp in [0.1, 1.0, 2.0]:
             config["training"]["temperature"] = temp
-            grpo = GRPO(model=None, config=config, use_wandb=False)
+            grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
             # Should initialize without errors
             assert grpo.temperature == temp

@@ -5,7 +5,7 @@ GRPO training and optimization tests.
 import pytest
 import torch
 
-from simple_rl.algorithms.grpo import GRPO
+from simple_rl.algorithms.grpo import GRPO_Reinforce
 
 
 class TestGRPOTraining:
@@ -28,7 +28,7 @@ class TestGRPOTraining:
     @pytest.mark.slow
     def test_train_step(self, config):
         """Test single training step."""
-        grpo = GRPO(config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(config=config, use_wandb=False)
 
         # Create batch
         batch = {"prompts": ["What is 2+2?", "What is 3+3?"]}
@@ -48,7 +48,7 @@ class TestGRPOTraining:
     @pytest.mark.slow
     def test_train_method(self, config):
         """Test train method for multiple episodes."""
-        grpo = GRPO(config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(config=config, use_wandb=False)
 
         # Train for a few episodes
         final_metrics = grpo.train(num_episodes=2)
@@ -60,7 +60,7 @@ class TestGRPOTraining:
 
     def test_gradient_clipping(self, config):
         """Test gradient clipping is applied."""
-        grpo = GRPO(config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(config=config, use_wandb=False)
 
         # Create a batch that might cause large gradients
         batch = {"prompts": ["Test"] * config["training"]["batch_size"]}
@@ -81,7 +81,7 @@ class TestGRPOTraining:
     @pytest.mark.slow
     def test_evaluate_method(self, config):
         """Test evaluation method."""
-        grpo = GRPO(config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(config=config, use_wandb=False)
 
         # Evaluate
         eval_metrics = grpo.evaluate(num_episodes=1)
@@ -95,7 +95,7 @@ class TestGRPOTraining:
 
     def test_checkpointing(self, config, tmp_path):
         """Test save and load checkpoint."""
-        grpo = GRPO(config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(config=config, use_wandb=False)
 
         # Train for one step
         batch = {"prompts": ["Test prompt"]}
@@ -106,7 +106,7 @@ class TestGRPOTraining:
         grpo.save_checkpoint(str(checkpoint_path))
 
         # Create new instance and load
-        grpo2 = GRPO(config=config, use_wandb=False)
+        grpo2 = GRPO_Reinforce(config=config, use_wandb=False)
         grpo2.load_checkpoint(str(checkpoint_path))
 
         # Check state is restored
@@ -119,7 +119,7 @@ class TestGRPOTraining:
 
     def test_loss_computation(self, config):
         """Test loss computation details."""
-        grpo = GRPO(config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(config=config, use_wandb=False)
 
         # Create mock data
         batch_size = 4

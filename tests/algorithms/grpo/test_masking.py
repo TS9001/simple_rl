@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from simple_rl.algorithms.grpo import GRPO
+from simple_rl.algorithms.grpo import GRPO_Reinforce
 
 
 class TestGRPOMasking:
@@ -36,7 +36,7 @@ class TestGRPOMasking:
 
     def test_no_double_masking_in_compute_log_probs(self, config):
         """Verify that masks are applied exactly once in compute_log_probs."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         batch_size = 2
         seq_len = 20
@@ -107,7 +107,7 @@ class TestGRPOMasking:
 
     def test_masking_with_variable_length_sequences(self, config):
         """Test masking handles variable length sequences correctly."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         # Create sequences of different lengths
         batch_size = 3
@@ -166,7 +166,7 @@ class TestGRPOMasking:
 
     def test_policy_loss_receives_premasked_logprobs(self, config):
         """Verify that compute_policy_loss receives already-masked log probs."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         batch_size = 4
         seq_len = 15
@@ -206,7 +206,7 @@ class TestGRPOMasking:
 
     def test_kl_divergence_with_premasked_inputs(self, config):
         """Test KL divergence computation with pre-masked log probs."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         batch_size = 2
         seq_len = 10
@@ -235,7 +235,7 @@ class TestGRPOMasking:
     def test_masking_consistency_across_updates(self, config):
         """Ensure masking remains consistent across multiple update epochs."""
         config["algorithm"]["update_epochs"] = 3
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         # Track log prob sums across epochs
         epoch_sums = []
@@ -275,7 +275,7 @@ class TestGRPOMasking:
 
     def test_masking_correctness(self, config):
         """Test that masking correctly separates prompt from completion."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         # Create a sequence where we know the prompt length
         batch_size = 2
@@ -295,7 +295,7 @@ class TestGRPOMasking:
 
     def test_memory_efficient_masking(self, config):
         """Test that masking operations don't create unnecessary copies."""
-        grpo = GRPO(model=None, config=config, use_wandb=False)
+        grpo = GRPO_Reinforce(model=None, config=config, use_wandb=False)
 
         batch_size = 8
         seq_len = 50
