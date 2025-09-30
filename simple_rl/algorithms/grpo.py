@@ -124,6 +124,23 @@ class GRPO(BaseAlgorithm):
         self.stored_attention_mask = None
         self.stored_prompt_end_positions = None
 
+        # Early stopping tokens for generation
+        self._setup_stopping_tokens()
+
+    def _setup_stopping_tokens(self):
+        """Set up additional stopping tokens for early termination."""
+        # Try to encode </answer> tag as stopping token
+        self.answer_end_token_id = None
+        try:
+            # Encode the closing answer tag
+            encoded = self.policy.tokenizer.encode("</answer>", add_special_tokens=False)
+            if encoded:
+                # Use the last token (most specific)
+                self.answer_end_token_id = encoded[-1]
+        except Exception:
+            # If encoding fails, just use default EOS
+            pass
+
     def reset_timings(self):
         """Reset timing data."""
         self.timing_manager.reset_timings()
@@ -190,6 +207,13 @@ class GRPO(BaseAlgorithm):
         self.timing_manager.start_timer("batch_text_generation")
         prev_mode = self.policy.training
         self.policy.eval()
+
+        # Build EOS token list for early stopping
+        eos_token_id = self.policy.tokenizer.eos_token_id
+        if self.answer_end_token_id is not None:
+            # Stop at either EOS or </answer> tag
+            eos_token_id = [eos_token_id, self.answer_end_token_id]
+
         with torch.no_grad():
             generated_ids, generated_mask = self.policy.generate(
                 replicated_prompt_ids,
@@ -200,6 +224,7 @@ class GRPO(BaseAlgorithm):
                 top_p=self.top_p,
                 num_return_sequences=1,
                 min_new_tokens=1,
+                eos_token_id=eos_token_id,
             )
         self.policy.train(prev_mode)
         self.timing_manager.end_timer("batch_text_generation")
@@ -269,6 +294,14 @@ class GRPO(BaseAlgorithm):
         """
         store = self.store_completions if store_outputs is None else store_outputs
 
+        # Shuffle prompts to distribute hard/easy problems across batches
+        # This prevents one batch from consistently being slower
+        num_prompts = len(prompts)
+        shuffle_indices = torch.randperm(num_prompts).tolist()
+        prompts = [prompts[i] for i in shuffle_indices]
+        if answers is not None:
+            answers = [answers[i] for i in shuffle_indices]
+
         # Storage for aggregated results across batches
         all_prompts = [] if store else None
         all_completions = [] if store else None
@@ -280,8 +313,6 @@ class GRPO(BaseAlgorithm):
         all_generated_ids = []
         all_generated_mask = []
         all_prompt_end_positions = []
-
-        num_prompts = len(prompts)
 
         # Process prompts in batches
         for batch_start in range(0, num_prompts, self.rollout_batch_size):
@@ -317,18 +348,12 @@ class GRPO(BaseAlgorithm):
             prev_mode = self.policy.training
             self.policy.eval()
             with torch.no_grad():  # No gradients needed during trajectory generation
-                prev_cache = getattr(self.policy.model.config, "use_cache", None)
-                if prev_cache is not None:
-                    self.policy.model.config.use_cache = False
-                try:
-                    policy_log_probs = self.policy.compute_log_probs(
-                        generated_ids,
-                        attention_mask=generated_mask,
-                        target_mask=None,
-                    )
-                finally:
-                    if prev_cache is not None:
-                        self.policy.model.config.use_cache = prev_cache
+                # Keep KV cache enabled for faster inference
+                policy_log_probs = self.policy.compute_log_probs(
+                    generated_ids,
+                    attention_mask=generated_mask,
+                    target_mask=None,
+                )
             if prev_mode:
                 self.policy.train()
             policy_time = self.timing_manager.end_timer(f"batch_{batch_idx}_policy_log_probs")
@@ -337,18 +362,12 @@ class GRPO(BaseAlgorithm):
             # Compute reference log probs for this batch
             self.timing_manager.start_timer(f"batch_{batch_idx}_ref_log_probs")
             with torch.no_grad():
-                prev_cache = getattr(self.ref_policy.model.config, "use_cache", None)
-                if prev_cache is not None:
-                    self.ref_policy.model.config.use_cache = False
-                try:
-                    ref_log_probs = self.ref_policy.compute_log_probs(
-                        generated_ids,
-                        attention_mask=generated_mask,
-                        target_mask=None,
-                    )
-                finally:
-                    if prev_cache is not None:
-                        self.ref_policy.model.config.use_cache = prev_cache
+                # Keep KV cache enabled for faster inference
+                ref_log_probs = self.ref_policy.compute_log_probs(
+                    generated_ids,
+                    attention_mask=generated_mask,
+                    target_mask=None,
+                )
             ref_time = self.timing_manager.end_timer(f"batch_{batch_idx}_ref_log_probs")
             print(f"[TIMING]   Reference log probs: {ref_time:.2f}s")
 
@@ -433,9 +452,10 @@ class GRPO(BaseAlgorithm):
         self.stored_prompt_end_positions = torch.cat(all_prompt_end_positions, dim=0)
 
         # Stack into tensors (OLD log probs from generation - won't change)
+        # Note: Already detached from torch.no_grad() context, no need for explicit .detach()
         self.timing_manager.start_timer("tensor_stacking")
-        all_log_probs = pad_sequence(all_log_probs, batch_first=True, padding_value=0.0).detach()
-        all_ref_log_probs = pad_sequence(all_ref_log_probs, batch_first=True, padding_value=0.0).detach()
+        all_log_probs = pad_sequence(all_log_probs, batch_first=True, padding_value=0.0)
+        all_ref_log_probs = pad_sequence(all_ref_log_probs, batch_first=True, padding_value=0.0)
         all_completion_mask = pad_sequence(all_completion_mask, batch_first=True, padding_value=0.0)
         all_rewards = torch.cat(all_rewards, dim=0)
         self.timing_manager.end_timer("tensor_stacking")

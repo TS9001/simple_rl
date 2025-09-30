@@ -136,6 +136,10 @@ class LanguageModel(nn.Module):
         """
         self._ensure_compiled()
 
+        # Use default eos_token_id unless overridden in kwargs
+        if 'eos_token_id' not in kwargs:
+            kwargs['eos_token_id'] = self.tokenizer.eos_token_id
+
         with torch.no_grad():
             outputs = self.model.generate(
                 input_ids=prompt_ids,
@@ -146,7 +150,6 @@ class LanguageModel(nn.Module):
                 top_k=top_k,
                 top_p=top_p,
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
                 return_dict_in_generate=True,
                 output_scores=False,
                 **kwargs,
