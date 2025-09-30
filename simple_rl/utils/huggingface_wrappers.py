@@ -170,7 +170,6 @@ class LanguageModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        target_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute log probabilities for a sequence.
@@ -178,7 +177,6 @@ class LanguageModel(nn.Module):
         Args:
             input_ids: Input token IDs [batch_size, seq_len]
             attention_mask: Attention mask [batch_size, seq_len]
-            target_mask: Mask for target tokens to compute log probs for
 
         Returns:
             Log probabilities [batch_size, seq_len-1]
