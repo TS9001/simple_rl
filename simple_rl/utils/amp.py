@@ -54,7 +54,13 @@ class AMPConfig:
 
     def _setup_amp(self) -> None:
         """Set up AMP configuration based on device and settings."""
-        mp_config = self.config.get("mixed_precision", {})
+        # Support both top-level and nested optimization.mixed_precision
+        mp_config = self.config.get("mixed_precision")
+        if mp_config is None:
+            mp_config = self.config.get("optimization", {}).get("mixed_precision", {})
+        if mp_config is None:
+            mp_config = {}
+
         device_type = self._get_device_type()
 
         # Normalize mp_config

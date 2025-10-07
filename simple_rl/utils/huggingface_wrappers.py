@@ -170,6 +170,7 @@ class LanguageModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        logits_to_keep: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Compute log probabilities for a sequence.
@@ -177,19 +178,43 @@ class LanguageModel(nn.Module):
         Args:
             input_ids: Input token IDs [batch_size, seq_len]
             attention_mask: Attention mask [batch_size, seq_len]
+            logits_to_keep: If specified, only compute log probs for the last N tokens
+                          (model still sees full context, this only affects output size)
 
         Returns:
-            Log probabilities [batch_size, seq_len-1]
+            Log probabilities [batch_size, seq_len-1] or [batch_size, logits_to_keep]
         """
-        # Get logits from model
+        # Get logits from model (full forward pass with complete context)
         logits = self.forward(input_ids, attention_mask=attention_mask)
 
         # Shift logits and labels for next token prediction
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = input_ids[:, 1:].contiguous()
 
+        # If logits_to_keep specified, only keep last N positions
+        # (saves memory in log_softmax and gather operations)
+        if logits_to_keep is not None:
+            # Ensure we don't try to keep more tokens than exist
+            actual_seq_len = shift_logits.size(1)
+            logits_to_keep = min(logits_to_keep, actual_seq_len)
+
+            if logits_to_keep < actual_seq_len:
+                # Use explicit indexing instead of negative indexing for MPS compatibility
+                start_idx = actual_seq_len - logits_to_keep
+                shift_logits = shift_logits[:, start_idx:, :]
+                shift_labels = shift_labels[:, start_idx:]
+
         # Compute log probabilities
-        log_probs_all = F.log_softmax(shift_logits, dim=-1)
+        # MPS workaround: For large vocab sizes, move to CPU for log_softmax if on MPS
+        if shift_logits.device.type == 'mps' and shift_logits.size(-1) > 100000:
+            # Move to CPU for log_softmax computation (MPS has issues with large vocab)
+            original_device = shift_logits.device
+            shift_logits_cpu = shift_logits.to('cpu')
+            log_probs_all = F.log_softmax(shift_logits_cpu, dim=-1)
+            log_probs_all = log_probs_all.to(original_device)
+            del shift_logits_cpu
+        else:
+            log_probs_all = F.log_softmax(shift_logits, dim=-1)
 
         # Gather log probs for actual tokens
         log_probs = torch.gather(

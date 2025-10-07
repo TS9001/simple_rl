@@ -28,6 +28,8 @@ from simple_rl.utils.timing import TimingManager
 from simple_rl.utils.training_config import create_training_config
 from simple_rl.utils.checkpointing import save_checkpoint, load_checkpoint
 from simple_rl.utils.logging_utils import create_logger
+from simple_rl.utils.kl_divergence import compute_kl_divergence
+from simple_rl.utils.debug_logger import GRPODebugLogger
 
 
 class GRPO(BaseAlgorithm):
@@ -86,6 +88,9 @@ class GRPO(BaseAlgorithm):
         assert frozen_params == total_params, "Not all reference parameters frozen"
         print(f"✓ Reference model frozen: {frozen_params} parameters")
 
+        # Print KL divergence configuration (will be set after training_config)
+        self._print_kl_config = True
+
         # Training config
         self.training_config = create_training_config(self.config)
 
@@ -96,6 +101,19 @@ class GRPO(BaseAlgorithm):
         self.clip_epsilon = self.training_config.clip_epsilon
         self.store_completions = self.training_config.store_completions
         self.update_epochs = self.training_config.update_epochs
+
+        # KL divergence estimator configuration
+        # Options: "mc" (Monte Carlo), "k3" (low-variance unbiased), "abs", "mse"
+        self.kl_estimator = self.config.get("training", {}).get("kl_estimator", "k3")
+        self.kl_clamp_min = self.config.get("training", {}).get("kl_clamp_min", -5.0)
+        self.kl_clamp_max = self.config.get("training", {}).get("kl_clamp_max", 5.0)
+
+        # Print KL configuration
+        if self._print_kl_config:
+            print(f"✓ KL divergence estimator: {self.kl_estimator}")
+            if self.kl_estimator == "k3":
+                print(f"  Clamp range: [{self.kl_clamp_min}, {self.kl_clamp_max}]")
+            del self._print_kl_config
 
         # Training parameters
         self.learning_rate = self.training_config.learning_rate
@@ -121,6 +139,12 @@ class GRPO(BaseAlgorithm):
         self.logger = create_logger(self.config)
         if self.use_wandb:
             self.logger.init_wandb()
+
+        # Debug logger
+        debug_config = self.config.get("debug", {})
+        debug_enabled = debug_config.get("enabled", False)
+        debug_log_dir = debug_config.get("log_dir", "debug_logs")
+        self.debug_logger = GRPODebugLogger(log_dir=debug_log_dir, enabled=debug_enabled)
 
         # Statistics
         self.total_steps = 0
@@ -161,7 +185,7 @@ class GRPO(BaseAlgorithm):
 
     def _create_completion_mask(self, completion_ids: torch.Tensor) -> torch.Tensor:
         """
-        Create mask for completion tokens, excluding tokens after EOS.
+        Create mask for completion tokens, excluding tokens after EOS or padding.
 
         Args:
             completion_ids: Token IDs [batch_size, seq_len]
@@ -170,25 +194,32 @@ class GRPO(BaseAlgorithm):
             Binary mask [batch_size, seq_len]
         """
         eos_token_id = self.policy.tokenizer.eos_token_id
-        is_eos = completion_ids == eos_token_id
+        pad_token_id = self.policy.tokenizer.pad_token_id
 
-        # Find first EOS position
-        eos_idx = torch.full(
-            (is_eos.size(0),),
-            is_eos.size(1),
+        # Check for both EOS and PAD tokens
+        is_eos = completion_ids == eos_token_id
+        is_pad = completion_ids == pad_token_id
+
+        # A position is masked out if it's EOS, PAD, or after the first EOS/PAD
+        is_stop = is_eos | is_pad
+
+        # Find first stop position (EOS or PAD)
+        stop_idx = torch.full(
+            (is_stop.size(0),),
+            is_stop.size(1),
             dtype=torch.long,
             device=completion_ids.device,
         )
 
-        mask_exists = is_eos.any(dim=1)
-        eos_idx[mask_exists] = is_eos.int().argmax(dim=1)[mask_exists]
+        mask_exists = is_stop.any(dim=1)
+        stop_idx[mask_exists] = is_stop.int().argmax(dim=1)[mask_exists]
 
-        # Create mask
+        # Create mask: 1 for valid tokens (before stop), 0 for stop and after
         sequence_indices = torch.arange(
-            is_eos.size(1), device=completion_ids.device
-        ).expand(is_eos.size(0), -1)
+            is_stop.size(1), device=completion_ids.device
+        ).expand(is_stop.size(0), -1)
 
-        return (sequence_indices <= eos_idx.unsqueeze(1)).float()
+        return (sequence_indices < stop_idx.unsqueeze(1)).float()
 
     def _generate_grouped_completions(
         self, prompts: List[str]
@@ -345,6 +376,17 @@ class GRPO(BaseAlgorithm):
             replicated_prompt_end_positions = generation["prompt_end_positions"]
             total_sequences = generation["total_sequences"]
 
+            # Debug logging: generation batch
+            self.debug_logger.log_generation_batch(
+                batch_idx=batch_idx,
+                prompts=batch_prompts,
+                generated_ids=generated_ids,
+                generated_mask=generated_mask,
+                completion_ids=completion_ids,
+                completion_texts=completion_texts,
+                prompt_end_positions=replicated_prompt_end_positions,
+            )
+
             # Store for later recomputation
             all_generated_ids.append(generated_ids.detach())
             all_generated_mask.append(generated_mask.detach())
@@ -354,11 +396,17 @@ class GRPO(BaseAlgorithm):
             self.timing_manager.start_timer(f"batch_{batch_idx}_policy_log_probs")
             prev_mode = self.policy.training
             self.policy.eval()
+
+            # Calculate max completion length to use logits_to_keep
+            max_completion_len = max(c.size(0) for c in batch_completion_ids)
+
             with torch.no_grad():  # No gradients needed during trajectory generation
                 # Keep KV cache enabled for faster inference
+                # Only compute log probs for completion tokens (model still sees full context)
                 policy_log_probs = self.policy.compute_log_probs(
                     generated_ids,
                     attention_mask=generated_mask,
+                    logits_to_keep=max_completion_len,
                 )
             if prev_mode:
                 self.policy.train()
@@ -369,9 +417,11 @@ class GRPO(BaseAlgorithm):
             self.ref_policy.eval()  # Ensure ref policy is in eval mode
             with torch.no_grad():
                 # Keep KV cache enabled for faster inference
+                # Only compute log probs for completion tokens (model still sees full context)
                 ref_log_probs = self.ref_policy.compute_log_probs(
                     generated_ids,
                     attention_mask=generated_mask,
+                    logits_to_keep=max_completion_len,
                 )
             self.timing_manager.end_timer(f"batch_{batch_idx}_ref_log_probs")
 
@@ -379,34 +429,38 @@ class GRPO(BaseAlgorithm):
             self.timing_manager.start_timer(f"batch_{batch_idx}_extract_completions")
             completion_mask = self._create_completion_mask(completion_ids)
 
+            # policy_log_probs and ref_log_probs are [batch, max_completion_len]
+            # With left-padding: logits_to_keep gives [completion_tokens ... padding_tokens]
+            # The actual completion tokens are at the BEGINNING of the tensor
             for seq_idx in range(total_sequences):
                 seq_completion_ids = batch_completion_ids[seq_idx]
                 actual_completion_length = seq_completion_ids.size(0)
-                prompt_end = int(replicated_prompt_end_positions[seq_idx])
 
-                completion_start = max(prompt_end - 1, 0)
-                completion_end = completion_start + actual_completion_length
-
-                seq_policy_log_probs = policy_log_probs[seq_idx, completion_start:completion_end]
-                seq_ref_log_probs = ref_log_probs[seq_idx, completion_start:completion_end]
+                # Extract the FIRST actual_completion_length log probs
+                # (completions are at the start due to left-padding)
+                seq_policy_log_probs = policy_log_probs[seq_idx, :actual_completion_length]
+                seq_ref_log_probs = ref_log_probs[seq_idx, :actual_completion_length]
                 seq_completion_mask = completion_mask[seq_idx, :actual_completion_length]
 
-                min_length = min(
-                    len(seq_policy_log_probs),
-                    len(seq_ref_log_probs),
-                    len(seq_completion_mask)
-                )
-
-                seq_policy_log_probs = seq_policy_log_probs[:min_length]
-                seq_ref_log_probs = seq_ref_log_probs[:min_length]
-                seq_completion_mask = seq_completion_mask[:min_length]
-
+                # Apply mask to zero out tokens after EOS
                 seq_policy_log_probs = seq_policy_log_probs * seq_completion_mask
                 seq_ref_log_probs = seq_ref_log_probs * seq_completion_mask
 
                 all_log_probs.append(seq_policy_log_probs)
                 all_ref_log_probs.append(seq_ref_log_probs)
                 all_completion_mask.append(seq_completion_mask)
+
+            # Debug logging: log probs computation
+            self.debug_logger.log_logprobs_computation(
+                batch_idx=batch_idx,
+                policy_log_probs=policy_log_probs,
+                ref_log_probs=ref_log_probs,
+                completion_mask=completion_mask,
+                seq_idx=0,
+                batch_completion_ids=batch_completion_ids,
+                max_completion_len=max_completion_len,
+            )
+
             self.timing_manager.end_timer(f"batch_{batch_idx}_extract_completions")
 
             # Compute rewards for this batch
@@ -436,21 +490,51 @@ class GRPO(BaseAlgorithm):
         # Find max sequence length across all batches
         max_seq_len = max(tensor.size(1) for tensor in all_generated_ids)
 
-        # Pad all tensors to same length
+        # Pad all tensors to same length - PAD ON THE LEFT to match original padding
+        # CRITICAL: Adjust prompt_end_positions when adding left padding!
         padded_generated_ids = []
         padded_generated_mask = []
-        for gen_ids, gen_mask in zip(all_generated_ids, all_generated_mask):
+        adjusted_prompt_end_positions = []
+        batch_lengths = [tensor.size(1) for tensor in all_generated_ids]
+        padding_adjustments = []
+
+        for gen_ids, gen_mask, prompt_ends in zip(
+            all_generated_ids, all_generated_mask, all_prompt_end_positions
+        ):
+            pad_len = 0
             if gen_ids.size(1) < max_seq_len:
-                # Pad sequences to max_seq_len
+                # Pad on the LEFT (prepend padding) to match tokenizer's left-padding
                 pad_len = max_seq_len - gen_ids.size(1)
-                gen_ids = F.pad(gen_ids, (0, pad_len), value=self.policy.tokenizer.pad_token_id)
-                gen_mask = F.pad(gen_mask, (0, pad_len), value=0)
+                gen_ids = F.pad(gen_ids, (pad_len, 0), value=self.policy.tokenizer.pad_token_id)
+                gen_mask = F.pad(gen_mask, (pad_len, 0), value=0)
+
+            # Adjust prompt_end_positions by the amount of left-padding added
+            # This ensures positions remain valid after padding shifts everything right
+            adjusted_prompt_ends = prompt_ends + pad_len
+
             padded_generated_ids.append(gen_ids)
             padded_generated_mask.append(gen_mask)
+            adjusted_prompt_end_positions.append(adjusted_prompt_ends)
+            padding_adjustments.append(pad_len)
 
         self.stored_generated_ids = torch.cat(padded_generated_ids, dim=0)
         self.stored_attention_mask = torch.cat(padded_generated_mask, dim=0)
-        self.stored_prompt_end_positions = torch.cat(all_prompt_end_positions, dim=0)
+        self.stored_prompt_end_positions = torch.cat(adjusted_prompt_end_positions, dim=0)
+
+        # Debug logging: batch concatenation
+        self.debug_logger.log_batch_concatenation(
+            num_batches=len(all_generated_ids),
+            batch_lengths=batch_lengths,
+            max_seq_len=max_seq_len,
+            stored_generated_ids=self.stored_generated_ids,
+            stored_attention_mask=self.stored_attention_mask,
+            stored_prompt_end_positions=self.stored_prompt_end_positions,
+            padding_adjustments=padding_adjustments,
+        )
+
+        # Validate that prompt_end_positions are within bounds after padding adjustment
+        assert (self.stored_prompt_end_positions <= self.stored_generated_ids.size(1)).all(), \
+            f"Invalid prompt_end_positions after padding: max={self.stored_prompt_end_positions.max()}, seq_len={self.stored_generated_ids.size(1)}"
 
         # Stack into tensors (OLD log probs from generation - won't change)
         # Note: Already detached from torch.no_grad() context, no need for explicit .detach()
@@ -507,13 +591,13 @@ class GRPO(BaseAlgorithm):
             group_mean = grouped_rewards.mean(dim=1, keepdim=True)
             group_std = grouped_rewards.std(dim=1, keepdim=True)
 
-            normalized_rewards = (grouped_rewards - group_mean) / (group_std + 1e-8)
+            normalized_rewards = (grouped_rewards - group_mean) / (group_std + 1e-4)
 
             # Flatten back
             advantages = normalized_rewards.view(-1)
         else:
             # Global normalization
-            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
 
         return advantages
 
@@ -563,12 +647,33 @@ class GRPO(BaseAlgorithm):
         policy_loss = -torch.min(surr1, surr2).mean()
 
         # KL divergence penalty (per-token)
-        # KL(π_ref || π_new) = sum(π_ref * log(π_ref / π_new))
-        # In log space: KL = sum(exp(log_ref) * (log_ref - log_new))
+        # KL(π_ref || π_new) penalizes when new policy diverges from reference
+        # This prevents the policy from becoming overconfident
         # NOTE: Detach ref_log_probs - no backprop through reference model!
         ref_log_probs_detached = ref_log_probs.detach()
-        kl_per_token = torch.exp(ref_log_probs_detached) * (ref_log_probs_detached - new_log_probs)
-        kl_penalty = (kl_per_token * completion_mask).sum() / (completion_mask.sum() + 1e-8)
+
+        # Compute KL divergence using configured estimator
+        # Options: "mc" (Monte Carlo), "k3" (low-variance unbiased), "abs", "mse"
+        kl_penalty = compute_kl_divergence(
+            ref_log_probs_detached,
+            new_log_probs,
+            mask=completion_mask,
+            estimator=self.kl_estimator,
+            clamp_min=self.kl_clamp_min,
+            clamp_max=self.kl_clamp_max,
+        )
+
+        # Debug logging: KL computation (with full tensors if KL is high)
+        kl_value = kl_penalty.item() if isinstance(kl_penalty, torch.Tensor) else kl_penalty
+        self.debug_logger.log_kl_computation(
+            kl_penalty=kl_value,
+            estimator=self.kl_estimator,
+            clamp_min=self.kl_clamp_min,
+            clamp_max=self.kl_clamp_max,
+            ref_log_probs=ref_log_probs if kl_value > 5.0 else None,
+            new_log_probs=new_log_probs if kl_value > 5.0 else None,
+            completion_mask=completion_mask if kl_value > 5.0 else None,
+        )
 
         # Total GRPO loss
         loss = policy_loss + self.kl_coef * kl_penalty
@@ -611,6 +716,14 @@ class GRPO(BaseAlgorithm):
         prompts = batch["prompts"]
         answers = batch["answers"]
 
+        # Debug logging: episode start
+        self.debug_logger.log_episode_start(self.episode)
+        self.debug_logger.log_training_step_start(
+            episode=self.episode,
+            num_prompts=len(prompts),
+            num_sequences=len(prompts) * self.group_size,
+        )
+
         self.timing_manager.start_timer("trajectory_generation")
         (
             _,
@@ -630,6 +743,14 @@ class GRPO(BaseAlgorithm):
             group_size=self.group_size,
             normalize_within_groups=self.normalize_rewards
         )
+
+        # Debug logging: advantages
+        self.debug_logger.log_advantages_computation(
+            rewards=rewards,
+            advantages=advantages,
+            group_size=self.group_size,
+        )
+
         self.timing_manager.end_timer("advantage_computation")
 
         self.timing_manager.start_timer("optimization")
@@ -668,6 +789,9 @@ class GRPO(BaseAlgorithm):
             mb_generated_ids = self.stored_generated_ids[mb_indices]
             mb_attention_mask = self.stored_attention_mask[mb_indices]
 
+            # Calculate max completion length for this minibatch
+            mb_max_completion_len = mb_completion_mask.size(1)
+
             # Use eval mode to disable dropout (for deterministic log probs)
             # but keep gradients enabled for backprop
             self.policy.eval()
@@ -676,24 +800,40 @@ class GRPO(BaseAlgorithm):
                 self.policy.model.config.use_cache = False
             try:
                 # Gradients are enabled by default (not in no_grad context)
+                # Use logits_to_keep to get LAST mb_max_completion_len tokens
                 mb_full_log_probs = self.policy.compute_log_probs(
                     mb_generated_ids,
                     attention_mask=mb_attention_mask,
+                    logits_to_keep=mb_max_completion_len,
                 )
             finally:
                 if prev_cache is not None:
                     self.policy.model.config.use_cache = prev_cache
 
-            # Extract completion log probs (same indexing as during generation)
-            mb_prompt_ends = self.stored_prompt_end_positions[mb_indices]
+            # Extract completion log probs for each sequence
+            # mb_full_log_probs contains log probs for LAST mb_max_completion_len positions
+            # We need to find where each completion starts within this window
             mb_new_log_probs_list = []
+            mb_prompt_end_positions = self.stored_prompt_end_positions[mb_indices]
 
             for i in range(len(mb_indices)):
-                prompt_end = int(mb_prompt_ends[i])
-                completion_start = max(prompt_end - 1, 0)
+                # Get sequence length and prompt end position
+                seq_len = mb_generated_ids.size(1)
+                prompt_end = mb_prompt_end_positions[i].item()
+
+                # Completion starts at prompt_end position in the full sequence
+                # logits_to_keep gives us log probs for positions [seq_len - mb_max_completion_len : seq_len]
+                # So in mb_full_log_probs, position 0 corresponds to sequence position (seq_len - mb_max_completion_len)
+                logits_start_pos = seq_len - mb_max_completion_len
+
+                # Where does the completion start within mb_full_log_probs?
+                completion_start_in_logits = prompt_end - logits_start_pos
+
+                # Get actual completion length from mask
                 completion_len = mb_completion_mask[i].sum().int().item()
 
-                seq_new_log_probs = mb_full_log_probs[i, completion_start:completion_start + completion_len]
+                # Extract completion log probs from correct position
+                seq_new_log_probs = mb_full_log_probs[i, completion_start_in_logits:completion_start_in_logits + completion_len]
 
                 # Pad to match completion_mask size
                 if seq_new_log_probs.size(0) < mb_completion_mask.size(1):
@@ -709,6 +849,21 @@ class GRPO(BaseAlgorithm):
 
             mb_new_log_probs = torch.stack(mb_new_log_probs_list)
             mb_new_log_probs = mb_new_log_probs * mb_completion_mask
+
+            # Debug logging: minibatch update (only first minibatch to avoid spam)
+            if mb_idx == 1:
+                self.debug_logger.log_minibatch_update(
+                    mb_idx=mb_idx,
+                    mb_start=mb_start,
+                    mb_end=mb_end,
+                    mb_generated_ids=mb_generated_ids,
+                    mb_attention_mask=mb_attention_mask,
+                    mb_old_log_probs=mb_old_log_probs,
+                    mb_ref_log_probs=mb_ref_log_probs,
+                    mb_new_log_probs=mb_new_log_probs,
+                    mb_completion_mask=mb_completion_mask,
+                    mb_advantages=mb_advantages,
+                )
 
             self.timing_manager.end_timer(f"minibatch_{mb_idx}_recompute")
 
@@ -788,6 +943,9 @@ class GRPO(BaseAlgorithm):
             "ratio_clipped_frac": epoch_metrics["ratio_clipped_frac"],
             "tokens_generated": completion_mask.sum().item(),
         }
+
+        # Debug logging: episode summary
+        self.debug_logger.log_episode_summary(self.episode, metrics)
 
         # Update statistics
         self.total_steps += 1
