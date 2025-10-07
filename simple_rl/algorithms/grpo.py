@@ -959,49 +959,246 @@ class GRPO(BaseAlgorithm):
 
         return metrics
 
-    def train(self, num_episodes: int) -> Dict[str, float]:
-        """Train for specified number of episodes."""
+    def train(
+        self,
+        train_data: Dict[str, List[str]],
+        val_data: Optional[Dict[str, List[str]]] = None,
+        num_episodes: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Train the model using GRPO.
+
+        Args:
+            train_data: Dict with 'prompts' and 'answers' lists
+            val_data: Optional validation data with same format
+            num_episodes: Number of episodes to train (overrides config)
+
+        Returns:
+            Dictionary of training and validation metrics
+        """
+        import time
+        from pathlib import Path
+
+        # Get training parameters from config
+        if num_episodes is None:
+            num_episodes = self.config['training']['num_episodes']
+
+        batch_size = self.config['training']['batch_size']
+        update_epochs = self.config['training'].get('update_epochs', 1)
+        log_interval = self.config['logging']['log_interval']
+        save_interval = self.config['logging']['save_interval']
+
+        # Validation parameters
+        validation_enabled = self.config.get('validation', {}).get('enabled', False)
+        validation_interval = self.config.get('validation', {}).get('interval', 10)
+        validation_num_samples = self.config.get('validation', {}).get('num_samples', 20)
+        validation_num_demo_examples = self.config.get('validation', {}).get('num_demo_examples', 5)
+
+        # Get generation parameters from config
+        max_new_tokens = self.config['training']['max_new_tokens']
+        temperature = self.config['training']['temperature']
+        top_p = self.config['training']['top_p']
+
+        train_prompts = train_data["prompts"]
+        train_answers = train_data["answers"]
+
         print(f"Starting proper GRPO training for {num_episodes} episodes...")
         print(f"  - Using PPO clipped objective (clip_epsilon={self.clip_epsilon})")
-        print(f"  - Single epoch per batch (as per DeepSeekMath)")
+        print(f"  - Training samples: {len(train_prompts)}")
+        print(f"  - Batch size: {batch_size}")
+        print(f"  - Update epochs: {update_epochs}")
         print(f"  - Group size: {self.group_size}")
         print(f"  - Rollout batch size: {self.rollout_batch_size} prompts (OOM prevention)")
         print(f"  - Minibatch size: {self.minibatch_size} rollouts per update")
+        if validation_enabled:
+            print(f"  - Validation enabled: every {validation_interval} episodes")
+            print(f"    - Evaluating {validation_num_samples} validation samples")
+            print(f"    - Showing {validation_num_demo_examples} demo examples")
+        print("=" * 50)
 
-        final_metrics = {}
+        # Training metrics storage
+        training_metrics = {
+            "episode": [],
+            "total_loss": [],
+            "pg_loss": [],
+            "kl_divergence": [],
+            "reward_mean": [],
+            "reward_std": [],
+            "tokens_generated": [],
+            "episode_time": [],
+            "total_tokens": [],
+            "tokens_per_second": []
+        }
+
+        # Validation metrics storage
+        validation_metrics = {
+            "episode": [],
+            "exact_accuracy": [],
+            "numeric_accuracy": [],
+            "format_compliance": [],
+            "avg_format_score": [],
+            "avg_correctness_score": []
+        }
+
+        # Create checkpoint directory
+        checkpoint_dir = Path("checkpoints/grpo_qwen_math")
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize tracking
+        cumulative_tokens = 0
+        training_start_time = time.time()
 
         for episode in range(num_episodes):
             self.episode = episode
+            episode_start_time = time.time()
 
-            # Generate demo prompts (replace with actual data)
-            prompts = [
-                f"Question {i}: What is {i}+{i}?" for i in range(self.batch_size)
-            ]
+            # Aggregate metrics across all epochs in this episode
+            sum_total_loss = 0.0
+            sum_pg_loss = 0.0
+            sum_kl = 0.0
+            sum_reward_mean = 0.0
+            sum_reward_std = 0.0
+            sum_tokens_generated = 0
+            episode_tokens = 0
 
-            batch = {"prompts": prompts, "answers": [str(i*2) for i in range(self.batch_size)]}
-            metrics = self.train_step(batch)
+            for _ in range(update_epochs):
+                # Sample a fresh batch of problems per epoch
+                batch_indices = np.random.choice(len(train_prompts), batch_size, replace=True)
 
-            # Print progress
-            log_interval = self.config.get("logging", {}).get("log_interval", 1)
+                # Get prompts and answers for this batch
+                batch_prompts = [train_prompts[i] for i in batch_indices]
+                batch_answers = [train_answers[i] for i in batch_indices]
 
+                # Pass entire batch to train_step
+                batch_data = {
+                    "prompts": batch_prompts,
+                    "answers": batch_answers
+                }
+                metrics = self.train_step(batch_data)
+
+                # Accumulate metrics
+                sum_total_loss += metrics["total_loss"]
+                sum_pg_loss += metrics["pg_loss"]
+                sum_kl += metrics["kl_divergence"]
+                sum_reward_mean += metrics["reward_mean"]
+                sum_reward_std += metrics.get("reward_std", 0.0)
+
+                # Track tokens
+                tokens_in_batch = metrics.get("tokens_generated", 0)
+                sum_tokens_generated += tokens_in_batch
+                episode_tokens += tokens_in_batch
+
+            # Calculate episode time
+            episode_time = time.time() - episode_start_time
+            cumulative_tokens += episode_tokens
+
+            # Calculate tokens per second for this episode
+            tokens_per_sec = episode_tokens / episode_time if episode_time > 0 else 0
+
+            # Episode-level averaged metrics
+            avg_metrics = {
+                "total_loss": sum_total_loss / update_epochs,
+                "pg_loss": sum_pg_loss / update_epochs,
+                "kl_divergence": sum_kl / update_epochs,
+                "reward_mean": sum_reward_mean / update_epochs,
+                "reward_std": sum_reward_std / update_epochs,
+                "tokens_generated": sum_tokens_generated / update_epochs,
+            }
+
+            # Store metrics
+            training_metrics["episode"].append(episode)
+            training_metrics["total_loss"].append(avg_metrics["total_loss"])
+            training_metrics["pg_loss"].append(avg_metrics["pg_loss"])
+            training_metrics["kl_divergence"].append(avg_metrics["kl_divergence"])
+            training_metrics["reward_mean"].append(avg_metrics["reward_mean"])
+            training_metrics["reward_std"].append(avg_metrics.get("reward_std", 0.0))
+            training_metrics["tokens_generated"].append(avg_metrics.get("tokens_generated", 0))
+            training_metrics["episode_time"].append(episode_time)
+            training_metrics["total_tokens"].append(cumulative_tokens)
+            training_metrics["tokens_per_second"].append(tokens_per_sec)
+
+            # Logging
             if episode % log_interval == 0:
-                self.logger.print_progress(episode, num_episodes, metrics)
+                print(f"Episode {int(episode):3d} | "
+                      f"Loss: {avg_metrics['total_loss']:7.4f} | "
+                      f"PG Loss: {avg_metrics['pg_loss']:7.4f} | "
+                      f"KL: {avg_metrics['kl_divergence']:7.4f} | "
+                      f"Reward: {avg_metrics['reward_mean']:6.3f} ± {avg_metrics.get('reward_std', 0.0):5.3f} | "
+                      f"Tokens: {int(episode_tokens):5d} | "
+                      f"Time: {episode_time:5.2f}s | "
+                      f"Speed: {tokens_per_sec:6.1f} tok/s")
 
-                if episode > 0 and episode % 10 == 0:
-                    self.timing_manager.print_timing_summary(f"Episode {episode} Summary")
+            # Run validation if enabled and at the right interval
+            if validation_enabled and val_data and (episode + 1) % validation_interval == 0:
+                print(f"\n{'='*60}")
+                print(f"VALIDATION AT EPISODE {episode + 1}")
+                print(f"{'='*60}")
 
-            final_metrics = metrics
+                # Import evaluation function
+                from simple_rl.evaluation.gsm8k import evaluate_on_gsm8k, demonstrate_model_responses
+
+                # Run evaluation on validation set
+                val_metrics = evaluate_on_gsm8k(
+                    self,
+                    self.policy.tokenizer,
+                    val_data["prompts"],
+                    val_data["answers"],
+                    validation_num_samples,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    model_name=f"Episode {episode + 1}"
+                )
+
+                # Store validation metrics
+                validation_metrics["episode"].append(episode + 1)
+                validation_metrics["exact_accuracy"].append(val_metrics['exact_accuracy'])
+                validation_metrics["numeric_accuracy"].append(val_metrics['numeric_accuracy'])
+                validation_metrics["format_compliance"].append(val_metrics['format_compliance'])
+                validation_metrics["avg_format_score"].append(val_metrics['avg_format_score'])
+                validation_metrics["avg_correctness_score"].append(val_metrics['avg_correctness_score'])
+
+                # Demonstrate model responses
+                demonstrate_model_responses(
+                    self,
+                    self.policy.tokenizer,
+                    val_data["prompts"][:validation_num_demo_examples],
+                    val_data["answers"][:validation_num_demo_examples],
+                    validation_num_demo_examples,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    title=f"EPISODE {episode + 1} RESPONSE EXAMPLES"
+                )
+
+                print(f"{'='*60}\n")
 
             # Save checkpoint
-            save_interval = self.config.get("logging", {}).get("save_interval", 100)
-            if episode % save_interval == 0 and episode > 0:
-                checkpoint_path = f"checkpoints/grpo_episode_{episode}.pt"
-                self.save_checkpoint(checkpoint_path)
+            if (episode + 1) % save_interval == 0:
+                checkpoint_path = checkpoint_dir / f"checkpoint_episode_{episode+1}.pt"
+                self.save_checkpoint(str(checkpoint_path))
+                print(f"  → Saved checkpoint to {checkpoint_path}")
 
-        print(f"\n[TRAINING] Completed {num_episodes} episodes")
+            # Print timing summary periodically
+            if episode > 0 and episode % 10 == 0:
+                self.timing_manager.print_timing_summary(f"Episode {episode} Summary")
+
+        # Calculate total training time
+        total_training_time = time.time() - training_start_time
+        print("=" * 50)
+        print("Training complete!")
+        print(f"Total training time: {total_training_time:.2f} seconds ({total_training_time/60:.2f} minutes)")
+        print(f"Total tokens processed: {cumulative_tokens:,}")
+        print(f"Average speed: {cumulative_tokens/total_training_time:.1f} tokens/second")
+
         self.timing_manager.print_timing_summary("FINAL TRAINING PERFORMANCE")
 
-        return final_metrics
+        return {
+            "training_metrics": training_metrics,
+            "validation_metrics": validation_metrics,
+            "total_time": total_training_time,
+            "final_reward": training_metrics["reward_mean"][-1] if training_metrics["reward_mean"] else 0.0
+        }
 
     def evaluate(self, num_episodes: int = 1) -> Dict[str, float]:
         """Evaluate the policy."""
