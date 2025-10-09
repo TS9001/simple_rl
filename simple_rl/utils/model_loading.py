@@ -55,7 +55,11 @@ def create_model_loader_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(dtype_cfg, str):
             target_dtype = alias_map.get(dtype_cfg.lower())
             if target_dtype is not None:
-                loader_kwargs["torch_dtype"] = target_dtype
+                loader_kwargs["dtype"] = target_dtype
+    else:
+        # Default to fp16 on CUDA/MPS if unspecified
+        if torch.cuda.is_available() or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            loader_kwargs["dtype"] = torch.float16
 
     # CUDA-specific optimizations
     if torch.cuda.is_available():

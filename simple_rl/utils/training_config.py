@@ -39,6 +39,8 @@ class TrainingConfig:
             "kl_coef": algo_config.get("kl_coef", 0.05),
             "normalize_rewards": algo_config.get("normalize_rewards", True),
             "clip_epsilon": algo_config.get("clip_epsilon", 0.2),
+            "clip_epsilon_low": algo_config.get("clip_epsilon_low", algo_config.get("clip_epsilon", 0.2)),
+            "clip_epsilon_high": algo_config.get("clip_epsilon_high", algo_config.get("clip_epsilon", 0.2)),
             "store_completions": algo_config.get("store_completions", True),
 
             # Rollout generation batching (to avoid OOM during generation)
@@ -134,6 +136,16 @@ class TrainingConfig:
     def clip_epsilon(self) -> float:
         """Get clipping epsilon."""
         return self._parsed_config["clip_epsilon"]
+
+    @property
+    def clip_epsilon_low(self) -> float:
+        """Get lower clipping epsilon (for asymmetric clipping)."""
+        return self._parsed_config["clip_epsilon_low"]
+
+    @property
+    def clip_epsilon_high(self) -> float:
+        """Get upper clipping epsilon (for asymmetric clipping)."""
+        return self._parsed_config["clip_epsilon_high"]
 
     @property
     def store_completions(self) -> bool:

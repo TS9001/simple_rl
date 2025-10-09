@@ -17,6 +17,7 @@ from transformers import (
 )
 import time
 import numpy as np
+import math
 
 from .base import BaseAlgorithm
 
@@ -33,6 +34,8 @@ class SFTDataset(Dataset):
         completions: List[str],
         tokenizer,
         max_length: int = 1024,
+        debug: bool = False,
+        mask_prompt: bool = True,
     ):
         """
         Initialize SFT dataset.
@@ -42,11 +45,17 @@ class SFTDataset(Dataset):
             completions: List of completion strings (targets)
             tokenizer: HuggingFace tokenizer
             max_length: Maximum sequence length
+            debug: Enable debug output
+            mask_prompt: If True, mask prompt tokens in loss (standard).
+                        If False, train on full sequence including prompt (like reference notebook).
         """
         self.prompts = prompts
         self.completions = completions
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.debug = debug
+        self.mask_prompt = mask_prompt
+        self._debug_logged = False
 
     def __len__(self):
         return len(self.prompts)
@@ -72,13 +81,72 @@ class SFTDataset(Dataset):
             prompt + "\n",
             truncation=True,
             max_length=self.max_length,
+            add_special_tokens=True,
         )
         prompt_length = len(prompt_encoding["input_ids"])
 
-        # Create labels: -100 for prompt tokens (ignored in loss), actual token ids for completion
         labels = encoding["input_ids"].clone()
-        labels[0, :prompt_length] = -100  # Mask prompt tokens
-        labels[0, encoding["attention_mask"][0] == 0] = -100  # Mask padding tokens
+
+        # Calculate padding offset for left-padded sequences
+        seq_len = encoding["input_ids"].size(1)
+        nonpad_len = int(encoding["attention_mask"][0].sum().item())
+        pad_len = seq_len - nonpad_len
+
+        if self.mask_prompt:
+            # Mask prompt tokens at the correct offset when using left padding
+            start = pad_len  # where real tokens start
+            end = min(start + prompt_length, seq_len)
+            labels[0, start:end] = -100  # mask only the prompt span
+
+        # Always mask padding tokens
+        labels[0, encoding["attention_mask"][0] == 0] = -100
+
+        if self.debug and not self._debug_logged:
+            print("\n" + "=" * 80)
+            print("[SFTDataset Debug - Full Training Example]")
+            print("=" * 80)
+
+            # Show the full message
+            print("\n📝 FULL TRAINING TEXT:")
+            print("-" * 80)
+            print(full_text)
+            print("-" * 80)
+
+            print(f"\n📊 BREAKDOWN:")
+            print(f"  Prompt: {repr(prompt[:100])}..." if len(prompt) > 100 else f"  Prompt: {repr(prompt)}")
+            print(f"  Completion: {repr(completion[:100])}..." if len(completion) > 100 else f"  Completion: {repr(completion)}")
+            print(f"  Mask prompt tokens: {self.mask_prompt}")
+
+            # Tokenization details
+            full_ids = encoding["input_ids"].squeeze(0)
+            labels_flat = labels.squeeze(0)
+            completion_indices = (labels_flat != -100).nonzero(as_tuple=True)
+
+            print(f"\n🔢 TOKENIZATION:")
+            print(f"  Total tokens: {len(full_ids)}")
+            print(f"  Prompt tokens: {prompt_length}")
+            print(f"  Non-masked tokens (for loss): {(labels_flat != -100).sum().item()}")
+
+            if completion_indices[0].numel() > 0:
+                first_completion_idx = completion_indices[0][0].item()
+                context_start = max(0, first_completion_idx - 3)
+                context_end = min(len(full_ids), first_completion_idx + 5)
+                context_ids = full_ids[context_start:context_end]
+                first_completion_token = self.tokenizer.decode(
+                    [full_ids[first_completion_idx]], skip_special_tokens=False
+                )
+                context_text = self.tokenizer.decode(
+                    context_ids, skip_special_tokens=False
+                )
+
+                print(f"\n🎯 LABEL MASKING:")
+                print(f"  First non-masked token index: {first_completion_idx}")
+                print(f"  First non-masked token: {repr(first_completion_token)}")
+                print(f"  Context around split: {repr(context_text)}")
+
+            print("=" * 80 + "\n")
+
+            self._debug_logged = True
 
         return {
             "input_ids": encoding["input_ids"].squeeze(0),
@@ -135,6 +203,8 @@ class SFT(BaseAlgorithm):
             )
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
+            # Ensure consistent padding behavior for decoder-only models
+            self.tokenizer.padding_side = "left"
         else:
             self.tokenizer = tokenizer
 
@@ -144,7 +214,7 @@ class SFT(BaseAlgorithm):
             print(f"Loading model: {model_name}")
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                 device_map="auto" if torch.cuda.is_available() else None,
                 trust_remote_code=True,
             )
@@ -152,6 +222,16 @@ class SFT(BaseAlgorithm):
             self.model = model
 
         self.model = self.model.to(self.device)
+
+        # Ensure model config is aligned with tokenizer for padding/eos
+        try:
+            if getattr(self.model, "config", None) is not None:
+                if getattr(self.model.config, "pad_token_id", None) is None:
+                    self.model.config.pad_token_id = self.tokenizer.eos_token_id
+                # Optionally disable cache if using gradient checkpointing
+        except Exception:
+            # Be conservative if model lacks expected attributes
+            pass
 
         # Training configuration
         training_config = config.get("training", {})
@@ -163,6 +243,18 @@ class SFT(BaseAlgorithm):
         )
         self.max_grad_norm = training_config.get("max_grad_norm", 1.0)
         self.warmup_steps = training_config.get("warmup_steps", 100)
+        self.enable_gradient_checkpointing = training_config.get("gradient_checkpointing", False)
+        self.weight_decay = training_config.get("weight_decay", 0.01)
+        self.label_smoothing = training_config.get("label_smoothing", 0.0)
+        # Mixed precision (MPS autocast)
+        self.mixed_precision = training_config.get("mixed_precision", {}) or {}
+        self.use_mps_autocast = (
+            isinstance(self.device, torch.device)
+            and self.device.type == "mps"
+            and bool(self.mixed_precision.get("enabled", False))
+        )
+        _dtype_key = str(self.mixed_precision.get("dtype", "fp16")).lower()
+        self.mps_autocast_dtype = torch.float16 if _dtype_key in ("fp16", "float16") else torch.bfloat16
 
         # Model configuration
         model_config = config.get("model", {})
@@ -178,6 +270,8 @@ class SFT(BaseAlgorithm):
         self.validation_enabled = validation_config.get("enabled", True)
         self.validation_interval = validation_config.get("interval", 200)
         self.validation_num_samples = validation_config.get("num_samples", 20)
+        self.validation_seed = validation_config.get("seed", 42)
+        self._val_sample_indices = None
 
         # Initialize optimizer (will be set up in train())
         self.optimizer = None
@@ -224,22 +318,45 @@ class SFT(BaseAlgorithm):
             completions=train_data["completions"],
             tokenizer=self.tokenizer,
             max_length=self.max_length,
+            debug=train_data.get(
+                "debug_boundary",
+                self.config.get("training", {}).get("debug_boundary", False),
+            ),
+            mask_prompt=self.config.get("training", {}).get("mask_prompt", True),
         )
 
         train_dataloader = DataLoader(
             train_dataset, batch_size=self.batch_size, shuffle=True
         )
 
-        # Calculate total training steps
+        # Calculate total training steps (ceil to avoid under-counting)
         num_epochs = num_episodes or self.num_epochs
-        num_training_steps = (
-            len(train_dataloader) * num_epochs // self.gradient_accumulation_steps
-        )
+        updates_per_epoch = math.ceil(len(train_dataloader) / self.gradient_accumulation_steps) if len(train_dataloader) > 0 else 0
+        num_training_steps = updates_per_epoch * num_epochs
 
         # Initialize optimizer if not already done
         if self.optimizer is None:
+            # Weight decay with no_decay for biases and layer norms
+            decay_params = []
+            no_decay_params = []
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if any(nd in name for nd in ["bias", "LayerNorm.weight", "layer_norm.weight", "ln_f.weight", "ln_attn.weight"]):
+                    no_decay_params.append(param)
+                else:
+                    decay_params.append(param)
+
+            optimizer_grouped_parameters = [
+                {"params": decay_params, "weight_decay": self.weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ]
+
             self.optimizer = torch.optim.AdamW(
-                self.model.parameters(), lr=self.learning_rate, weight_decay=0.01
+                optimizer_grouped_parameters,
+                lr=self.learning_rate,
+                betas=(0.9, 0.999),
+                eps=1e-8,
             )
 
         # Initialize scheduler if not already done
@@ -249,6 +366,14 @@ class SFT(BaseAlgorithm):
                 num_warmup_steps=self.warmup_steps,
                 num_training_steps=num_training_steps,
             )
+
+        # Enable gradient checkpointing for memory/stability if requested
+        if self.enable_gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
+            if getattr(self.model, "config", None) is not None:
+                # use_cache must be disabled when using gradient checkpointing
+                if hasattr(self.model.config, "use_cache"):
+                    self.model.config.use_cache = False
+            self.model.gradient_checkpointing_enable()
 
         print(f"Starting SFT training for {num_epochs} epochs...")
         print(f"Batch size: {self.batch_size}")
@@ -280,8 +405,11 @@ class SFT(BaseAlgorithm):
         self.model.train()
         training_start_time = time.time()
 
+        # Initialize gradients
+        self.optimizer.zero_grad()
+
         for epoch in range(num_epochs):
-            epoch_loss = 0.0
+            epoch_loss_sum = 0.0  # sum of unscaled (pre-accumulation) losses
             epoch_start_time = time.time()
 
             progress_bar = tqdm(
@@ -297,17 +425,45 @@ class SFT(BaseAlgorithm):
                 labels = batch["labels"].to(self.device)
 
                 # Forward pass
-                outputs = self.model(
-                    input_ids=input_ids, attention_mask=attention_mask, labels=labels
-                )
-
-                loss = outputs.loss
+                if self.use_mps_autocast:
+                    with torch.autocast(device_type="mps", dtype=self.mps_autocast_dtype):
+                        outputs = self.model(
+                            input_ids=input_ids, attention_mask=attention_mask, labels=labels
+                        )
+                        if self.label_smoothing and self.label_smoothing > 0.0:
+                            logits = outputs.logits
+                            shift_logits = logits[:, :-1, :].contiguous()
+                            shift_labels = labels[:, 1:].contiguous()
+                            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=float(self.label_smoothing))
+                            loss = loss_fct(
+                                shift_logits.view(-1, shift_logits.size(-1)),
+                                shift_labels.view(-1),
+                            )
+                        else:
+                            loss = outputs.loss
+                else:
+                    outputs = self.model(
+                        input_ids=input_ids, attention_mask=attention_mask, labels=labels
+                    )
+                    if self.label_smoothing and self.label_smoothing > 0.0:
+                        logits = outputs.logits
+                        shift_logits = logits[:, :-1, :].contiguous()
+                        shift_labels = labels[:, 1:].contiguous()
+                        loss_fct = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=float(self.label_smoothing))
+                        loss = loss_fct(
+                            shift_logits.view(-1, shift_logits.size(-1)),
+                            shift_labels.view(-1),
+                        )
+                    else:
+                        loss = outputs.loss
 
                 # Scale loss for gradient accumulation
+                raw_loss_value = float(loss.item())
                 loss = loss / self.gradient_accumulation_steps
                 loss.backward()
-
-                epoch_loss += loss.item()
+                
+                # Track unscaled loss for accurate epoch averaging
+                epoch_loss_sum += raw_loss_value
 
                 # Update weights after accumulation steps
                 if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
@@ -329,9 +485,7 @@ class SFT(BaseAlgorithm):
                     # Store metrics
                     current_lr = self.scheduler.get_last_lr()[0]
                     training_metrics["step"].append(self.global_step)
-                    training_metrics["loss"].append(
-                        loss.item() * self.gradient_accumulation_steps
-                    )
+                    training_metrics["loss"].append(raw_loss_value)
                     training_metrics["learning_rate"].append(current_lr)
                     training_metrics["epoch"].append(epoch)
                     training_metrics["tokens_per_second"].append(tokens_per_sec)
@@ -405,13 +559,23 @@ class SFT(BaseAlgorithm):
                         self.save_checkpoint(str(checkpoint_path))
                         print(f"  → Saved checkpoint to {checkpoint_path}")
 
+            # Flush any remaining gradients if last batch didn't trigger update
+            # This handles edge case where len(dataloader) % gradient_accumulation_steps != 0
+            if (batch_idx + 1) % self.gradient_accumulation_steps != 0:
+                print(f"\nFlushing remaining gradients from last {(batch_idx + 1) % self.gradient_accumulation_steps} batches...")
+                clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+                self.global_step += 1
+
             # Epoch summary
             epoch_time = time.time() - epoch_start_time
-            avg_epoch_loss = epoch_loss / len(train_dataloader)
+            avg_epoch_loss = epoch_loss_sum / len(train_dataloader) if len(train_dataloader) > 0 else float("nan")
             print(
                 f"\nEpoch {epoch+1} completed in {epoch_time:.2f}s | Avg Loss: {avg_epoch_loss:.4f}"
             )
-
+            print("=" * 50)
         # Training complete
         total_training_time = time.time() - training_start_time
         print("=" * 50)
@@ -420,6 +584,11 @@ class SFT(BaseAlgorithm):
             f"Total training time: {total_training_time:.2f} seconds ({total_training_time/60:.2f} minutes)"
         )
         print(f"Total steps: {self.global_step}")
+
+        # Always save final checkpoint
+        final_checkpoint_path = checkpoint_dir / f"checkpoint_step_{self.global_step}_final.pt"
+        self.save_checkpoint(str(final_checkpoint_path))
+        print(f"  → Saved final checkpoint to {final_checkpoint_path}")
 
         return {
             "training_metrics": training_metrics,
@@ -468,9 +637,13 @@ class SFT(BaseAlgorithm):
 
         # Backward pass
         if self.optimizer is None:
-            # Initialize optimizer if needed
+            # Initialize optimizer if needed (match HF Trainer defaults)
             self.optimizer = torch.optim.AdamW(
-                self.model.parameters(), lr=self.learning_rate, weight_decay=0.01
+                self.model.parameters(),
+                lr=self.learning_rate,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=0.0
             )
 
         self.optimizer.zero_grad()
@@ -496,11 +669,13 @@ class SFT(BaseAlgorithm):
             Dictionary of evaluation metrics
         """
         # Create dataset and dataloader
+        # IMPORTANT: Use same mask_prompt setting as training!
         test_dataset = SFTDataset(
             prompts=test_data["prompts"],
             completions=test_data["completions"],
             tokenizer=self.tokenizer,
             max_length=self.max_length,
+            mask_prompt=self.config.get("training", {}).get("mask_prompt", True),
         )
 
         test_dataloader = DataLoader(
@@ -517,11 +692,39 @@ class SFT(BaseAlgorithm):
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
 
-                outputs = self.model(
-                    input_ids=input_ids, attention_mask=attention_mask, labels=labels
-                )
-
-                total_loss += outputs.loss.item()
+                if self.use_mps_autocast:
+                    with torch.autocast(device_type="mps", dtype=self.mps_autocast_dtype):
+                        outputs = self.model(
+                            input_ids=input_ids, attention_mask=attention_mask, labels=labels
+                        )
+                        if self.label_smoothing and self.label_smoothing > 0.0:
+                            logits = outputs.logits
+                            shift_logits = logits[:, :-1, :].contiguous()
+                            shift_labels = labels[:, 1:].contiguous()
+                            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=float(self.label_smoothing))
+                            loss = loss_fct(
+                                shift_logits.view(-1, shift_logits.size(-1)),
+                                shift_labels.view(-1),
+                            )
+                            total_loss += loss.item()
+                        else:
+                            total_loss += outputs.loss.item()
+                else:
+                    outputs = self.model(
+                        input_ids=input_ids, attention_mask=attention_mask, labels=labels
+                    )
+                    if self.label_smoothing and self.label_smoothing > 0.0:
+                        logits = outputs.logits
+                        shift_logits = logits[:, :-1, :].contiguous()
+                        shift_labels = labels[:, 1:].contiguous()
+                        loss_fct = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=float(self.label_smoothing))
+                        loss = loss_fct(
+                            shift_logits.view(-1, shift_logits.size(-1)),
+                            shift_labels.view(-1),
+                        )
+                        total_loss += loss.item()
+                    else:
+                        total_loss += outputs.loss.item()
                 total_batches += 1
 
         avg_loss = total_loss / total_batches
@@ -547,11 +750,14 @@ class SFT(BaseAlgorithm):
         Returns:
             Dictionary of validation metrics
         """
-        # Sample if needed
+        # Sample deterministically if needed (persist indices across validations)
         if len(val_data["prompts"]) > self.validation_num_samples:
-            indices = np.random.choice(
-                len(val_data["prompts"]), self.validation_num_samples, replace=False
-            )
+            if self._val_sample_indices is None:
+                rng = np.random.RandomState(self.validation_seed)
+                self._val_sample_indices = rng.choice(
+                    len(val_data["prompts"]), self.validation_num_samples, replace=False
+                )
+            indices = self._val_sample_indices
             sampled_data = {
                 "prompts": [val_data["prompts"][i] for i in indices],
                 "completions": [val_data["completions"][i] for i in indices],
@@ -560,11 +766,13 @@ class SFT(BaseAlgorithm):
             sampled_data = val_data
 
         # Create dataset and dataloader
+        # IMPORTANT: Use same mask_prompt setting as training!
         val_dataset = SFTDataset(
             prompts=sampled_data["prompts"],
             completions=sampled_data["completions"],
             tokenizer=self.tokenizer,
             max_length=self.max_length,
+            mask_prompt=self.config.get("training", {}).get("mask_prompt", True),
         )
 
         val_dataloader = DataLoader(
@@ -581,11 +789,39 @@ class SFT(BaseAlgorithm):
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
 
-                outputs = self.model(
-                    input_ids=input_ids, attention_mask=attention_mask, labels=labels
-                )
-
-                total_loss += outputs.loss.item()
+                if self.use_mps_autocast:
+                    with torch.autocast(device_type="mps", dtype=self.mps_autocast_dtype):
+                        outputs = self.model(
+                            input_ids=input_ids, attention_mask=attention_mask, labels=labels
+                        )
+                        if self.label_smoothing and self.label_smoothing > 0.0:
+                            logits = outputs.logits
+                            shift_logits = logits[:, :-1, :].contiguous()
+                            shift_labels = labels[:, 1:].contiguous()
+                            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=float(self.label_smoothing))
+                            loss = loss_fct(
+                                shift_logits.view(-1, shift_logits.size(-1)),
+                                shift_labels.view(-1),
+                            )
+                            total_loss += loss.item()
+                        else:
+                            total_loss += outputs.loss.item()
+                else:
+                    outputs = self.model(
+                        input_ids=input_ids, attention_mask=attention_mask, labels=labels
+                    )
+                    if self.label_smoothing and self.label_smoothing > 0.0:
+                        logits = outputs.logits
+                        shift_logits = logits[:, :-1, :].contiguous()
+                        shift_labels = labels[:, 1:].contiguous()
+                        loss_fct = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=float(self.label_smoothing))
+                        loss = loss_fct(
+                            shift_logits.view(-1, shift_logits.size(-1)),
+                            shift_labels.view(-1),
+                        )
+                        total_loss += loss.item()
+                    else:
+                        total_loss += outputs.loss.item()
                 total_batches += 1
 
         avg_loss = total_loss / total_batches
@@ -595,13 +831,14 @@ class SFT(BaseAlgorithm):
     def generate(
         self,
         prompts: List[str],
-        max_new_tokens: int = 128,
+        max_new_tokens: int = 300,  # Increased from 128 for math reasoning
         temperature: float = 1.0,
         top_p: float = 1.0,
         do_sample: bool = True,
+        batch_size: int = 8,  # Batch size for generation
     ) -> List[str]:
         """
-        Generate completions for given prompts.
+        Generate completions for given prompts using batched generation.
 
         Args:
             prompts: List of prompt strings
@@ -609,22 +846,30 @@ class SFT(BaseAlgorithm):
             temperature: Sampling temperature
             top_p: Nucleus sampling parameter
             do_sample: Whether to use sampling
+            batch_size: Number of prompts to process in parallel
 
         Returns:
             List of generated completion strings
         """
         self.model.eval()
-        completions = []
+        all_completions = []
 
         with torch.no_grad():
-            for prompt in prompts:
-                # Tokenize
+            # Process prompts in batches for speed
+            for i in range(0, len(prompts), batch_size):
+                batch_prompts = prompts[i:i + batch_size]
+
+                # Tokenize batch with padding
                 inputs = self.tokenizer(
-                    prompt, return_tensors="pt", truncation=True, max_length=512
+                    batch_prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=512
                 )
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-                # Generate
+                # Generate for batch
                 generated_ids = self.model.generate(
                     inputs["input_ids"],
                     attention_mask=inputs.get("attention_mask", None),
@@ -635,16 +880,20 @@ class SFT(BaseAlgorithm):
                     pad_token_id=self.tokenizer.eos_token_id,
                 )
 
-                # Extract completion
-                prompt_len = inputs["input_ids"].shape[1]
-                completion_ids = generated_ids[:, prompt_len:]
-                completion = self.tokenizer.decode(
-                    completion_ids[0], skip_special_tokens=True
-                ).strip()
+                # Extract completions for each item in batch
+                for j, gen_ids in enumerate(generated_ids):
+                    # Find where the prompt ends (first non-pad token in input)
+                    prompt_len = (inputs["attention_mask"][j] == 1).sum().item()
 
-                completions.append(completion)
+                    # Extract only the completion part
+                    completion_ids = gen_ids[prompt_len:]
+                    completion = self.tokenizer.decode(
+                        completion_ids, skip_special_tokens=True
+                    ).strip()
 
-        return completions
+                    all_completions.append(completion)
+
+        return all_completions
 
     def save_checkpoint(self, path: str):
         """

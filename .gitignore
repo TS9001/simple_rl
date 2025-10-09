@@ -150,3 +150,6 @@ reports/
 .dmypy.json
 dmypy.json
 plans/*
+
+# generated files
+notebooks/cot_archive/*

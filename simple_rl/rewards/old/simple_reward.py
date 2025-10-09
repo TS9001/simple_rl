@@ -28,14 +28,20 @@ def extract_answer_from_model_output(text: str) -> Optional[str]:
     Returns:
         Extracted answer string or None if not found/invalid
     """
-    text_parts = text.split("<answer>")
-    if len(text_parts) < 2:
+    # Use regex to find all <answer>...</answer> blocks
+    matches = re.findall(r'<answer>(.*?)</answer>', text, re.DOTALL)
+    
+    if not matches:
         return None
-    end = text_parts[-1]
-    if "</answer>" not in end:
+    
+    # Take the last answer in case there are multiple
+    answer = matches[-1].strip()
+    
+    # Filter out placeholder text
+    if answer == "..." or answer == "":
         return None
-    answer = end.split("</answer>")[0].strip()
-    return None if answer == "..." else answer
+    
+    return answer
 
 
 def extract_answer_from_dataset(text: str) -> Optional[str]:
@@ -53,22 +59,31 @@ def extract_answer_from_dataset(text: str) -> Optional[str]:
 
 def extract_single_number(text: Optional[str]) -> Optional[float]:
     """
-    Extract the first number from text, handling currency symbols and commas.
+    Extract a single number from text if exactly one exists.
+
+    Matches the original GRPO notebook implementation:
+    - Returns the number ONLY if exactly one number is found
+    - Returns None if zero numbers or multiple numbers found
 
     Args:
         text: Input text that may contain numbers
 
     Returns:
-        First number found as float or None if no valid number
+        Single number as float, or None if not exactly one number
     """
     if text is None:
         return None
-    numbers = NUMBER_PATTERN.findall(str(text).replace("$", "").replace(",", ""))
-    if numbers:
+
+    # Find all numbers
+    numbers = NUMBER_PATTERN.findall(str(text))
+
+    # Return the number ONLY if exactly one is found
+    if len(numbers) == 1:
         try:
             return float(numbers[0])
         except ValueError:
             return None
+
     return None
 
 
@@ -76,9 +91,9 @@ def correctness_reward(completion: str, answer: Optional[str] = None) -> float:
     """
     Compute correctness reward based on answer accuracy.
 
-    Reward structure:
+    Matches the original GRPO notebook implementation:
     - 2.0: Exact string match
-    - 1.5: Numerical match (within 0.01 tolerance)
+    - 1.5: Numerical equality (both single numbers, exact match)
     - 0.0: No match or missing answer
 
     Args:
@@ -92,15 +107,18 @@ def correctness_reward(completion: str, answer: Optional[str] = None) -> float:
         return 0.0
 
     model_answer = extract_answer_from_model_output(completion)
+
+    # Exact string match
     if model_answer == answer:
         return 2.0
 
-    model_num = extract_single_number(model_answer)
-    answer_num = extract_single_number(answer)
+    # Try numeric equivalence (exact equality, no tolerance)
+    model_num = extract_single_number(str(model_answer))
+    answer_num = extract_single_number(str(answer))
 
-    if model_num is not None and answer_num is not None:
-        if abs(model_num - answer_num) < 0.01:
-            return 1.5
+    if model_num is not None and answer_num is not None and model_num == answer_num:
+        return 1.5
+
     return 0.0
 
 
@@ -108,25 +126,27 @@ def format_reward(completion: str) -> float:
     """
     Compute format reward based on presence of required XML tags.
 
-    Reward structure:
-    - 0.25 for each tag: <reasoning>, </reasoning>, <answer>, </answer>
-    - 0.5 bonus if all tags are present (total 1.5)
+    Matches the original GRPO notebook implementation:
+    - 0.2 for each tag: <reasoning>, </reasoning>, <answer>, </answer>
+    - Maximum score: 0.8 (all 4 tags present)
 
     Args:
         completion: Model completion text
 
     Returns:
-        Format reward (0.0 to 1.5)
+        Format reward (0.0 to 0.8)
     """
     score = 0.0
-    score += 0.25 if "<reasoning>" in completion else 0
-    score += 0.25 if "</reasoning>" in completion else 0
-    score += 0.25 if "<answer>" in completion else 0
-    score += 0.25 if "</answer>" in completion else 0
-
-    if score == 1.0:  # All tags present
-        score += 0.5
+    if "<reasoning>" in completion:
+        score += 0.20
+    if "</reasoning>" in completion:
+        score += 0.20
+    if "<answer>" in completion:
+        score += 0.20
+    if "</answer>" in completion:
+        score += 0.20
     return score
+    
 
 
 def compute_math_reward(completion: str, answer: Optional[str] = None) -> float:
@@ -147,7 +167,8 @@ def compute_math_rewards_batch(
     completions: Union[List[str], torch.Tensor],
     answers: Optional[List[str]] = None,
     device: Union[str, torch.device, None] = None,
-) -> torch.Tensor:
+    return_breakdown: bool = False,
+) -> Union[torch.Tensor, tuple]:
     """
     Compute rewards for a batch of completions.
     Returns tensor directly on specified device (cuda/mps/cpu).
@@ -156,9 +177,11 @@ def compute_math_rewards_batch(
         completions: List of completion strings or tensor of token ids
         answers: List of ground truth answers (optional)
         device: Target device for output tensor
+        return_breakdown: If True, returns (total, format, correctness) tuple
 
     Returns:
-        Tensor of rewards on specified device
+        If return_breakdown=False: Tensor of total rewards on specified device
+        If return_breakdown=True: Tuple of (total_rewards, format_rewards, correctness_rewards)
 
     Raises:
         NotImplementedError: If completions are provided as token tensor
@@ -177,7 +200,18 @@ def compute_math_rewards_batch(
     if answers is None:
         answers = [None] * batch_size
 
-    rewards = list(map(compute_math_reward, completions, answers))
+    if return_breakdown:
+        # Compute format and correctness separately
+        format_rewards = list(map(format_reward, completions))
+        correctness_rewards = list(map(correctness_reward, completions, answers))
+        total_rewards = [f + c for f, c in zip(format_rewards, correctness_rewards)]
 
-    # Convert to tensor on target device
-    return torch.tensor(rewards, dtype=torch.float32, device=device)
+        return (
+            torch.tensor(total_rewards, dtype=torch.float32, device=device),
+            torch.tensor(format_rewards, dtype=torch.float32, device=device),
+            torch.tensor(correctness_rewards, dtype=torch.float32, device=device),
+        )
+    else:
+        rewards = list(map(compute_math_reward, completions, answers))
+        # Convert to tensor on target device
+        return torch.tensor(rewards, dtype=torch.float32, device=device)

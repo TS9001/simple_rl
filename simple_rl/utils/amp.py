@@ -132,19 +132,19 @@ class AMPConfig:
                 print(
                     "Mixed precision autocast on MPS failed to initialize. Falling back to full precision."
                 )
-                self._autocast = nullcontext()
+                self._autocast = nullcontext
                 self._amp_enabled = False
         else:
             if mode not in {"off", "disable"}:
                 print(
                     "Mixed precision on MPS remains experimental in the latest PyTorch nightly; keeping full precision."
                 )
-            self._autocast = nullcontext()
+            self._autocast = nullcontext
             self._amp_enabled = False
 
     def _setup_cpu_amp(self) -> None:
         """Set up CPU (no mixed precision)."""
-        self._autocast = nullcontext()
+        self._autocast = nullcontext
         self._amp_enabled = False
 
     @property

@@ -24,12 +24,19 @@ class LanguageModel(nn.Module):
     Can be used by any algorithm that needs language generation capabilities.
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        model: Optional[Any] = None,
+        tokenizer: Optional[Any] = None,
+    ):
         """
         Initialize language model with HuggingFace model.
 
         Args:
             config: Configuration dictionary with model settings
+            model: Optional pre-loaded HuggingFace model
+            tokenizer: Optional pre-loaded HuggingFace tokenizer
         """
         super().__init__()
 
@@ -42,10 +49,14 @@ class LanguageModel(nn.Module):
         # Determine target device
         target_device = get_target_device(model_config.get("device") or config.get("device"))
 
-        # Load HuggingFace model and tokenizer using utility
-        self.model, self.tokenizer = load_huggingface_model_and_tokenizer(
-            self.model_name, config
-        )
+        # Load HuggingFace model and tokenizer using utility (if not provided)
+        if model is None or tokenizer is None:
+            self.model, self.tokenizer = load_huggingface_model_and_tokenizer(
+                self.model_name, config
+            )
+        else:
+            self.model = model
+            self.tokenizer = tokenizer
 
         # Set up tokenizer and model config
         setup_tokenizer_and_model_config(self.model, self.tokenizer)
@@ -205,14 +216,11 @@ class LanguageModel(nn.Module):
                 shift_labels = shift_labels[:, start_idx:]
 
         # Compute log probabilities
-        # MPS workaround: For large vocab sizes, move to CPU for log_softmax if on MPS
+        # MPS workaround: use on-device logsumexp-based log_softmax to avoid CPU fallback
         if shift_logits.device.type == 'mps' and shift_logits.size(-1) > 100000:
-            # Move to CPU for log_softmax computation (MPS has issues with large vocab)
-            original_device = shift_logits.device
-            shift_logits_cpu = shift_logits.to('cpu')
-            log_probs_all = F.log_softmax(shift_logits_cpu, dim=-1)
-            log_probs_all = log_probs_all.to(original_device)
-            del shift_logits_cpu
+            # log_softmax(x) = x - logsumexp(x)
+            logsumexp = torch.logsumexp(shift_logits, dim=-1, keepdim=True)
+            log_probs_all = shift_logits - logsumexp
         else:
             log_probs_all = F.log_softmax(shift_logits, dim=-1)
 

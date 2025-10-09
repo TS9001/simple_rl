@@ -18,11 +18,11 @@ import torch
 from tqdm import tqdm
 from datasets import load_dataset
 
-from simple_rl.rewards.simple_reward import (
+from simple_rl.rewards import (
     extract_answer_from_model_output,
     extract_single_number,
-    correctness_reward,
-    format_reward,
+    compute_format_reward,
+    compute_correctness_reward,
 )
 
 
@@ -150,10 +150,14 @@ def evaluate_on_gsm8k(
     test_prompts: List[str],
     test_answers: List[str],
     num_samples: int,
-    max_new_tokens: int = 128,
+    max_new_tokens: int = 300,  # Increased from 128 for math reasoning
     temperature: float = 1.0,
     top_p: float = 1.0,
-    model_name: str = "Model"
+    model_name: str = "Model",
+    sample: bool = True,
+    save_results: bool = False,
+    results_file: str = "eval_results.json",
+    step: int = 0,
 ) -> Dict[str, Any]:
     """
     Evaluate a model on GSM8K test set.
@@ -172,6 +176,10 @@ def evaluate_on_gsm8k(
         temperature: Sampling temperature
         top_p: Nucleus sampling parameter
         model_name: Name for display purposes
+        sample: Whether to sample or use greedy decoding
+        save_results: If True, save detailed results to JSON file
+        results_file: Base path for results file (will be modified with step/date)
+        step: Step/episode number for tracking training progress
 
     Returns:
         Dictionary with evaluation metrics:
@@ -181,6 +189,7 @@ def evaluate_on_gsm8k(
         - avg_format_score: Average format reward score
         - avg_correctness_score: Average correctness score
         - num_evaluated: Number of examples evaluated
+        - num_correct: Total number of correct answers
         - results: List of individual results
     """
     # Extract tokenizer from model/algo object
@@ -209,7 +218,7 @@ def evaluate_on_gsm8k(
                     attention_mask=inputs.get("attention_mask", None),
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
-                    do_sample=True,
+                    do_sample=sample,
                     top_p=top_p,
                 )
 
@@ -284,10 +293,29 @@ def evaluate_on_gsm8k(
     print(f"\nEvaluating {model_name} on {len(eval_prompts)} GSM8K problems...")
     print("=" * 60)
 
-    for prompt, correct_answer in tqdm(zip(eval_prompts, eval_answers), total=len(eval_prompts), desc="Evaluating"):
-        # Generate completion
-        completion = generate_fn(prompt)
+    # Check if we can use batched generation (much faster!)
+    if hasattr(model_or_algo, 'generate') and hasattr(model_or_algo, 'model'):
+        # SFT instance - use batched generation for speed
+        print("Using batched generation for speed...")
+        completions = model_or_algo.generate(
+            prompts=eval_prompts,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            batch_size=8  # Process 8 prompts at a time
+        )
+    else:
+        # GRPO or raw model - generate one by one (slower)
+        print("Generating responses one by one...")
+        completions = []
+        for prompt in tqdm(eval_prompts, desc="Generating"):
+            completion = generate_fn(prompt)
+            completions.append(completion)
 
+    # Now evaluate all completions
+    print("Evaluating responses...")
+    for prompt, correct_answer, completion in tqdm(zip(eval_prompts, eval_answers, completions),
+                                                     total=len(eval_prompts), desc="Evaluating"):
         # Extract model's answer
         model_answer = extract_answer_from_model_output(completion)
 
@@ -302,24 +330,23 @@ def evaluate_on_gsm8k(
                 is_exact = True
                 is_numeric = True
             else:
-                # Numeric equivalence
+                # Numeric equivalence (exact equality, matching original notebook)
                 model_num = extract_single_number(model_answer)
                 correct_num = extract_single_number(correct_answer)
-                if model_num is not None and correct_num is not None:
-                    if abs(model_num - correct_num) < 0.01:
-                        correct_numeric += 1
-                        is_numeric = True
+                if model_num is not None and correct_num is not None and model_num == correct_num:
+                    correct_numeric += 1
+                    is_numeric = True
 
         # Check format compliance
-        fmt_score = format_reward(completion)
+        fmt_score = compute_format_reward(completion)
         total_format_score += fmt_score
 
         # Full format compliance (all 4 tags present)
         if all(tag in completion for tag in ["<reasoning>", "</reasoning>", "<answer>", "</answer>"]):
             format_compliant += 1
 
-        # Calculate correctness reward
-        correct_score = correctness_reward(completion, correct_answer)
+        # Calculate correctness reward (no partial credit for evaluation)
+        correct_score = compute_correctness_reward(completion, correct_answer, partial_credit=False)
         total_correctness_score += correct_score
 
         # Store result
@@ -335,6 +362,8 @@ def evaluate_on_gsm8k(
 
     # Calculate metrics
     n = len(eval_prompts)
+    total_correct = correct_exact + correct_numeric
+
     metrics = {
         'exact_accuracy': correct_exact / n * 100,
         'numeric_accuracy': correct_numeric / n * 100,
@@ -342,16 +371,74 @@ def evaluate_on_gsm8k(
         'avg_format_score': total_format_score / n,
         'avg_correctness_score': total_correctness_score / n,
         'num_evaluated': n,
+        'num_correct': total_correct,
         'results': results
     }
 
     # Print summary
     print(f"\n{model_name} Evaluation Results:")
+    print(f"  Total Correct: {total_correct}/{n} ({total_correct/n*100:.1f}%)")
     print(f"  Exact Match Accuracy: {metrics['exact_accuracy']:.1f}%")
     print(f"  Numeric Accuracy: {metrics['numeric_accuracy']:.1f}%")
     print(f"  Format Compliance: {metrics['format_compliance']:.1f}%")
     print(f"  Avg Format Score: {metrics['avg_format_score']:.3f}")
     print(f"  Avg Correctness Score: {metrics['avg_correctness_score']:.3f}")
+
+    # Save results to file if requested
+    if save_results:
+        import json
+        from pathlib import Path
+        from datetime import datetime
+
+        # Create filename with model type, step, and timestamp
+        # Extract model type from results_file (e.g., "results/sft_eval.json" -> "SFT")
+        base_path = Path(results_file)
+        if 'sft' in str(results_file).lower():
+            model_type = 'SFT'
+        elif 'grpo' in str(results_file).lower():
+            model_type = 'GRPO'
+        else:
+            model_type = 'MODEL'
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{model_type}_step_{step}_{timestamp}.json"
+        results_path = base_path.parent / filename
+
+        output_data = {
+            'model_name': model_name,
+            'step': step,
+            'timestamp': timestamp,
+            'metrics': {
+                'total_correct': total_correct,
+                'num_evaluated': n,
+                'accuracy': total_correct / n * 100,
+                'exact_accuracy': metrics['exact_accuracy'],
+                'numeric_accuracy': metrics['numeric_accuracy'],
+                'format_compliance': metrics['format_compliance'],
+                'avg_format_score': metrics['avg_format_score'],
+                'avg_correctness_score': metrics['avg_correctness_score'],
+            },
+            'detailed_results': [
+                {
+                    'prompt': r['prompt'],
+                    'model_answer': r['model_answer'],
+                    'correct_answer': r['correct_answer'],
+                    'is_correct': r['is_exact'] or r['is_numeric'],
+                    'is_exact': r['is_exact'],
+                    'is_numeric': r['is_numeric'],
+                    'format_score': r['format_score'],
+                    'correctness_score': r['correctness_score'],
+                }
+                for r in results
+            ]
+        }
+
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(results_path, 'w') as f:
+            json.dump(output_data, f, indent=2)
+
+        print(f"\n✓ Detailed results saved to: {results_path}")
 
     return metrics
 
@@ -361,7 +448,7 @@ def demonstrate_model_responses(
     test_prompts: List[str],
     test_answers: List[str],
     num_examples: int,
-    max_new_tokens: int = 128,
+    max_new_tokens: int = 300,  # Increased from 128 for math reasoning
     temperature: float = 1.0,
     top_p: float = 1.0,
     title: str = "MODEL RESPONSE EXAMPLES"
@@ -482,7 +569,8 @@ def demonstrate_model_responses(
         # Generate completion
         completion = generate_fn(prompt)
 
-        print(f"Model Response:\n{completion[:400]}...")
+        # Show more of the response (800 chars) to see if <answer> tags exist
+        print(f"Model Response:\n{completion[:800]}{'...' if len(completion) > 800 else ''}")
 
         # Extract and check answer
         model_answer = extract_answer_from_model_output(completion)

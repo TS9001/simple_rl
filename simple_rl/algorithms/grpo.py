@@ -46,9 +46,20 @@ class GRPO(BaseAlgorithm):
         self,
         config: Optional[Dict[str, Any]] = None,
         batch_reward_fn: Optional[Callable] = None,
+        model: Optional[Any] = None,
+        tokenizer: Optional[Any] = None,
         use_wandb: bool = False,
     ):
-        """Initialize GRPO algorithm."""
+        """
+        Initialize GRPO algorithm.
+
+        Args:
+            config: Configuration dictionary
+            batch_reward_fn: Batch reward function
+            model: Optional pre-loaded HuggingFace model
+            tokenizer: Optional pre-loaded HuggingFace tokenizer
+            use_wandb: Whether to use Weights & Biases logging
+        """
         self.config = config or {}
         self.use_wandb = use_wandb
 
@@ -60,12 +71,15 @@ class GRPO(BaseAlgorithm):
         if not config:
             raise ValueError("Config must be provided")
 
-        self.policy = LanguageModel(config)
+        self.policy = LanguageModel(config, model=model, tokenizer=tokenizer)
         self.policy = self.policy.to(self.device)
 
         # Print model information
         model_config = config.get("model", {})
-        model_name = model_config.get("hf_model_name") or model_config.get("model_name", "unknown")
+        if model is not None:
+            model_name = "pre-loaded model"
+        else:
+            model_name = model_config.get("hf_model_name") or model_config.get("model_name", "unknown")
         total_params = sum(p.numel() for p in self.policy.parameters())
         trainable_params = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
         print(f"✓ GRPO initialized with model: {model_name}")
@@ -98,7 +112,12 @@ class GRPO(BaseAlgorithm):
         self.group_size = self.training_config.group_size
         self.kl_coef = self.training_config.kl_coef
         self.normalize_rewards = self.training_config.normalize_rewards
+
+        # Clipping parameters - support both symmetric and asymmetric clipping
         self.clip_epsilon = self.training_config.clip_epsilon
+        self.clip_epsilon_low = self.training_config.clip_epsilon_low
+        self.clip_epsilon_high = self.training_config.clip_epsilon_high
+
         self.store_completions = self.training_config.store_completions
         self.update_epochs = self.training_config.update_epochs
 
@@ -128,6 +147,10 @@ class GRPO(BaseAlgorithm):
 
         # AMP setup
         self._amp_config = create_amp_config(self.config)
+        try:
+            print(f"AMP: enabled={self._amp_config.enabled}, device={self._amp_config.device}")
+        except Exception:
+            pass
 
         # Optimizer
         self.optimizer = configure_optimizer(self.policy, self.config)
@@ -152,6 +175,8 @@ class GRPO(BaseAlgorithm):
 
         # Timing
         self.timing_manager = TimingManager()
+        timing_config = self.config.get("timing", {})
+        self.print_timing = timing_config.get("enabled", False)  # Disabled by default
 
         # Storage for trajectory data (needed for multiple epochs)
         self.stored_generated_ids = None
@@ -255,8 +280,27 @@ class GRPO(BaseAlgorithm):
             # Stop at either EOS or </answer> tag
             eos_token_id = [eos_token_id, self.answer_end_token_id]
 
+        debug_generation = self.config.get("debug", {}).get("generation", False)
+        if debug_generation:
+            print(f"\n🔍 GENERATION DEBUG:")
+            print(f"  AMP enabled: {self._amp_config.enabled}")
+            print(f"  AMP device: {self._amp_config.device}")
+            print(f"  Temperature: {self.temperature}")
+            print(f"  Max new tokens: {self.max_new_tokens}")
+            print(f"  EOS token ID: {eos_token_id}")
+            print(f"  Device: {self.device}")
+
         with torch.no_grad():
-            generated_ids, generated_mask = self.policy.generate(
+            with self._amp_config.autocast():
+                if debug_generation:
+                    if hasattr(self.policy.model, 'dtype'):
+                        print(f"  Model dtype: {self.policy.model.dtype}")
+
+                    test_tensor = torch.randn(1, 1, device=self.device)
+                    test_result = test_tensor @ test_tensor.T
+                    print(f"  Computation dtype (matmul): {test_result.dtype}")
+
+                generated_ids, generated_mask = self.policy.generate(
                 replicated_prompt_ids,
                 attention_mask=replicated_prompt_mask,
                 max_new_tokens=self.max_new_tokens,
@@ -266,7 +310,14 @@ class GRPO(BaseAlgorithm):
                 num_return_sequences=1,
                 min_new_tokens=1,
                 eos_token_id=eos_token_id,
-            )
+                )
+
+        if debug_generation:
+            total_tokens_generated = generated_mask.sum().item()
+            avg_tokens_per_seq = total_tokens_generated / total_sequences
+            print(f"  Total tokens generated: {total_tokens_generated}")
+            print(f"  Avg tokens/sequence: {avg_tokens_per_seq:.1f}")
+
         self.policy.train(prev_mode)
         self.timing_manager.end_timer("batch_text_generation")
 
@@ -297,6 +348,16 @@ class GRPO(BaseAlgorithm):
             )
             for comp_ids in all_completion_ids
         ])
+
+        if debug_generation:
+            completion_lengths = [comp_ids.size(0) for comp_ids in all_completion_ids]
+            completion_lengths_tensor = torch.tensor(completion_lengths, dtype=torch.float32)
+            print(f"  Completion lengths - min: {min(completion_lengths)}, max: {max(completion_lengths)}, "
+                  f"mean: {completion_lengths_tensor.mean().item():.1f}, std: {completion_lengths_tensor.std().item():.1f}")
+
+            eos_ids = [eos_token_id] if isinstance(eos_token_id, int) else eos_token_id
+            num_with_eos = sum(1 for comp_ids in all_completion_ids if any(tok.item() in eos_ids for tok in comp_ids))
+            print(f"  Sequences with EOS: {num_with_eos}/{len(all_completion_ids)}")
 
         completion_texts = self.policy.decode(completion_ids)
         self.timing_manager.end_timer("completion_extraction")
@@ -347,6 +408,8 @@ class GRPO(BaseAlgorithm):
         all_prompts = [] if store else None
         all_completions = [] if store else None
         all_rewards = []
+        all_format_rewards = []
+        all_correctness_rewards = []
         all_log_probs = []
         all_ref_log_probs = []
         all_completion_mask = []
@@ -376,17 +439,6 @@ class GRPO(BaseAlgorithm):
             replicated_prompt_end_positions = generation["prompt_end_positions"]
             total_sequences = generation["total_sequences"]
 
-            # Debug logging: generation batch
-            self.debug_logger.log_generation_batch(
-                batch_idx=batch_idx,
-                prompts=batch_prompts,
-                generated_ids=generated_ids,
-                generated_mask=generated_mask,
-                completion_ids=completion_ids,
-                completion_texts=completion_texts,
-                prompt_end_positions=replicated_prompt_end_positions,
-            )
-
             # Store for later recomputation
             all_generated_ids.append(generated_ids.detach())
             all_generated_mask.append(generated_mask.detach())
@@ -403,11 +455,12 @@ class GRPO(BaseAlgorithm):
             with torch.no_grad():  # No gradients needed during trajectory generation
                 # Keep KV cache enabled for faster inference
                 # Only compute log probs for completion tokens (model still sees full context)
-                policy_log_probs = self.policy.compute_log_probs(
-                    generated_ids,
-                    attention_mask=generated_mask,
-                    logits_to_keep=max_completion_len,
-                )
+                with self._amp_config.autocast():
+                    policy_log_probs = self.policy.compute_log_probs(
+                        generated_ids,
+                        attention_mask=generated_mask,
+                        logits_to_keep=max_completion_len,
+                    )
             if prev_mode:
                 self.policy.train()
             self.timing_manager.end_timer(f"batch_{batch_idx}_policy_log_probs")
@@ -418,11 +471,12 @@ class GRPO(BaseAlgorithm):
             with torch.no_grad():
                 # Keep KV cache enabled for faster inference
                 # Only compute log probs for completion tokens (model still sees full context)
-                ref_log_probs = self.ref_policy.compute_log_probs(
-                    generated_ids,
-                    attention_mask=generated_mask,
-                    logits_to_keep=max_completion_len,
-                )
+                with self._amp_config.autocast():
+                    ref_log_probs = self.ref_policy.compute_log_probs(
+                        generated_ids,
+                        attention_mask=generated_mask,
+                        logits_to_keep=max_completion_len,
+                    )
             self.timing_manager.end_timer(f"batch_{batch_idx}_ref_log_probs")
 
             # Extract completion log probs for this batch
@@ -450,17 +504,6 @@ class GRPO(BaseAlgorithm):
                 all_ref_log_probs.append(seq_ref_log_probs)
                 all_completion_mask.append(seq_completion_mask)
 
-            # Debug logging: log probs computation
-            self.debug_logger.log_logprobs_computation(
-                batch_idx=batch_idx,
-                policy_log_probs=policy_log_probs,
-                ref_log_probs=ref_log_probs,
-                completion_mask=completion_mask,
-                seq_idx=0,
-                batch_completion_ids=batch_completion_ids,
-                max_completion_len=max_completion_len,
-            )
-
             self.timing_manager.end_timer(f"batch_{batch_idx}_extract_completions")
 
             # Compute rewards for this batch
@@ -470,10 +513,13 @@ class GRPO(BaseAlgorithm):
                 end_idx = start_idx + self.group_size
                 group_completions = completion_texts[start_idx:end_idx]
 
-                group_rewards = self.batch_reward_fn(
-                    group_completions, [answer] * self.group_size, self.device
+                # Get rewards with breakdown (total, format, correctness) in one call
+                group_rewards, group_format_rewards, group_correctness_rewards = self.batch_reward_fn(
+                    group_completions, [answer] * self.group_size, self.device, return_breakdown=True
                 )
                 all_rewards.append(group_rewards)
+                all_format_rewards.append(group_format_rewards)
+                all_correctness_rewards.append(group_correctness_rewards)
 
                 if store:
                     all_prompts.extend([prompt] * self.group_size)
@@ -521,17 +567,6 @@ class GRPO(BaseAlgorithm):
         self.stored_attention_mask = torch.cat(padded_generated_mask, dim=0)
         self.stored_prompt_end_positions = torch.cat(adjusted_prompt_end_positions, dim=0)
 
-        # Debug logging: batch concatenation
-        self.debug_logger.log_batch_concatenation(
-            num_batches=len(all_generated_ids),
-            batch_lengths=batch_lengths,
-            max_seq_len=max_seq_len,
-            stored_generated_ids=self.stored_generated_ids,
-            stored_attention_mask=self.stored_attention_mask,
-            stored_prompt_end_positions=self.stored_prompt_end_positions,
-            padding_adjustments=padding_adjustments,
-        )
-
         # Validate that prompt_end_positions are within bounds after padding adjustment
         assert (self.stored_prompt_end_positions <= self.stored_generated_ids.size(1)).all(), \
             f"Invalid prompt_end_positions after padding: max={self.stored_prompt_end_positions.max()}, seq_len={self.stored_generated_ids.size(1)}"
@@ -543,6 +578,13 @@ class GRPO(BaseAlgorithm):
         all_ref_log_probs = pad_sequence(all_ref_log_probs, batch_first=True, padding_value=0.0)
         all_completion_mask = pad_sequence(all_completion_mask, batch_first=True, padding_value=0.0)
         all_rewards = torch.cat(all_rewards, dim=0)
+        all_format_rewards = torch.cat(all_format_rewards, dim=0)
+        all_correctness_rewards = torch.cat(all_correctness_rewards, dim=0)
+
+        # Store format and correctness rewards for metrics tracking
+        self.stored_format_rewards = all_format_rewards
+        self.stored_correctness_rewards = all_correctness_rewards
+
         self.timing_manager.end_timer("tensor_stacking")
 
         if store:
@@ -627,22 +669,18 @@ class GRPO(BaseAlgorithm):
         self.timing_manager.start_timer("loss_computation")
 
         # Sum log probs over sequence (per-sequence log prob)
-        new_log_probs_sum = (new_log_probs * completion_mask).sum(dim=-1) / (
-            completion_mask.sum(dim=-1) + 1e-8
-        )
-        old_log_probs_sum = (old_log_probs * completion_mask).sum(dim=-1) / (
-            completion_mask.sum(dim=-1) + 1e-8
-        )
+        new_log_probs_sum = (new_log_probs * completion_mask).sum(dim=-1)
+        old_log_probs_sum = (old_log_probs * completion_mask).sum(dim=-1)
 
         # Compute ratio: π_new / π_old
         ratio = torch.exp(new_log_probs_sum - old_log_probs_sum)
 
-        # PPO clipped surrogate objective
+        # PPO clipped surrogate objective (with asymmetric clipping support)
         surr1 = ratio * advantages.detach()
         surr2 = torch.clamp(
             ratio,
-            1.0 - self.clip_epsilon,
-            1.0 + self.clip_epsilon
+            1.0 - self.clip_epsilon_low,   # Lower bound (e.g., 0.8 if clip_epsilon_low=0.2)
+            1.0 + self.clip_epsilon_high   # Upper bound (e.g., 1.4 if clip_epsilon_high=0.4)
         ) * advantages.detach()
         policy_loss = -torch.min(surr1, surr2).mean()
 
@@ -661,18 +699,6 @@ class GRPO(BaseAlgorithm):
             estimator=self.kl_estimator,
             clamp_min=self.kl_clamp_min,
             clamp_max=self.kl_clamp_max,
-        )
-
-        # Debug logging: KL computation (with full tensors if KL is high)
-        kl_value = kl_penalty.item() if isinstance(kl_penalty, torch.Tensor) else kl_penalty
-        self.debug_logger.log_kl_computation(
-            kl_penalty=kl_value,
-            estimator=self.kl_estimator,
-            clamp_min=self.kl_clamp_min,
-            clamp_max=self.kl_clamp_max,
-            ref_log_probs=ref_log_probs if kl_value > 5.0 else None,
-            new_log_probs=new_log_probs if kl_value > 5.0 else None,
-            completion_mask=completion_mask if kl_value > 5.0 else None,
         )
 
         # Total GRPO loss
@@ -716,14 +742,6 @@ class GRPO(BaseAlgorithm):
         prompts = batch["prompts"]
         answers = batch["answers"]
 
-        # Debug logging: episode start
-        self.debug_logger.log_episode_start(self.episode)
-        self.debug_logger.log_training_step_start(
-            episode=self.episode,
-            num_prompts=len(prompts),
-            num_sequences=len(prompts) * self.group_size,
-        )
-
         self.timing_manager.start_timer("trajectory_generation")
         (
             _,
@@ -742,13 +760,6 @@ class GRPO(BaseAlgorithm):
             rewards,
             group_size=self.group_size,
             normalize_within_groups=self.normalize_rewards
-        )
-
-        # Debug logging: advantages
-        self.debug_logger.log_advantages_computation(
-            rewards=rewards,
-            advantages=advantages,
-            group_size=self.group_size,
         )
 
         self.timing_manager.end_timer("advantage_computation")
@@ -801,11 +812,12 @@ class GRPO(BaseAlgorithm):
             try:
                 # Gradients are enabled by default (not in no_grad context)
                 # Use logits_to_keep to get LAST mb_max_completion_len tokens
-                mb_full_log_probs = self.policy.compute_log_probs(
-                    mb_generated_ids,
-                    attention_mask=mb_attention_mask,
-                    logits_to_keep=mb_max_completion_len,
-                )
+                with self._amp_config.autocast():
+                    mb_full_log_probs = self.policy.compute_log_probs(
+                        mb_generated_ids,
+                        attention_mask=mb_attention_mask,
+                        logits_to_keep=mb_max_completion_len,
+                    )
             finally:
                 if prev_cache is not None:
                     self.policy.model.config.use_cache = prev_cache
@@ -850,21 +862,6 @@ class GRPO(BaseAlgorithm):
             mb_new_log_probs = torch.stack(mb_new_log_probs_list)
             mb_new_log_probs = mb_new_log_probs * mb_completion_mask
 
-            # Debug logging: minibatch update (only first minibatch to avoid spam)
-            if mb_idx == 1:
-                self.debug_logger.log_minibatch_update(
-                    mb_idx=mb_idx,
-                    mb_start=mb_start,
-                    mb_end=mb_end,
-                    mb_generated_ids=mb_generated_ids,
-                    mb_attention_mask=mb_attention_mask,
-                    mb_old_log_probs=mb_old_log_probs,
-                    mb_ref_log_probs=mb_ref_log_probs,
-                    mb_new_log_probs=mb_new_log_probs,
-                    mb_completion_mask=mb_completion_mask,
-                    mb_advantages=mb_advantages,
-                )
-
             self.timing_manager.end_timer(f"minibatch_{mb_idx}_recompute")
 
             # Zero gradients
@@ -872,8 +869,7 @@ class GRPO(BaseAlgorithm):
 
             # Compute loss
             self.timing_manager.start_timer(f"minibatch_{mb_idx}_loss")
-            autocast_ctx = self._amp_config.autocast
-            with autocast_ctx:
+            with self._amp_config.autocast():
                 loss, mb_metrics = self.compute_loss(
                     mb_new_log_probs,
                     mb_old_log_probs,
@@ -937,15 +933,14 @@ class GRPO(BaseAlgorithm):
             "kl_divergence": epoch_metrics["kl_divergence"],
             "reward_mean": rewards.mean().item(),
             "reward_std": rewards.std().item(),
+            "format_reward_mean": self.stored_format_rewards.mean().item(),
+            "correctness_reward_mean": self.stored_correctness_rewards.mean().item(),
             "ratio_mean": epoch_metrics["ratio_mean"],
             "ratio_min": epoch_metrics["ratio_min"],
             "ratio_max": epoch_metrics["ratio_max"],
             "ratio_clipped_frac": epoch_metrics["ratio_clipped_frac"],
             "tokens_generated": completion_mask.sum().item(),
         }
-
-        # Debug logging: episode summary
-        self.debug_logger.log_episode_summary(self.episode, metrics)
 
         # Update statistics
         self.total_steps += 1
@@ -1003,7 +998,12 @@ class GRPO(BaseAlgorithm):
         train_answers = train_data["answers"]
 
         print(f"Starting proper GRPO training for {num_episodes} episodes...")
-        print(f"  - Using PPO clipped objective (clip_epsilon={self.clip_epsilon})")
+        # Show asymmetric clipping if different, otherwise show symmetric
+        if self.clip_epsilon_low == self.clip_epsilon_high:
+            print(f"  - Using PPO clipped objective (clip_epsilon={self.clip_epsilon})")
+        else:
+            print(f"  - Using PPO clipped objective (asymmetric: low={self.clip_epsilon_low}, high={self.clip_epsilon_high})")
+            print(f"    Ratio clipped to [{1-self.clip_epsilon_low:.2f}, {1+self.clip_epsilon_high:.2f}]")
         print(f"  - Training samples: {len(train_prompts)}")
         print(f"  - Batch size: {batch_size}")
         print(f"  - Update epochs: {update_epochs}")
@@ -1024,6 +1024,8 @@ class GRPO(BaseAlgorithm):
             "kl_divergence": [],
             "reward_mean": [],
             "reward_std": [],
+            "format_reward_mean": [],
+            "correctness_reward_mean": [],
             "tokens_generated": [],
             "episode_time": [],
             "total_tokens": [],
@@ -1058,6 +1060,8 @@ class GRPO(BaseAlgorithm):
             sum_kl = 0.0
             sum_reward_mean = 0.0
             sum_reward_std = 0.0
+            sum_format_reward_mean = 0.0
+            sum_correctness_reward_mean = 0.0
             sum_tokens_generated = 0
             episode_tokens = 0
 
@@ -1082,6 +1086,8 @@ class GRPO(BaseAlgorithm):
                 sum_kl += metrics["kl_divergence"]
                 sum_reward_mean += metrics["reward_mean"]
                 sum_reward_std += metrics.get("reward_std", 0.0)
+                sum_format_reward_mean += metrics.get("format_reward_mean", 0.0)
+                sum_correctness_reward_mean += metrics.get("correctness_reward_mean", 0.0)
 
                 # Track tokens
                 tokens_in_batch = metrics.get("tokens_generated", 0)
@@ -1102,6 +1108,8 @@ class GRPO(BaseAlgorithm):
                 "kl_divergence": sum_kl / update_epochs,
                 "reward_mean": sum_reward_mean / update_epochs,
                 "reward_std": sum_reward_std / update_epochs,
+                "format_reward_mean": sum_format_reward_mean / update_epochs,
+                "correctness_reward_mean": sum_correctness_reward_mean / update_epochs,
                 "tokens_generated": sum_tokens_generated / update_epochs,
             }
 
@@ -1112,6 +1120,8 @@ class GRPO(BaseAlgorithm):
             training_metrics["kl_divergence"].append(avg_metrics["kl_divergence"])
             training_metrics["reward_mean"].append(avg_metrics["reward_mean"])
             training_metrics["reward_std"].append(avg_metrics.get("reward_std", 0.0))
+            training_metrics["format_reward_mean"].append(avg_metrics["format_reward_mean"])
+            training_metrics["correctness_reward_mean"].append(avg_metrics["correctness_reward_mean"])
             training_metrics["tokens_generated"].append(avg_metrics.get("tokens_generated", 0))
             training_metrics["episode_time"].append(episode_time)
             training_metrics["total_tokens"].append(cumulative_tokens)
@@ -1124,6 +1134,8 @@ class GRPO(BaseAlgorithm):
                       f"PG Loss: {avg_metrics['pg_loss']:7.4f} | "
                       f"KL: {avg_metrics['kl_divergence']:7.4f} | "
                       f"Reward: {avg_metrics['reward_mean']:6.3f} ± {avg_metrics.get('reward_std', 0.0):5.3f} | "
+                      f"Fmt: {avg_metrics['format_reward_mean']:5.3f} | "
+                      f"Correct: {avg_metrics['correctness_reward_mean']:5.3f} | "
                       f"Tokens: {int(episode_tokens):5d} | "
                       f"Time: {episode_time:5.2f}s | "
                       f"Speed: {tokens_per_sec:6.1f} tok/s")
@@ -1140,14 +1152,16 @@ class GRPO(BaseAlgorithm):
                 # Run evaluation on validation set
                 val_metrics = evaluate_on_gsm8k(
                     self,
-                    self.policy.tokenizer,
                     val_data["prompts"],
                     val_data["answers"],
                     validation_num_samples,
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
-                    model_name=f"Episode {episode + 1}"
+                    model_name=f"Episode {episode + 1}",
+                    save_results=True,
+                    results_file="results/grpo_eval_results.json",
+                    step=episode + 1
                 )
 
                 # Store validation metrics
@@ -1161,7 +1175,6 @@ class GRPO(BaseAlgorithm):
                 # Demonstrate model responses
                 demonstrate_model_responses(
                     self,
-                    self.policy.tokenizer,
                     val_data["prompts"][:validation_num_demo_examples],
                     val_data["answers"][:validation_num_demo_examples],
                     validation_num_demo_examples,
@@ -1180,7 +1193,7 @@ class GRPO(BaseAlgorithm):
                 print(f"  → Saved checkpoint to {checkpoint_path}")
 
             # Print timing summary periodically
-            if episode > 0 and episode % 10 == 0:
+            if self.print_timing and episode > 0 and episode % 10 == 0:
                 self.timing_manager.print_timing_summary(f"Episode {episode} Summary")
 
         # Calculate total training time
@@ -1191,7 +1204,13 @@ class GRPO(BaseAlgorithm):
         print(f"Total tokens processed: {cumulative_tokens:,}")
         print(f"Average speed: {cumulative_tokens/total_training_time:.1f} tokens/second")
 
-        self.timing_manager.print_timing_summary("FINAL TRAINING PERFORMANCE")
+        # Save final model
+        final_checkpoint_path = checkpoint_dir / "checkpoint_final.pt"
+        self.save_checkpoint(str(final_checkpoint_path))
+        print(f"\n✓ Final model saved to: {final_checkpoint_path}")
+
+        if self.print_timing:
+            self.timing_manager.print_timing_summary("FINAL TRAINING PERFORMANCE")
 
         return {
             "training_metrics": training_metrics,
