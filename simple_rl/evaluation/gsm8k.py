@@ -150,7 +150,7 @@ def evaluate_on_gsm8k(
     test_prompts: List[str],
     test_answers: List[str],
     num_samples: int,
-    max_new_tokens: int = 300,  # Increased from 128 for math reasoning
+    max_new_tokens: int = 400,  # Increased to 400 to handle longer CoT completions (avg 288 tokens)
     temperature: float = 1.0,
     top_p: float = 1.0,
     model_name: str = "Model",
@@ -351,7 +351,8 @@ def evaluate_on_gsm8k(
 
         # Store result
         results.append({
-            'prompt': prompt[:50] + "...",
+            'prompt': prompt,
+            'completion': completion,
             'model_answer': model_answer,
             'correct_answer': correct_answer,
             'is_exact': is_exact,
@@ -421,6 +422,7 @@ def evaluate_on_gsm8k(
             'detailed_results': [
                 {
                     'prompt': r['prompt'],
+                    'completion': r['completion'],
                     'model_answer': r['model_answer'],
                     'correct_answer': r['correct_answer'],
                     'is_correct': r['is_exact'] or r['is_numeric'],
@@ -448,7 +450,7 @@ def demonstrate_model_responses(
     test_prompts: List[str],
     test_answers: List[str],
     num_examples: int,
-    max_new_tokens: int = 300,  # Increased from 128 for math reasoning
+    max_new_tokens: int = 400,  # Increased to 400 to handle longer CoT completions (avg 288 tokens)
     temperature: float = 1.0,
     top_p: float = 1.0,
     title: str = "MODEL RESPONSE EXAMPLES"

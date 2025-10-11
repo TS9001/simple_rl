@@ -1,7 +1,7 @@
 """HuggingFace model wrappers and utilities."""
 
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -9,11 +9,16 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from simple_rl.utils.device import get_target_device, apply_device_optimizations, clear_device_cache
-from simple_rl.utils.compilation import ModelCompilationManager
+# from simple_rl.utils.compilation import ModelCompilationManager  # COMMENTED OUT - compilation disabled
 from simple_rl.utils.model_loading import load_huggingface_model_and_tokenizer, setup_tokenizer_and_model_config
 
 
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# Enable parallel tokenization on MPS (safe and faster), disable elsewhere
+_use_parallel_tokenizers = (
+    hasattr(torch.backends, "mps") and 
+    torch.backends.mps.is_available()
+)
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "true" if _use_parallel_tokenizers else "false")
 
 
 class LanguageModel(nn.Module):
@@ -70,19 +75,19 @@ class LanguageModel(nn.Module):
         self.hidden_size = self.model.config.hidden_size
 
         # Track compile state / optimizations
-        self._compilation_manager = ModelCompilationManager(config)
+        # self._compilation_manager = ModelCompilationManager(config)  # COMMENTED OUT - compilation disabled
         self._using_bettertransformer: bool = False
 
         # Resolve initial device placement and apply optimizations
         super().to(target_device)
-        self._ensure_compiled()
+        # self._ensure_compiled()  # COMMENTED OUT - compilation disabled
         apply_device_optimizations()
 
     def to(self, *args, **kwargs):
         """Override to() to re-run backend-specific setup after device moves."""
 
         module = super().to(*args, **kwargs)
-        self._ensure_compiled()
+        # self._ensure_compiled()  # COMMENTED OUT - compilation disabled
         apply_device_optimizations()
         return module
 
@@ -113,17 +118,18 @@ class LanguageModel(nn.Module):
         )
         return outputs.logits
 
-    def _ensure_compiled(self) -> None:
-        """Compile the underlying model based on available backends."""
-        # Use the compilation manager
-        self.model = self._compilation_manager.ensure_compiled(self.model, self.device)
+    # COMMENTED OUT - compilation disabled
+    # def _ensure_compiled(self) -> None:
+    #     """Compile the underlying model based on available backends."""
+    #     # Use the compilation manager
+    #     self.model = self._compilation_manager.ensure_compiled(self.model, self.device)
 
 
     def generate(
         self,
         prompt_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        max_new_tokens: int = 128,
+        max_new_tokens: int = 400,  # Increased to 400 for longer CoT completions (avg 288 tokens)
         temperature: float = 1.0,
         do_sample: bool = True,
         top_k: Optional[int] = None,
@@ -145,7 +151,7 @@ class LanguageModel(nn.Module):
         Returns:
             Tuple of (generated_ids, attention_mask)
         """
-        self._ensure_compiled()
+        # self._ensure_compiled()  # COMMENTED OUT - compilation disabled
 
         # Use default eos_token_id unless overridden in kwargs
         if 'eos_token_id' not in kwargs:
@@ -205,7 +211,6 @@ class LanguageModel(nn.Module):
         # If logits_to_keep specified, only keep last N positions
         # (saves memory in log_softmax and gather operations)
         if logits_to_keep is not None:
-            # Ensure we don't try to keep more tokens than exist
             actual_seq_len = shift_logits.size(1)
             logits_to_keep = min(logits_to_keep, actual_seq_len)
 
@@ -216,11 +221,14 @@ class LanguageModel(nn.Module):
                 shift_labels = shift_labels[:, start_idx:]
 
         # Compute log probabilities
-        # MPS workaround: use on-device logsumexp-based log_softmax to avoid CPU fallback
+        # MPS workaround: For large vocab sizes, move to CPU for log_softmax if on MPS
         if shift_logits.device.type == 'mps' and shift_logits.size(-1) > 100000:
-            # log_softmax(x) = x - logsumexp(x)
-            logsumexp = torch.logsumexp(shift_logits, dim=-1, keepdim=True)
-            log_probs_all = shift_logits - logsumexp
+            # Move to CPU for log_softmax computation (MPS has issues with large vocab)
+            original_device = shift_logits.device
+            shift_logits_cpu = shift_logits.to('cpu')
+            log_probs_all = F.log_softmax(shift_logits_cpu, dim=-1)
+            log_probs_all = log_probs_all.to(original_device)
+            del shift_logits_cpu
         else:
             log_probs_all = F.log_softmax(shift_logits, dim=-1)
 

@@ -831,7 +831,7 @@ class SFT(BaseAlgorithm):
     def generate(
         self,
         prompts: List[str],
-        max_new_tokens: int = 300,  # Increased from 128 for math reasoning
+        max_new_tokens: int = 400,  # Increased to 400 for longer CoT completions (avg 288 tokens)
         temperature: float = 1.0,
         top_p: float = 1.0,
         do_sample: bool = True,

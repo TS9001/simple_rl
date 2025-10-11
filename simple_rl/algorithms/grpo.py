@@ -11,18 +11,18 @@ Key features:
 - Proper minibatch updates with log prob recomputation
 """
 
+import contextlib
 import copy
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
 from simple_rl.algorithms.base import BaseAlgorithm
 from simple_rl.utils.huggingface_wrappers import LanguageModel
 from simple_rl.utils.device import get_target_device, clear_device_cache
-from simple_rl.utils.amp import create_amp_config
+# from simple_rl.utils.amp import create_amp_config  # COMMENTED OUT - mixed precision disabled
 from simple_rl.utils.optimization import configure_optimizer
 from simple_rl.utils.timing import TimingManager
 from simple_rl.utils.training_config import create_training_config
@@ -87,31 +87,35 @@ class GRPO(BaseAlgorithm):
         print(f"  Trainable parameters: {trainable_params:,}")
         print(f"  Device: {self.device}")
 
-        # Create frozen reference model for KL penalty
-        self.ref_policy = copy.deepcopy(self.policy)
-        self.ref_policy = self.ref_policy.to(self.device)
-
-        # Freeze reference model
-        for param in self.ref_policy.parameters():
-            param.requires_grad = False
-        self.ref_policy.eval()
-
-        # Verify freezing
-        frozen_params = sum(1 for p in self.ref_policy.parameters() if not p.requires_grad)
-        total_params = sum(1 for _ in self.ref_policy.parameters())
-        assert frozen_params == total_params, "Not all reference parameters frozen"
-        print(f"✓ Reference model frozen: {frozen_params} parameters")
-
-        # Print KL divergence configuration (will be set after training_config)
-        self._print_kl_config = True
-
-        # Training config
+        # Training config (need this first to check kl_coef)
         self.training_config = create_training_config(self.config)
 
         # GRPO parameters
         self.group_size = self.training_config.group_size
         self.kl_coef = self.training_config.kl_coef
         self.normalize_rewards = self.training_config.normalize_rewards
+
+        # Create frozen reference model for KL penalty (ONLY if kl_coef > 0)
+        if self.kl_coef > 0:
+            self.ref_policy = copy.deepcopy(self.policy)
+            self.ref_policy = self.ref_policy.to(self.device)
+
+            # Freeze reference model
+            for param in self.ref_policy.parameters():
+                param.requires_grad = False
+            self.ref_policy.eval()
+
+            # Verify freezing
+            frozen_params = sum(1 for p in self.ref_policy.parameters() if not p.requires_grad)
+            total_params = sum(1 for _ in self.ref_policy.parameters())
+            assert frozen_params == total_params, "Not all reference parameters frozen"
+            print(f"✓ Reference model frozen: {frozen_params} parameters")
+        else:
+            self.ref_policy = None
+            print(f"✓ KL penalty disabled (kl_coef=0), skipping reference model")
+
+        # Print KL divergence configuration
+        self._print_kl_config = True
 
         # Clipping parameters - support both symmetric and asymmetric clipping
         self.clip_epsilon = self.training_config.clip_epsilon
@@ -145,12 +149,12 @@ class GRPO(BaseAlgorithm):
         self.top_p = self.training_config.top_p
         self.gradient_clip = self.training_config.gradient_clip
 
-        # AMP setup
-        self._amp_config = create_amp_config(self.config)
-        try:
-            print(f"AMP: enabled={self._amp_config.enabled}, device={self._amp_config.device}")
-        except Exception:
-            pass
+        # AMP setup - COMMENTED OUT - mixed precision disabled
+        # self._amp_config = create_amp_config(self.config)
+        # try:
+        #     print(f"AMP: enabled={self._amp_config.enabled}, device={self._amp_config.device}")
+        # except Exception:
+        #     pass
 
         # Optimizer
         self.optimizer = configure_optimizer(self.policy, self.config)
@@ -163,11 +167,19 @@ class GRPO(BaseAlgorithm):
         if self.use_wandb:
             self.logger.init_wandb()
 
-        # Debug logger
+        # Debug logger - initialize with all debug flags from config
         debug_config = self.config.get("debug", {})
         debug_enabled = debug_config.get("enabled", False)
         debug_log_dir = debug_config.get("log_dir", "debug_logs")
-        self.debug_logger = GRPODebugLogger(log_dir=debug_log_dir, enabled=debug_enabled)
+        self.debug_logger = GRPODebugLogger(
+            log_dir=debug_log_dir,
+            enabled=debug_enabled,
+            debug_generation=debug_config.get("generation", False),
+            debug_alignment=debug_config.get("alignment", False),
+            debug_advantages=debug_config.get("advantages", False),
+            debug_loss=debug_config.get("loss", False),
+            debug_gradients=debug_config.get("gradients", False),
+        )
 
         # Statistics
         self.total_steps = 0
@@ -178,10 +190,13 @@ class GRPO(BaseAlgorithm):
         timing_config = self.config.get("timing", {})
         self.print_timing = timing_config.get("enabled", False)  # Disabled by default
 
-        # Storage for trajectory data (needed for multiple epochs)
-        self.stored_generated_ids = None
-        self.stored_attention_mask = None
-        self.stored_prompt_end_positions = None
+        # Device-specific optimizations
+        device_opts = self.config.get("device_optimizations", {})
+        self.clear_cache_on_mps = device_opts.get("clear_cache_on_mps", False)  # Default: False (don't clear on MPS)
+
+        # Progress logging
+        logging_cfg = self.config.get("logging", {})
+        self.log_trajectory_progress = logging_cfg.get("show_trajectory_progress", False)  # Default: False
 
         # Early stopping tokens for generation
         self._setup_stopping_tokens()
@@ -210,41 +225,31 @@ class GRPO(BaseAlgorithm):
 
     def _create_completion_mask(self, completion_ids: torch.Tensor) -> torch.Tensor:
         """
-        Create mask for completion tokens, excluding tokens after EOS or padding.
+        Create mask for completion tokens, excluding padding and tokens after EOS.
+
+        Masks out:
+        - PAD tokens (anywhere in sequence)
+        - EOS token and everything after it
 
         Args:
             completion_ids: Token IDs [batch_size, seq_len]
 
         Returns:
-            Binary mask [batch_size, seq_len]
+            Binary mask [batch_size, seq_len] where 1 = valid token, 0 = masked
         """
-        eos_token_id = self.policy.tokenizer.eos_token_id
         pad_token_id = self.policy.tokenizer.pad_token_id
+        eos_token_id = self.policy.tokenizer.eos_token_id
 
-        # Check for both EOS and PAD tokens
-        is_eos = completion_ids == eos_token_id
-        is_pad = completion_ids == pad_token_id
+        # Mask out padding tokens (but don't stop at them)
+        not_pad = (completion_ids != pad_token_id).float()
 
-        # A position is masked out if it's EOS, PAD, or after the first EOS/PAD
-        is_stop = is_eos | is_pad
+        # Find EOS and mask everything after it (including EOS itself)
+        is_eos = (completion_ids == eos_token_id).int()
+        eos_cumsum = is_eos.cumsum(dim=1)
+        not_after_eos = (eos_cumsum == 0).float()
 
-        # Find first stop position (EOS or PAD)
-        stop_idx = torch.full(
-            (is_stop.size(0),),
-            is_stop.size(1),
-            dtype=torch.long,
-            device=completion_ids.device,
-        )
+        return not_pad * not_after_eos
 
-        mask_exists = is_stop.any(dim=1)
-        stop_idx[mask_exists] = is_stop.int().argmax(dim=1)[mask_exists]
-
-        # Create mask: 1 for valid tokens (before stop), 0 for stop and after
-        sequence_indices = torch.arange(
-            is_stop.size(1), device=completion_ids.device
-        ).expand(is_stop.size(0), -1)
-
-        return (sequence_indices < stop_idx.unsqueeze(1)).float()
 
     def _generate_grouped_completions(
         self, prompts: List[str]
@@ -280,26 +285,9 @@ class GRPO(BaseAlgorithm):
             # Stop at either EOS or </answer> tag
             eos_token_id = [eos_token_id, self.answer_end_token_id]
 
-        debug_generation = self.config.get("debug", {}).get("generation", False)
-        if debug_generation:
-            print(f"\n🔍 GENERATION DEBUG:")
-            print(f"  AMP enabled: {self._amp_config.enabled}")
-            print(f"  AMP device: {self._amp_config.device}")
-            print(f"  Temperature: {self.temperature}")
-            print(f"  Max new tokens: {self.max_new_tokens}")
-            print(f"  EOS token ID: {eos_token_id}")
-            print(f"  Device: {self.device}")
-
         with torch.no_grad():
-            with self._amp_config.autocast():
-                if debug_generation:
-                    if hasattr(self.policy.model, 'dtype'):
-                        print(f"  Model dtype: {self.policy.model.dtype}")
-
-                    test_tensor = torch.randn(1, 1, device=self.device)
-                    test_result = test_tensor @ test_tensor.T
-                    print(f"  Computation dtype (matmul): {test_result.dtype}")
-
+            # with self._amp_config.autocast():  # COMMENTED OUT - mixed precision disabled
+            with contextlib.nullcontext():
                 generated_ids, generated_mask = self.policy.generate(
                 replicated_prompt_ids,
                 attention_mask=replicated_prompt_mask,
@@ -312,52 +300,20 @@ class GRPO(BaseAlgorithm):
                 eos_token_id=eos_token_id,
                 )
 
-        if debug_generation:
-            total_tokens_generated = generated_mask.sum().item()
-            avg_tokens_per_seq = total_tokens_generated / total_sequences
-            print(f"  Total tokens generated: {total_tokens_generated}")
-            print(f"  Avg tokens/sequence: {avg_tokens_per_seq:.1f}")
-
         self.policy.train(prev_mode)
         self.timing_manager.end_timer("batch_text_generation")
 
         self.timing_manager.start_timer("completion_extraction")
-        # Extract completion IDs
-        prompt_lengths = batch_prompt_mask.sum(dim=-1)
-        prompt_start_positions = torch.argmax(batch_prompt_mask, dim=-1)
-        prompt_end_positions = prompt_start_positions + prompt_lengths
-        replicated_prompt_end_positions = prompt_end_positions.repeat_interleave(
-            self.group_size, dim=0
-        )
+        promot_end_index = batch_prompt_mask.shape[1]
+        # Vectorized completion extraction
+        device = generated_ids.device
+        total_sequences, seq_len = generated_ids.shape
+        max_completion_length = seq_len - promot_end_index
 
-        all_completion_ids = []
-        for seq_idx in range(total_sequences):
-            prompt_end = int(replicated_prompt_end_positions[seq_idx])
-            seq_completion_ids = generated_ids[seq_idx, prompt_end:]
-            all_completion_ids.append(seq_completion_ids)
-
-        max_completion_length = max(
-            comp_ids.size(0) for comp_ids in all_completion_ids
-        ) if all_completion_ids else 0
-
-        completion_ids = torch.stack([
-            F.pad(
-                comp_ids,
-                (0, max_completion_length - comp_ids.size(0)),
-                value=self.policy.tokenizer.pad_token_id,
-            )
-            for comp_ids in all_completion_ids
-        ])
-
-        if debug_generation:
-            completion_lengths = [comp_ids.size(0) for comp_ids in all_completion_ids]
-            completion_lengths_tensor = torch.tensor(completion_lengths, dtype=torch.float32)
-            print(f"  Completion lengths - min: {min(completion_lengths)}, max: {max(completion_lengths)}, "
-                  f"mean: {completion_lengths_tensor.mean().item():.1f}, std: {completion_lengths_tensor.std().item():.1f}")
-
-            eos_ids = [eos_token_id] if isinstance(eos_token_id, int) else eos_token_id
-            num_with_eos = sum(1 for comp_ids in all_completion_ids if any(tok.item() in eos_ids for tok in comp_ids))
-            print(f"  Sequences with EOS: {num_with_eos}/{len(all_completion_ids)}")
+        prompt_ends = torch.full((batch_prompt_mask.shape[0] * self.group_size,), batch_prompt_mask.shape[1]).to(device)
+        offsets = torch.arange(max_completion_length, device=device).unsqueeze(0)
+        gather_indices = (prompt_ends.unsqueeze(1) + offsets).clamp(0, seq_len - 1)
+        completion_ids = torch.gather(generated_ids, 1, gather_indices).to(device)
 
         completion_texts = self.policy.decode(completion_ids)
         self.timing_manager.end_timer("completion_extraction")
@@ -367,10 +323,11 @@ class GRPO(BaseAlgorithm):
             "generated_mask": generated_mask,
             "completion_ids": completion_ids,
             "completion_texts": completion_texts,
-            "all_completion_ids": all_completion_ids,
-            "prompt_end_positions": replicated_prompt_end_positions,
+            "actual_completion_lengths": completion_ids.shape[1],
+            "prompt_end_positions": prompt_ends,
             "total_sequences": total_sequences,
         }
+
 
     def generate_trajectories(
         self,
@@ -384,6 +341,11 @@ class GRPO(BaseAlgorithm):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ]:
         """
         Generate trajectories in batches to avoid OOM.
@@ -392,7 +354,8 @@ class GRPO(BaseAlgorithm):
         memory issues during generation.
 
         Returns:
-            (prompts, completions, rewards, old_log_probs, ref_log_probs, completion_mask)
+            (prompts, completions, rewards, old_log_probs, ref_log_probs, completion_mask,
+             format_rewards, correctness_rewards, generated_ids, attention_mask, prompt_end_positions)
         """
         store = self.store_completions if store_outputs is None else store_outputs
 
@@ -418,9 +381,17 @@ class GRPO(BaseAlgorithm):
         all_generated_mask = []
         all_prompt_end_positions = []
 
+        # Calculate total number of batches for progress logging
+        num_batches = (num_prompts + self.rollout_batch_size - 1) // self.rollout_batch_size
+        
         # Process prompts in batches
         for batch_start in range(0, num_prompts, self.rollout_batch_size):
             batch_idx = batch_start // self.rollout_batch_size + 1
+            
+            # Progress indicator (compact, non-intrusive)
+            if self.log_trajectory_progress:
+                print(f"  [Trajectory {batch_idx}/{num_batches}]", end=" ", flush=True)
+            
             self.timing_manager.start_timer(f"batch_{batch_idx}")
 
             batch_end = min(batch_start + self.rollout_batch_size, num_prompts)
@@ -435,7 +406,7 @@ class GRPO(BaseAlgorithm):
             generated_mask = generation["generated_mask"]
             completion_ids = generation["completion_ids"]
             completion_texts = generation["completion_texts"]
-            batch_completion_ids = generation["all_completion_ids"]
+            actual_completion_lengths = generation["actual_completion_lengths"]
             replicated_prompt_end_positions = generation["prompt_end_positions"]
             total_sequences = generation["total_sequences"]
 
@@ -449,13 +420,14 @@ class GRPO(BaseAlgorithm):
             prev_mode = self.policy.training
             self.policy.eval()
 
-            # Calculate max completion length to use logits_to_keep
-            max_completion_len = max(c.size(0) for c in batch_completion_ids)
+            # Calculate max completion length to use logits_to_keep (vectorized)
+            max_completion_len = completion_ids.size(1)
 
             with torch.no_grad():  # No gradients needed during trajectory generation
                 # Keep KV cache enabled for faster inference
                 # Only compute log probs for completion tokens (model still sees full context)
-                with self._amp_config.autocast():
+                # with self._amp_config.autocast():  # COMMENTED OUT - mixed precision disabled
+                with contextlib.nullcontext():
                     policy_log_probs = self.policy.compute_log_probs(
                         generated_ids,
                         attention_mask=generated_mask,
@@ -465,44 +437,41 @@ class GRPO(BaseAlgorithm):
                 self.policy.train()
             self.timing_manager.end_timer(f"batch_{batch_idx}_policy_log_probs")
 
-            # Compute reference log probs for this batch
-            self.timing_manager.start_timer(f"batch_{batch_idx}_ref_log_probs")
-            self.ref_policy.eval()  # Ensure ref policy is in eval mode
-            with torch.no_grad():
-                # Keep KV cache enabled for faster inference
-                # Only compute log probs for completion tokens (model still sees full context)
-                with self._amp_config.autocast():
-                    ref_log_probs = self.ref_policy.compute_log_probs(
-                        generated_ids,
-                        attention_mask=generated_mask,
-                        logits_to_keep=max_completion_len,
-                    )
-            self.timing_manager.end_timer(f"batch_{batch_idx}_ref_log_probs")
+            # Compute reference log probs for this batch (ONLY if KL penalty enabled)
+            if self.kl_coef > 0 and self.ref_policy is not None:
+                self.timing_manager.start_timer(f"batch_{batch_idx}_ref_log_probs")
+                self.ref_policy.eval()  # Ensure ref policy is in eval mode
+                with torch.no_grad():
+                    # Keep KV cache enabled for faster inference
+                    # Only compute log probs for completion tokens (model still sees full context)
+                    # with self._amp_config.autocast():  # COMMENTED OUT - mixed precision disabled
+                    with contextlib.nullcontext():
+                        ref_log_probs = self.ref_policy.compute_log_probs(
+                            generated_ids,
+                            attention_mask=generated_mask,
+                            logits_to_keep=max_completion_len,
+                        )
+                self.timing_manager.end_timer(f"batch_{batch_idx}_ref_log_probs")
+            else:
+                # KL penalty disabled - create dummy ref_log_probs (will be ignored in loss)
+                ref_log_probs = torch.zeros_like(policy_log_probs)
 
             # Extract completion log probs for this batch
             self.timing_manager.start_timer(f"batch_{batch_idx}_extract_completions")
             completion_mask = self._create_completion_mask(completion_ids)
 
-            # policy_log_probs and ref_log_probs are [batch, max_completion_len]
-            # With left-padding: logits_to_keep gives [completion_tokens ... padding_tokens]
-            # The actual completion tokens are at the BEGINNING of the tensor
+            # policy_log_probs contains log probs for the LAST max_completion_len positions in generated_ids
+            # completion_ids are extracted starting from prompt_end_position for each sequence
+            # Since all sequences in this batch have the same prompt_end_position (no left-padding within batch),
+            # the completion log probs are already aligned - just take the first max_completion_len
+            batch_policy_log_probs = policy_log_probs * completion_mask
+            batch_ref_log_probs = ref_log_probs * completion_mask
+
+            # Append per-sequence tensors (needed for variable-length padding later)
             for seq_idx in range(total_sequences):
-                seq_completion_ids = batch_completion_ids[seq_idx]
-                actual_completion_length = seq_completion_ids.size(0)
-
-                # Extract the FIRST actual_completion_length log probs
-                # (completions are at the start due to left-padding)
-                seq_policy_log_probs = policy_log_probs[seq_idx, :actual_completion_length]
-                seq_ref_log_probs = ref_log_probs[seq_idx, :actual_completion_length]
-                seq_completion_mask = completion_mask[seq_idx, :actual_completion_length]
-
-                # Apply mask to zero out tokens after EOS
-                seq_policy_log_probs = seq_policy_log_probs * seq_completion_mask
-                seq_ref_log_probs = seq_ref_log_probs * seq_completion_mask
-
-                all_log_probs.append(seq_policy_log_probs)
-                all_ref_log_probs.append(seq_ref_log_probs)
-                all_completion_mask.append(seq_completion_mask)
+                all_log_probs.append(batch_policy_log_probs[seq_idx, :])
+                all_ref_log_probs.append(batch_ref_log_probs[seq_idx, :])
+                all_completion_mask.append(completion_mask[seq_idx, :])
 
             self.timing_manager.end_timer(f"batch_{batch_idx}_extract_completions")
 
@@ -527,65 +496,44 @@ class GRPO(BaseAlgorithm):
             self.timing_manager.end_timer(f"batch_{batch_idx}_rewards")
 
             # Cleanup batch data
-            del generated_ids, generated_mask, completion_ids, policy_log_probs, ref_log_probs
-            clear_device_cache(self.device)
+            del generated_ids, generated_mask, completion_ids, policy_log_probs, ref_log_probs, actual_completion_lengths
+            if self.device.type == "cuda" or (self.device.type == "mps" and self.clear_cache_on_mps):
+                clear_device_cache(self.device)
 
             self.timing_manager.end_timer(f"batch_{batch_idx}")
+            
+            # Show completion for this batch
+            if self.log_trajectory_progress:
+                print("✓", end="", flush=True)
 
-        # Concatenate all batches (pad to same length first)
-        # Find max sequence length across all batches
-        max_seq_len = max(tensor.size(1) for tensor in all_generated_ids)
+        # Newline after all batches complete
+        if self.log_trajectory_progress:
+            print()  # Move to next line after progress indicators
 
-        # Pad all tensors to same length - PAD ON THE LEFT to match original padding
-        # CRITICAL: Adjust prompt_end_positions when adding left padding!
-        padded_generated_ids = []
-        padded_generated_mask = []
-        adjusted_prompt_end_positions = []
-        batch_lengths = [tensor.size(1) for tensor in all_generated_ids]
-        padding_adjustments = []
+        # Don't concatenate - return as LISTS of variable-length tensors
+        # Padding will be done per-minibatch to save memory
+        # Convert all_generated_ids and all_generated_mask from list of batches to list of sequences
+        generated_ids = []
+        attention_mask = []
+        for batch_ids, batch_mask in zip(all_generated_ids, all_generated_mask):
+            # Split batch into individual sequences
+            for seq_idx in range(batch_ids.size(0)):
+                generated_ids.append(batch_ids[seq_idx])
+                attention_mask.append(batch_mask[seq_idx])
 
-        for gen_ids, gen_mask, prompt_ends in zip(
-            all_generated_ids, all_generated_mask, all_prompt_end_positions
-        ):
-            pad_len = 0
-            if gen_ids.size(1) < max_seq_len:
-                # Pad on the LEFT (prepend padding) to match tokenizer's left-padding
-                pad_len = max_seq_len - gen_ids.size(1)
-                gen_ids = F.pad(gen_ids, (pad_len, 0), value=self.policy.tokenizer.pad_token_id)
-                gen_mask = F.pad(gen_mask, (pad_len, 0), value=0)
+        # Flatten prompt_end_positions from list of batches to single tensor
+        prompt_end_positions = torch.cat(all_prompt_end_positions, dim=0)
 
-            # Adjust prompt_end_positions by the amount of left-padding added
-            # This ensures positions remain valid after padding shifts everything right
-            adjusted_prompt_ends = prompt_ends + pad_len
-
-            padded_generated_ids.append(gen_ids)
-            padded_generated_mask.append(gen_mask)
-            adjusted_prompt_end_positions.append(adjusted_prompt_ends)
-            padding_adjustments.append(pad_len)
-
-        self.stored_generated_ids = torch.cat(padded_generated_ids, dim=0)
-        self.stored_attention_mask = torch.cat(padded_generated_mask, dim=0)
-        self.stored_prompt_end_positions = torch.cat(adjusted_prompt_end_positions, dim=0)
-
-        # Validate that prompt_end_positions are within bounds after padding adjustment
-        assert (self.stored_prompt_end_positions <= self.stored_generated_ids.size(1)).all(), \
-            f"Invalid prompt_end_positions after padding: max={self.stored_prompt_end_positions.max()}, seq_len={self.stored_generated_ids.size(1)}"
-
-        # Stack into tensors (OLD log probs from generation - won't change)
-        # Note: Already detached from torch.no_grad() context, no need for explicit .detach()
+        # Concatenate rewards (these are scalars per sequence, no padding needed)
         self.timing_manager.start_timer("tensor_stacking")
-        all_log_probs = pad_sequence(all_log_probs, batch_first=True, padding_value=0.0)
-        all_ref_log_probs = pad_sequence(all_ref_log_probs, batch_first=True, padding_value=0.0)
-        all_completion_mask = pad_sequence(all_completion_mask, batch_first=True, padding_value=0.0)
         all_rewards = torch.cat(all_rewards, dim=0)
         all_format_rewards = torch.cat(all_format_rewards, dim=0)
         all_correctness_rewards = torch.cat(all_correctness_rewards, dim=0)
-
-        # Store format and correctness rewards for metrics tracking
-        self.stored_format_rewards = all_format_rewards
-        self.stored_correctness_rewards = all_correctness_rewards
-
         self.timing_manager.end_timer("tensor_stacking")
+
+        # Keep log probs and completion masks as LISTS of variable-length tensors
+        # Padding will be done per-minibatch
+        # Note: all_log_probs, all_ref_log_probs, all_completion_mask are already lists
 
         if store:
             return (
@@ -595,6 +543,11 @@ class GRPO(BaseAlgorithm):
                 all_log_probs,
                 all_ref_log_probs,
                 all_completion_mask,
+                all_format_rewards,
+                all_correctness_rewards,
+                generated_ids,
+                attention_mask,
+                prompt_end_positions,
             )
         return (
             None,
@@ -603,6 +556,11 @@ class GRPO(BaseAlgorithm):
             all_log_probs,
             all_ref_log_probs,
             all_completion_mask,
+            all_format_rewards,
+            all_correctness_rewards,
+            generated_ids,
+            attention_mask,
+            prompt_end_positions,
         )
 
     def compute_advantages(
@@ -622,25 +580,34 @@ class GRPO(BaseAlgorithm):
         Returns:
             Advantages tensor [batch_size]
         """
+
         if normalize_within_groups and group_size > 1:
+            # Reshape to groups
             batch_size = rewards.shape[0]
             num_groups = batch_size // group_size
-
-            # Reshape to groups
             grouped_rewards = rewards.view(num_groups, group_size)
 
             # Normalize within each group (baseline = group mean)
             group_mean = grouped_rewards.mean(dim=1, keepdim=True)
             group_std = grouped_rewards.std(dim=1, keepdim=True)
 
-            normalized_rewards = (grouped_rewards - group_mean) / (group_std + 1e-4)
+            # Check for very small std values
+            # small_std_count = int((group_std < 1e-3).sum().item())
+
+            # Use larger epsilon to prevent explosion when std is small
+            normalized_rewards = (grouped_rewards - group_mean) / (group_std + 1e-2)
 
             # Flatten back
             advantages = normalized_rewards.view(-1)
         else:
             # Global normalization
-            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
+            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-2)
 
+        # Clip advantages to prevent extreme policy updates
+        # advantages_before_clip = advantages.clone()
+        advantages = torch.clamp(advantages, min=-10.0, max=10.0)
+
+        # clipped_count = int(((advantages_before_clip < -10.0) | (advantages_before_clip > 10.0)).sum().item())
         return advantages
 
     def compute_loss(
@@ -652,9 +619,9 @@ class GRPO(BaseAlgorithm):
         completion_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute GRPO loss with PPO-style clipping.
+        Compute GRPO loss with PPO-style clipping and entropy bonus.
 
-        Loss = E[min(ratio * A, clip(ratio, 1-ε, 1+ε) * A)] - β * KL
+        Loss = E[min(ratio * A, clip(ratio, 1-ε, 1+ε) * A)] - β * KL - α * H
 
         Args:
             new_log_probs: Current policy log probs [batch, seq_len]
@@ -684,30 +651,43 @@ class GRPO(BaseAlgorithm):
         ) * advantages.detach()
         policy_loss = -torch.min(surr1, surr2).mean()
 
-        # KL divergence penalty (per-token)
+        # KL divergence penalty (per-token) - ONLY if enabled
         # KL(π_ref || π_new) penalizes when new policy diverges from reference
         # This prevents the policy from becoming overconfident
-        # NOTE: Detach ref_log_probs - no backprop through reference model!
-        ref_log_probs_detached = ref_log_probs.detach()
+        if self.kl_coef > 0:
+            # NOTE: Detach ref_log_probs - no backprop through reference model!
+            ref_log_probs_detached = ref_log_probs.detach()
 
-        # Compute KL divergence using configured estimator
-        # Options: "mc" (Monte Carlo), "k3" (low-variance unbiased), "abs", "mse"
-        kl_penalty = compute_kl_divergence(
-            ref_log_probs_detached,
-            new_log_probs,
-            mask=completion_mask,
-            estimator=self.kl_estimator,
-            clamp_min=self.kl_clamp_min,
-            clamp_max=self.kl_clamp_max,
-        )
+            # Compute KL divergence using configured estimator
+            # Options: "mc" (Monte Carlo), "k3" (low-variance unbiased), "abs", "mse"
+            kl_penalty = compute_kl_divergence(
+                ref_log_probs_detached,
+                new_log_probs,
+                mask=completion_mask,
+                estimator=self.kl_estimator,
+                clamp_min=self.kl_clamp_min,
+                clamp_max=self.kl_clamp_max,
+            )
 
-        # Total GRPO loss
-        loss = policy_loss + self.kl_coef * kl_penalty
+        else:
+            # KL penalty disabled - return zero
+            kl_penalty = torch.tensor(0.0, device=new_log_probs.device)
+
+        # Entropy bonus for exploration
+        new_probs = torch.exp(new_log_probs)
+        entropy = -(new_probs * new_log_probs * completion_mask).sum(dim=-1).mean()
+
+        # Get entropy coefficient from config (default: 0.01)
+        entropy_coef = self.config.get("training", {}).get("entropy_coef", 0.01)
+
+        # Total GRPO loss with entropy bonus
+        loss = policy_loss + self.kl_coef * kl_penalty - entropy_coef * entropy
 
         # Metrics
         metrics = {
             "policy_loss": policy_loss.item(),
             "kl_divergence": kl_penalty.item(),
+            "entropy": entropy.item(),
             "ratio_mean": ratio.mean().item(),
             "ratio_min": ratio.min().item(),
             "ratio_max": ratio.max().item(),
@@ -724,24 +704,28 @@ class GRPO(BaseAlgorithm):
 
     def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
         """
-        Perform proper GRPO training step (single epoch as per DeepSeekMath).
+        Perform proper GRPO training step with multiple epochs over same trajectories.
 
         Training procedure:
-        1. Collect all rollouts/trajectories (store in RAM)
+        1. Collect all rollouts/trajectories ONCE (expensive - store in RAM)
         2. Compute group-normalized advantages
-        3. Single epoch: shuffle, iterate minibatches, update policy
-        4. Minibatch = subset of rollouts per optimization step
+        3. Multiple epochs over SAME data (3-5 epochs):
+           - Shuffle data each epoch
+           - Iterate minibatches
+           - Update policy per minibatch
+        4. This squeezes more learning from expensive trajectory generation
 
         Args:
             batch: Dictionary with 'prompts' and 'answers'
 
         Returns:
-            Dictionary of training metrics
+            Dictionary of training metrics averaged across all epochs
         """
         self.policy.train()
         prompts = batch["prompts"]
         answers = batch["answers"]
 
+        # 1. GENERATE TRAJECTORIES ONCE (expensive!)
         self.timing_manager.start_timer("trajectory_generation")
         (
             _,
@@ -750,28 +734,45 @@ class GRPO(BaseAlgorithm):
             old_log_probs,
             ref_log_probs,
             completion_mask,
+            format_rewards,
+            correctness_rewards,
+            generated_ids,
+            attention_mask,
+            prompt_end_positions,
         ) = self.generate_trajectories(
             prompts, answers=answers, store_outputs=False
         )
         self.timing_manager.end_timer("trajectory_generation")
 
+        # 2. COMPUTE ADVANTAGES ONCE
         self.timing_manager.start_timer("advantage_computation")
         advantages = self.compute_advantages(
             rewards,
             group_size=self.group_size,
             normalize_within_groups=self.normalize_rewards
         )
-
         self.timing_manager.end_timer("advantage_computation")
+
+        # Compute metrics NOW and save scalars (before optimization loop)
+        # This allows us to free reward tensors early
+        total_sequences = rewards.shape[0]
+        reward_mean_scalar = rewards.mean().item()
+        reward_std_scalar = rewards.std().item()
+        format_reward_mean_scalar = format_rewards.mean().item()
+        correctness_reward_mean_scalar = correctness_rewards.mean().item()
+        # completion_mask is now a list of tensors - sum across all
+        total_tokens_scalar = sum(mask.sum().item() for mask in completion_mask)
+
+        # Free reward tensors before optimization loop (only need advantages now)
+        del rewards, format_rewards, correctness_rewards
 
         self.timing_manager.start_timer("optimization")
 
-        total_sequences = rewards.shape[0]
-
-        # Aggregate metrics across all minibatch updates
+        # Aggregate metrics across ALL epochs and minibatches
         epoch_metrics = {
             "policy_loss": 0.0,
             "kl_divergence": 0.0,
+            "entropy": 0.0,
             "ratio_mean": 0.0,
             "ratio_clipped_frac": 0.0,
             "ratio_min": 0.0,
@@ -779,146 +780,187 @@ class GRPO(BaseAlgorithm):
         }
         num_updates = 0
 
-        # Shuffle rollouts once (single epoch)
-        indices = torch.randperm(total_sequences, device=self.device)
+        # Calculate total minibatches for progress logging
+        num_minibatches = (total_sequences + self.minibatch_size - 1) // self.minibatch_size
 
-        # Iterate through minibatches
-        for mb_idx, mb_start in enumerate(range(0, total_sequences, self.minibatch_size), 1):
-            self.timing_manager.start_timer(f"minibatch_{mb_idx}")
+        # Set up eval mode and disable KV cache once for all epochs/minibatches
+        # Use eval mode to disable dropout (for deterministic log probs)
+        # but keep gradients enabled for backprop
+        #self.policy.eval()
+        prev_cache = getattr(self.policy.model.config, "use_cache", None)
+        if prev_cache is not None:
+            self.policy.model.config.use_cache = False
 
-            mb_end = min(mb_start + self.minibatch_size, total_sequences)
-            mb_indices = indices[mb_start:mb_end]
+        try:
+            # 3. MULTIPLE EPOCHS OVER SAME TRAJECTORIES (3-5 typically)
+            for epoch in range(self.update_epochs):
+                # Shuffle rollouts for this epoch (different order each time)
+                indices = torch.randperm(total_sequences, device=self.device)
 
-            # Extract minibatch data
-            mb_old_log_probs = old_log_probs[mb_indices]
-            mb_ref_log_probs = ref_log_probs[mb_indices]
-            mb_advantages = advantages[mb_indices]
-            mb_completion_mask = completion_mask[mb_indices]
+                # Iterate through minibatches
+                for mb_idx, mb_start in enumerate(range(0, total_sequences, self.minibatch_size), 1):
+                    # Progress indicator for optimization
+                    if self.log_trajectory_progress:
+                        print(f"  [Epoch {epoch+1}/{self.update_epochs} | Minibatch {mb_idx}/{num_minibatches}]", end=" ", flush=True)
 
-            # Recompute log probs with CURRENT policy
-            self.timing_manager.start_timer(f"minibatch_{mb_idx}_recompute")
-            mb_generated_ids = self.stored_generated_ids[mb_indices]
-            mb_attention_mask = self.stored_attention_mask[mb_indices]
+                    self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}")
 
-            # Calculate max completion length for this minibatch
-            mb_max_completion_len = mb_completion_mask.size(1)
+                    mb_end = min(mb_start + self.minibatch_size, total_sequences)
+                    mb_indices = indices[mb_start:mb_end]
 
-            # Use eval mode to disable dropout (for deterministic log probs)
-            # but keep gradients enabled for backprop
-            self.policy.eval()
-            prev_cache = getattr(self.policy.model.config, "use_cache", None)
+                    # Extract minibatch data - advantages are scalars, no padding needed
+                    mb_advantages = advantages[mb_indices]
+
+                    # Extract selected sequences from lists (variable-length)
+                    selected_gen_ids = [generated_ids[idx] for idx in mb_indices]
+                    selected_attn_mask = [attention_mask[idx] for idx in mb_indices]
+                    selected_old_log_probs = [old_log_probs[idx] for idx in mb_indices]
+                    selected_ref_log_probs = [ref_log_probs[idx] for idx in mb_indices]
+                    selected_completion_mask = [completion_mask[idx] for idx in mb_indices]
+
+                    # Recompute log probs with CURRENT policy
+                    self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_recompute")
+
+                    # Pad generated_ids and attention_mask first
+                    mb_generated_ids = pad_sequence(
+                        selected_gen_ids,
+                        batch_first=True,
+                        padding_value=self.policy.tokenizer.pad_token_id
+                    )
+                    mb_attention_mask = pad_sequence(
+                        selected_attn_mask,
+                        batch_first=True,
+                        padding_value=0
+                    )
+
+                    # Recompute log probs per sequence with sequence-specific logits_to_keep
+                    new_log_probs_list = []
+
+                    with contextlib.nullcontext():
+                        for _, (seq_gen_ids, seq_attn_mask, seq_old_log_probs) in enumerate(
+                            zip(selected_gen_ids, selected_attn_mask, selected_old_log_probs)
+                        ):
+                            # Get the number of completion tokens for this sequence
+                            n_completion_tokens = seq_old_log_probs.size(0)
+
+                            # Compute log probs for just this sequence
+                            seq_new_log_probs = self.policy.compute_log_probs(
+                                seq_gen_ids.unsqueeze(0),  # Add batch dim
+                                attention_mask=seq_attn_mask.unsqueeze(0),  # Add batch dim
+                                logits_to_keep=n_completion_tokens,
+                            )
+
+                            # Remove batch dim and store
+                            new_log_probs_list.append(seq_new_log_probs.squeeze(0))
+
+                    # Pad all tensors to same length
+                    mb_new_log_probs = pad_sequence(
+                        new_log_probs_list,
+                        batch_first=True,
+                        padding_value=0.0
+                    )
+                    mb_old_log_probs = pad_sequence(
+                        selected_old_log_probs,
+                        batch_first=True,
+                        padding_value=0.0
+                    )
+                    mb_ref_log_probs = pad_sequence(
+                        selected_ref_log_probs,
+                        batch_first=True,
+                        padding_value=0.0
+                    )
+                    mb_completion_mask = pad_sequence(
+                        selected_completion_mask,
+                        batch_first=True,
+                        padding_value=0.0
+                    )
+
+                    # Apply the mask (use the original completion_mask from generation)
+                    mb_new_log_probs = mb_new_log_probs * mb_completion_mask
+                    mb_old_log_probs = mb_old_log_probs * mb_completion_mask
+
+                    self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_recompute")
+
+                    # Zero gradients
+                    self.optimizer.zero_grad()
+
+                    # Compute loss
+                    self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_loss")
+                    # with self._amp_config.autocast():  # COMMENTED OUT - mixed precision disabled
+                    with contextlib.nullcontext():
+                        loss, mb_metrics = self.compute_loss(
+                            mb_new_log_probs,
+                            mb_old_log_probs,
+                            mb_advantages,
+                            mb_ref_log_probs,
+                            mb_completion_mask,
+                        )
+                    self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_loss")
+
+                    # Backward pass
+                    self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_backward")
+                    # if self._amp_config.enabled and self._amp_config.grad_scaler is not None:  # COMMENTED OUT - mixed precision disabled
+                    #     self._amp_config.grad_scaler.scale(loss).backward()
+                    # else:
+                    loss.backward()
+                    self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_backward")
+
+                    # Gradient clipping
+                    self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_clip")
+                    # if self._amp_config.enabled and self._amp_config.grad_scaler is not None:  # COMMENTED OUT - mixed precision disabled
+                    #     self._amp_config.grad_scaler.unscale_(self.optimizer)
+
+                    # NOTE: clip_grad_norm_ returns the TOTAL norm BEFORE clipping
+                    # The actual gradients ARE clipped to max_norm, but the return value shows the original norm
+                    grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
+                        self.policy.parameters(), max_norm=self.gradient_clip
+                    )
+
+                    self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_clip")
+
+                    # Parameter update
+                    self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_update")
+                    # if self._amp_config.enabled and self._amp_config.grad_scaler is not None:  # COMMENTED OUT - mixed precision disabled
+                    #     self._amp_config.grad_scaler.step(self.optimizer)
+                    #     self._amp_config.grad_scaler.update()
+                    # else:
+                    self.optimizer.step()
+                    self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_update")
+
+                    # Accumulate metrics
+                    for key in epoch_metrics:
+                        if key in mb_metrics:
+                            epoch_metrics[key] += mb_metrics[key]
+                    num_updates += 1
+
+                    # Cleanup - Delete ALL minibatch tensors to free memory
+                    self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_cleanup")
+                    del (
+                        mb_new_log_probs, loss,
+                        mb_old_log_probs, mb_ref_log_probs, mb_advantages, mb_completion_mask,
+                        mb_generated_ids, mb_attention_mask,
+                        # Delete temporary selection lists
+                        selected_gen_ids, selected_attn_mask, selected_old_log_probs,
+                        selected_ref_log_probs, selected_completion_mask
+                    )
+                    if self.device.type == "cuda" or (self.device.type == "mps" and self.clear_cache_on_mps):
+                        clear_device_cache(self.device)
+                    self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_cleanup")
+
+                    self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}")
+
+                    # Show completion for this minibatch
+                    if self.log_trajectory_progress:
+                        print("✓", end="", flush=True)
+
+                # Newline after all minibatches in this epoch complete
+                if self.log_trajectory_progress:
+                    print()  # Move to next line after epoch minibatches
+        
+        finally:
+            # Restore cache config
             if prev_cache is not None:
-                self.policy.model.config.use_cache = False
-            try:
-                # Gradients are enabled by default (not in no_grad context)
-                # Use logits_to_keep to get LAST mb_max_completion_len tokens
-                with self._amp_config.autocast():
-                    mb_full_log_probs = self.policy.compute_log_probs(
-                        mb_generated_ids,
-                        attention_mask=mb_attention_mask,
-                        logits_to_keep=mb_max_completion_len,
-                    )
-            finally:
-                if prev_cache is not None:
-                    self.policy.model.config.use_cache = prev_cache
-
-            # Extract completion log probs for each sequence
-            # mb_full_log_probs contains log probs for LAST mb_max_completion_len positions
-            # We need to find where each completion starts within this window
-            mb_new_log_probs_list = []
-            mb_prompt_end_positions = self.stored_prompt_end_positions[mb_indices]
-
-            for i in range(len(mb_indices)):
-                # Get sequence length and prompt end position
-                seq_len = mb_generated_ids.size(1)
-                prompt_end = mb_prompt_end_positions[i].item()
-
-                # Completion starts at prompt_end position in the full sequence
-                # logits_to_keep gives us log probs for positions [seq_len - mb_max_completion_len : seq_len]
-                # So in mb_full_log_probs, position 0 corresponds to sequence position (seq_len - mb_max_completion_len)
-                logits_start_pos = seq_len - mb_max_completion_len
-
-                # Where does the completion start within mb_full_log_probs?
-                completion_start_in_logits = prompt_end - logits_start_pos
-
-                # Get actual completion length from mask
-                completion_len = mb_completion_mask[i].sum().int().item()
-
-                # Extract completion log probs from correct position
-                seq_new_log_probs = mb_full_log_probs[i, completion_start_in_logits:completion_start_in_logits + completion_len]
-
-                # Pad to match completion_mask size
-                if seq_new_log_probs.size(0) < mb_completion_mask.size(1):
-                    seq_new_log_probs = F.pad(
-                        seq_new_log_probs,
-                        (0, mb_completion_mask.size(1) - seq_new_log_probs.size(0)),
-                        value=0.0
-                    )
-                else:
-                    seq_new_log_probs = seq_new_log_probs[:mb_completion_mask.size(1)]
-
-                mb_new_log_probs_list.append(seq_new_log_probs)
-
-            mb_new_log_probs = torch.stack(mb_new_log_probs_list)
-            mb_new_log_probs = mb_new_log_probs * mb_completion_mask
-
-            self.timing_manager.end_timer(f"minibatch_{mb_idx}_recompute")
-
-            # Zero gradients
-            self.optimizer.zero_grad()
-
-            # Compute loss
-            self.timing_manager.start_timer(f"minibatch_{mb_idx}_loss")
-            with self._amp_config.autocast():
-                loss, mb_metrics = self.compute_loss(
-                    mb_new_log_probs,
-                    mb_old_log_probs,
-                    mb_advantages,
-                    mb_ref_log_probs,
-                    mb_completion_mask,
-                )
-            self.timing_manager.end_timer(f"minibatch_{mb_idx}_loss")
-
-            # Backward pass
-            self.timing_manager.start_timer(f"minibatch_{mb_idx}_backward")
-            if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
-                self._amp_config.grad_scaler.scale(loss).backward()
-            else:
-                loss.backward()
-            self.timing_manager.end_timer(f"minibatch_{mb_idx}_backward")
-
-            # Gradient clipping
-            self.timing_manager.start_timer(f"minibatch_{mb_idx}_clip")
-            if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
-                self._amp_config.grad_scaler.unscale_(self.optimizer)
-
-            torch.nn.utils.clip_grad_norm_(
-                self.policy.parameters(), max_norm=self.gradient_clip
-            )
-            self.timing_manager.end_timer(f"minibatch_{mb_idx}_clip")
-
-            # Parameter update
-            self.timing_manager.start_timer(f"minibatch_{mb_idx}_update")
-            if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
-                self._amp_config.grad_scaler.step(self.optimizer)
-                self._amp_config.grad_scaler.update()
-            else:
-                self.optimizer.step()
-            self.timing_manager.end_timer(f"minibatch_{mb_idx}_update")
-
-            # Accumulate metrics
-            for key in epoch_metrics:
-                if key in mb_metrics:
-                    epoch_metrics[key] += mb_metrics[key]
-            num_updates += 1
-
-            # Cleanup
-            self.timing_manager.start_timer(f"minibatch_{mb_idx}_cleanup")
-            del mb_new_log_probs, mb_full_log_probs, loss
-            clear_device_cache(self.device)
-            self.timing_manager.end_timer(f"minibatch_{mb_idx}_cleanup")
-
-            self.timing_manager.end_timer(f"minibatch_{mb_idx}")
+                self.policy.model.config.use_cache = prev_cache
 
         self.timing_manager.end_timer("optimization")
 
@@ -926,20 +968,20 @@ class GRPO(BaseAlgorithm):
         for key in epoch_metrics:
             epoch_metrics[key] /= max(1, num_updates)
 
-        # Final metrics
+        # Final metrics (using pre-computed scalars)
         metrics = {
             "total_loss": epoch_metrics["policy_loss"] + self.kl_coef * epoch_metrics["kl_divergence"],
             "pg_loss": epoch_metrics["policy_loss"],
             "kl_divergence": epoch_metrics["kl_divergence"],
-            "reward_mean": rewards.mean().item(),
-            "reward_std": rewards.std().item(),
-            "format_reward_mean": self.stored_format_rewards.mean().item(),
-            "correctness_reward_mean": self.stored_correctness_rewards.mean().item(),
+            "reward_mean": reward_mean_scalar,
+            "reward_std": reward_std_scalar,
+            "format_reward_mean": format_reward_mean_scalar,
+            "correctness_reward_mean": correctness_reward_mean_scalar,
             "ratio_mean": epoch_metrics["ratio_mean"],
             "ratio_min": epoch_metrics["ratio_min"],
             "ratio_max": epoch_metrics["ratio_max"],
             "ratio_clipped_frac": epoch_metrics["ratio_clipped_frac"],
-            "tokens_generated": completion_mask.sum().item(),
+            "tokens_generated": total_tokens_scalar,
         }
 
         # Update statistics
@@ -948,9 +990,12 @@ class GRPO(BaseAlgorithm):
         # Log metrics
         self.logger.log_metrics(metrics, self.total_steps)
 
-        # Cleanup
-        del old_log_probs, ref_log_probs, advantages, completion_mask, rewards
-        clear_device_cache(self.device)
+        # Cleanup after episode
+        del old_log_probs, ref_log_probs, advantages, completion_mask
+        del generated_ids, attention_mask, prompt_end_positions  # Lists get garbage collected
+
+        if self.device.type == "cuda" or (self.device.type == "mps" and self.clear_cache_on_mps):
+            clear_device_cache(self.device)
 
         return metrics
 
@@ -1054,75 +1099,36 @@ class GRPO(BaseAlgorithm):
             self.episode = episode
             episode_start_time = time.time()
 
-            # Aggregate metrics across all epochs in this episode
-            sum_total_loss = 0.0
-            sum_pg_loss = 0.0
-            sum_kl = 0.0
-            sum_reward_mean = 0.0
-            sum_reward_std = 0.0
-            sum_format_reward_mean = 0.0
-            sum_correctness_reward_mean = 0.0
-            sum_tokens_generated = 0
-            episode_tokens = 0
+            # Sample a batch of problems for this episode
+            batch_indices = np.random.choice(len(train_prompts), batch_size, replace=True)
+            batch_prompts = [train_prompts[i] for i in batch_indices]
+            batch_answers = [train_answers[i] for i in batch_indices]
 
-            for _ in range(update_epochs):
-                # Sample a fresh batch of problems per epoch
-                batch_indices = np.random.choice(len(train_prompts), batch_size, replace=True)
-
-                # Get prompts and answers for this batch
-                batch_prompts = [train_prompts[i] for i in batch_indices]
-                batch_answers = [train_answers[i] for i in batch_indices]
-
-                # Pass entire batch to train_step
-                batch_data = {
-                    "prompts": batch_prompts,
-                    "answers": batch_answers
-                }
-                metrics = self.train_step(batch_data)
-
-                # Accumulate metrics
-                sum_total_loss += metrics["total_loss"]
-                sum_pg_loss += metrics["pg_loss"]
-                sum_kl += metrics["kl_divergence"]
-                sum_reward_mean += metrics["reward_mean"]
-                sum_reward_std += metrics.get("reward_std", 0.0)
-                sum_format_reward_mean += metrics.get("format_reward_mean", 0.0)
-                sum_correctness_reward_mean += metrics.get("correctness_reward_mean", 0.0)
-
-                # Track tokens
-                tokens_in_batch = metrics.get("tokens_generated", 0)
-                sum_tokens_generated += tokens_in_batch
-                episode_tokens += tokens_in_batch
+            # Pass batch to train_step (which handles multiple epochs internally)
+            batch_data = {
+                "prompts": batch_prompts,
+                "answers": batch_answers
+            }
+            metrics = self.train_step(batch_data)
 
             # Calculate episode time
             episode_time = time.time() - episode_start_time
+            episode_tokens = metrics.get("tokens_generated", 0)
             cumulative_tokens += episode_tokens
 
             # Calculate tokens per second for this episode
             tokens_per_sec = episode_tokens / episode_time if episode_time > 0 else 0
 
-            # Episode-level averaged metrics
-            avg_metrics = {
-                "total_loss": sum_total_loss / update_epochs,
-                "pg_loss": sum_pg_loss / update_epochs,
-                "kl_divergence": sum_kl / update_epochs,
-                "reward_mean": sum_reward_mean / update_epochs,
-                "reward_std": sum_reward_std / update_epochs,
-                "format_reward_mean": sum_format_reward_mean / update_epochs,
-                "correctness_reward_mean": sum_correctness_reward_mean / update_epochs,
-                "tokens_generated": sum_tokens_generated / update_epochs,
-            }
-
             # Store metrics
             training_metrics["episode"].append(episode)
-            training_metrics["total_loss"].append(avg_metrics["total_loss"])
-            training_metrics["pg_loss"].append(avg_metrics["pg_loss"])
-            training_metrics["kl_divergence"].append(avg_metrics["kl_divergence"])
-            training_metrics["reward_mean"].append(avg_metrics["reward_mean"])
-            training_metrics["reward_std"].append(avg_metrics.get("reward_std", 0.0))
-            training_metrics["format_reward_mean"].append(avg_metrics["format_reward_mean"])
-            training_metrics["correctness_reward_mean"].append(avg_metrics["correctness_reward_mean"])
-            training_metrics["tokens_generated"].append(avg_metrics.get("tokens_generated", 0))
+            training_metrics["total_loss"].append(metrics["total_loss"])
+            training_metrics["pg_loss"].append(metrics["pg_loss"])
+            training_metrics["kl_divergence"].append(metrics["kl_divergence"])
+            training_metrics["reward_mean"].append(metrics["reward_mean"])
+            training_metrics["reward_std"].append(metrics.get("reward_std", 0.0))
+            training_metrics["format_reward_mean"].append(metrics["format_reward_mean"])
+            training_metrics["correctness_reward_mean"].append(metrics["correctness_reward_mean"])
+            training_metrics["tokens_generated"].append(metrics.get("tokens_generated", 0))
             training_metrics["episode_time"].append(episode_time)
             training_metrics["total_tokens"].append(cumulative_tokens)
             training_metrics["tokens_per_second"].append(tokens_per_sec)
@@ -1130,12 +1136,12 @@ class GRPO(BaseAlgorithm):
             # Logging
             if episode % log_interval == 0:
                 print(f"Episode {int(episode):3d} | "
-                      f"Loss: {avg_metrics['total_loss']:7.4f} | "
-                      f"PG Loss: {avg_metrics['pg_loss']:7.4f} | "
-                      f"KL: {avg_metrics['kl_divergence']:7.4f} | "
-                      f"Reward: {avg_metrics['reward_mean']:6.3f} ± {avg_metrics.get('reward_std', 0.0):5.3f} | "
-                      f"Fmt: {avg_metrics['format_reward_mean']:5.3f} | "
-                      f"Correct: {avg_metrics['correctness_reward_mean']:5.3f} | "
+                      f"Loss: {metrics['total_loss']:7.4f} | "
+                      f"PG Loss: {metrics['pg_loss']:7.4f} | "
+                      f"KL: {metrics['kl_divergence']:7.4f} | "
+                      f"Reward: {metrics['reward_mean']:6.3f} ± {metrics.get('reward_std', 0.0):5.3f} | "
+                      f"Fmt: {metrics['format_reward_mean']:5.3f} | "
+                      f"Correct: {metrics['correctness_reward_mean']:5.3f} | "
                       f"Tokens: {int(episode_tokens):5d} | "
                       f"Time: {episode_time:5.2f}s | "
                       f"Speed: {tokens_per_sec:6.1f} tok/s")
@@ -1227,7 +1233,7 @@ class GRPO(BaseAlgorithm):
         with torch.no_grad():
             for _ in range(num_episodes):
                 prompts = [f"Test {i}: Calculate {i}*2" for i in range(4)]
-                _, _, rewards, _, _, _ = self.generate_trajectories(prompts)
+                _, _, rewards, _, _, _, _, _, _, _, _ = self.generate_trajectories(prompts)
                 total_rewards.extend(rewards.cpu().numpy())
 
         self.policy.train()
@@ -1239,10 +1245,12 @@ class GRPO(BaseAlgorithm):
 
     def save_checkpoint(self, path: str):
         """Save model checkpoint."""
+        # Handle case where ref_policy may be None (when kl_coef=0)
+        ref_policy_state = self.ref_policy.state_dict() if self.ref_policy is not None else None
         save_checkpoint(
             path,
             self.policy.state_dict(),
-            self.ref_policy.state_dict(),
+            ref_policy_state,
             self.optimizer.state_dict(),
             self.config,
             self.total_steps,
@@ -1253,7 +1261,9 @@ class GRPO(BaseAlgorithm):
         """Load model checkpoint."""
         checkpoint = load_checkpoint(path, self.device)
         self.policy.load_state_dict(checkpoint["policy_state_dict"])
-        self.ref_policy.load_state_dict(checkpoint["ref_policy_state_dict"])
+        # Only load ref_policy if it exists and was saved (may be None when kl_coef=0)
+        if self.ref_policy is not None and checkpoint.get("ref_policy_state_dict") is not None:
+            self.ref_policy.load_state_dict(checkpoint["ref_policy_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.total_steps = checkpoint.get("total_steps", 0)
         self.episode = checkpoint.get("episode", 0)

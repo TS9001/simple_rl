@@ -50,8 +50,12 @@ def create_optimizer(model: torch.nn.Module, config: Dict[str, Any]) -> torch.op
 
     optimizer_kwargs: Dict[str, Any] = {"lr": lr, "betas": betas, "eps": eps}
 
+    # Apply weight_decay for both Adam and AdamW (both support it)
+    weight_decay = optimizer_cfg.get("weight_decay", 0.0)
+    if weight_decay > 0:
+        optimizer_kwargs["weight_decay"] = weight_decay
+
     if optimizer_type == "adamw":
-        optimizer_kwargs["weight_decay"] = optimizer_cfg.get("weight_decay", 0.0)
         optimizer_class = torch.optim.AdamW
     else:
         optimizer_class = torch.optim.Adam

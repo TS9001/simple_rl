@@ -39,6 +39,13 @@ class ModelCompilationManager:
         # Determine current target
         target_type = getattr(device, "type", None)
 
+        # Skip compile on MPS by default (usually slower/unstable)
+        if target_type == "mps":
+            disable_mps_compile = compile_cfg.get("disable_on_mps", True)
+            if disable_mps_compile:
+                self._compiled_device_type = "disabled"
+                return model
+
         if target_type == "cpu":
             # Defer compilation until the module is moved to an accelerated backend
             self._compiled_device_type = None

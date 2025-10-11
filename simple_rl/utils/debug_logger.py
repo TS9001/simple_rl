@@ -15,15 +15,35 @@ import json
 class GRPODebugLogger:
     """Debug logger for GRPO training diagnostics."""
 
-    def __init__(self, log_dir: str = "debug_logs", enabled: bool = True):
+    def __init__(
+        self,
+        log_dir: str = "debug_logs",
+        enabled: bool = True,
+        debug_generation: bool = False,
+        debug_alignment: bool = False,
+        debug_advantages: bool = False,
+        debug_loss: bool = False,
+        debug_gradients: bool = False,
+    ):
         """
         Initialize debug logger.
 
         Args:
             log_dir: Directory to store debug logs
-            enabled: Whether logging is enabled
+            enabled: Master switch - whether ANY logging is enabled
+            debug_generation: Log generation details (token counts, EOS, etc.)
+            debug_alignment: Log alignment between OLD and NEW log probs
+            debug_advantages: Log advantage computation details
+            debug_loss: Log loss computation details
+            debug_gradients: Log gradient norms and clipping
         """
         self.enabled = enabled
+        self.debug_generation = debug_generation and enabled
+        self.debug_alignment = debug_alignment and enabled
+        self.debug_advantages = debug_advantages and enabled
+        self.debug_loss = debug_loss and enabled
+        self.debug_gradients = debug_gradients and enabled
+
         if not self.enabled:
             return
 
@@ -40,6 +60,12 @@ class GRPODebugLogger:
             f.write("GRPO DEBUG LOG\n")
             f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("=" * 80 + "\n\n")
+            f.write(f"Debug flags:\n")
+            f.write(f"  generation: {self.debug_generation}\n")
+            f.write(f"  alignment: {self.debug_alignment}\n")
+            f.write(f"  advantages: {self.debug_advantages}\n")
+            f.write(f"  loss: {self.debug_loss}\n")
+            f.write(f"  gradients: {self.debug_gradients}\n\n")
 
         print(f"✓ Debug logging enabled: {self.log_file}")
 
@@ -455,6 +481,317 @@ class GRPODebugLogger:
 
         self._write(f"\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         self._write("\n")
+
+    def log_generation_debug(
+        self,
+        temperature: float,
+        max_new_tokens: int,
+        eos_token_id: Any,
+        device: torch.device,
+        model_dtype: Any = None,
+        total_sequences: int = 0,
+        total_tokens_generated: int = 0,
+        avg_tokens_per_seq: float = 0.0,
+        completion_lengths: Optional[torch.Tensor] = None,
+        has_eos_count: int = 0,
+    ):
+        """Log generation configuration and statistics."""
+        if not self.debug_generation:
+            return
+
+        print(f"\n🔍 GENERATION DEBUG:")
+        print(f"  Temperature: {temperature}")
+        print(f"  Max new tokens: {max_new_tokens}")
+        print(f"  EOS token ID: {eos_token_id}")
+        print(f"  Device: {device}")
+        if model_dtype is not None:
+            print(f"  Model dtype: {model_dtype}")
+
+        if total_sequences > 0:
+            print(f"  Total tokens generated: {total_tokens_generated}")
+            print(f"  Avg tokens/sequence: {avg_tokens_per_seq:.1f}")
+
+        if completion_lengths is not None:
+            print(f"  Completion lengths - min: {completion_lengths.min().item()}, "
+                  f"max: {completion_lengths.max().item()}, "
+                  f"mean: {completion_lengths.float().mean().item():.1f}, "
+                  f"std: {completion_lengths.float().std().item():.1f}")
+
+        if total_sequences > 0:
+            print(f"  Sequences with EOS: {has_eos_count}/{total_sequences}")
+
+    def log_alignment_generation(
+        self,
+        batch_idx: int,
+        total_sequences: int,
+        seq_len: int,
+        max_completion_len: int,
+        logits_start_pos: int,
+        policy_log_probs: torch.Tensor,
+        ref_log_probs: torch.Tensor,
+        completion_ids: torch.Tensor,
+        completion_mask: torch.Tensor,
+        generated_ids: torch.Tensor,
+        replicated_prompt_end_positions: torch.Tensor,
+        actual_completion_lengths: torch.Tensor,
+        completion_start_in_logits: torch.Tensor,
+    ):
+        """Log alignment verification during generation (writes to file)."""
+        if not self.debug_alignment or batch_idx != 1:
+            return
+
+        # Print to console
+        print(f"\n🔍 Alignment debug flag: {self.debug_alignment}")
+
+        # Write detailed logs to file
+        filepath = self.log_dir / "generation_extraction.txt"
+        with open(filepath, "w") as f:
+            f.write(f"=== GENERATION TRAJECTORY EXTRACTION (Batch {batch_idx}) ===\n")
+            f.write(f"total_sequences: {total_sequences}\n")
+            f.write(f"seq_len (generated_ids): {seq_len}\n")
+            f.write(f"max_completion_len: {max_completion_len}\n")
+            f.write(f"logits_start_pos: {logits_start_pos}\n")
+            f.write(f"policy_log_probs.shape: {policy_log_probs.shape}\n")
+            f.write(f"ref_log_probs.shape: {ref_log_probs.shape}\n")
+            f.write(f"completion_ids.shape: {completion_ids.shape}\n")
+            f.write(f"completion_mask.shape: {completion_mask.shape}\n\n")
+
+            # Log first 3 sequences in detail
+            for seq_idx in range(min(3, total_sequences)):
+                f.write(f"\n--- Sequence {seq_idx} ---\n")
+                f.write(f"  prompt_end_position: {replicated_prompt_end_positions[seq_idx].item()}\n")
+                f.write(f"  actual_completion_length: {actual_completion_lengths[seq_idx].item()}\n")
+                f.write(f"  completion_start_in_logits: {completion_start_in_logits[seq_idx].item()}\n")
+
+                # Show FULL generated sequence
+                gen_seq = generated_ids[seq_idx]
+                prompt_end = int(replicated_prompt_end_positions[seq_idx].item())
+                f.write(f"  generated_ids[:20]: {gen_seq[:20].tolist()}\n")
+                f.write(f"  generated_ids[{prompt_end}:{prompt_end+20}] (completion start): {gen_seq[prompt_end:prompt_end+20].tolist()}\n")
+                f.write(f"  generated_ids[-20:]: {gen_seq[-20:].tolist()}\n")
+
+                # Show completion tokens
+                comp_ids = completion_ids[seq_idx, :min(20, int(actual_completion_lengths[seq_idx]))]
+                f.write(f"  completion_ids[:20]: {comp_ids.tolist()}\n")
+
+                # Verify extraction is correct
+                f.write(f"  VERIFICATION: generated_ids[{prompt_end}] == completion_ids[0]? ")
+                f.write(f"{gen_seq[prompt_end].item()} == {completion_ids[seq_idx, 0].item()} -> ")
+                f.write(f"{'✓ MATCH' if gen_seq[prompt_end].item() == completion_ids[seq_idx, 0].item() else '✗ MISMATCH'}\n")
+
+                # Show gather indices
+                gather_start = completion_start_in_logits[seq_idx].item()
+                f.write(f"  gather_indices[0:10]: {list(range(int(gather_start), int(gather_start + 10)))}\n")
+
+            # Log extracted log probs
+            f.write(f"\n=== EXTRACTED LOG PROBS ===\n")
+            for seq_idx in range(min(3, total_sequences)):
+                actual_len = int(actual_completion_lengths[seq_idx])
+                seq_policy_lp = policy_log_probs[seq_idx, :actual_len]
+                seq_mask = completion_mask[seq_idx, :actual_len]
+                f.write(f"\n--- Sequence {seq_idx} ---\n")
+                f.write(f"  policy_log_probs[:10]: {seq_policy_lp[:10].tolist()}\n")
+                f.write(f"  completion_mask[:10]: {seq_mask[:10].tolist()}\n")
+                f.write(f"  sum(policy_log_probs * mask): {(seq_policy_lp * seq_mask).sum().item()}\n")
+
+    def log_alignment_minibatch(
+        self,
+        mb_idx: int,
+        batch_size: int,
+        seq_len: int,
+        mb_max_completion_len: int,
+        logits_start_pos: int,
+        mb_full_log_probs: torch.Tensor,
+        mb_completion_mask: torch.Tensor,
+        mb_indices: torch.Tensor,
+        mb_old_log_probs: torch.Tensor,
+        mb_new_log_probs: torch.Tensor,
+        mb_prompt_end_positions: torch.Tensor,
+        valid_indices_mask: torch.Tensor,
+    ):
+        """Log alignment verification during minibatch recompute (writes to file)."""
+        if not self.debug_alignment or mb_idx > 2:
+            return
+
+        filepath = self.log_dir / f"minibatch_{mb_idx}_extraction.txt"
+        with open(filepath, "w") as f:
+            f.write(f"=== MINIBATCH {mb_idx} RECOMPUTE EXTRACTION ===\n")
+            f.write(f"batch_size: {batch_size}\n")
+            f.write(f"seq_len (mb_generated_ids): {seq_len}\n")
+            f.write(f"mb_max_completion_len: {mb_max_completion_len}\n")
+            f.write(f"logits_start_pos: {logits_start_pos}\n")
+            f.write(f"mb_full_log_probs.shape: {mb_full_log_probs.shape}\n")
+            f.write(f"mb_completion_mask.shape: {mb_completion_mask.shape}\n")
+            f.write(f"mb_indices: {mb_indices.tolist()[:5]}... (first 5)\n\n")
+
+            # Log first 3 sequences in detail
+            for seq_idx in range(min(3, batch_size)):
+                orig_idx = mb_indices[seq_idx].item()
+                f.write(f"\n--- Minibatch seq {seq_idx} (original idx={orig_idx}) ---\n")
+                f.write(f"  prompt_end_position: {mb_prompt_end_positions[seq_idx].item()}\n")
+                f.write(f"  completion_start_in_logits: {(mb_prompt_end_positions[seq_idx] - logits_start_pos).item()}\n")
+
+                # Show old log probs for comparison
+                old_lp_sum = (mb_old_log_probs[seq_idx] * mb_completion_mask[seq_idx]).sum().item()
+                f.write(f"  OLD log_probs sum: {old_lp_sum}\n")
+                f.write(f"  OLD log_probs[:10]: {mb_old_log_probs[seq_idx, :10].tolist()}\n")
+
+            # Log extracted NEW log probs
+            f.write(f"\n=== EXTRACTED NEW LOG PROBS ===\n")
+            for seq_idx in range(min(3, batch_size)):
+                orig_idx = mb_indices[seq_idx].item()
+                new_lp_sum = (mb_new_log_probs[seq_idx] * mb_completion_mask[seq_idx]).sum().item()
+                f.write(f"\n--- Minibatch seq {seq_idx} (original idx={orig_idx}) ---\n")
+                f.write(f"  NEW log_probs[:10]: {mb_new_log_probs[seq_idx, :10].tolist()}\n")
+                f.write(f"  NEW log_probs sum: {new_lp_sum}\n")
+                f.write(f"  completion_mask[:10]: {mb_completion_mask[seq_idx, :10].tolist()}\n")
+                f.write(f"  valid_indices_mask[:10]: {valid_indices_mask[seq_idx, :10].tolist()}\n")
+
+    def log_advantages_debug(
+        self,
+        rewards: torch.Tensor,
+        group_size: int,
+        normalize_within_groups: bool,
+        num_groups: int,
+        group_mean: Optional[torch.Tensor] = None,
+        group_std: Optional[torch.Tensor] = None,
+        normalized_rewards: Optional[torch.Tensor] = None,
+        advantages: Optional[torch.Tensor] = None,
+        small_std_count: int = 0,
+        clipped_count: int = 0,
+    ):
+        """Log advantage computation debug information."""
+        if not self.debug_advantages:
+            return
+
+        print(f"\n🔍 ADVANTAGE COMPUTATION DEBUG:")
+        print(f"  rewards - shape: {rewards.shape}, min: {rewards.min().item():.4f}, "
+              f"max: {rewards.max().item():.4f}, mean: {rewards.mean().item():.4f}, "
+              f"std: {rewards.std().item():.4f}")
+        print(f"  group_size: {group_size}, normalize_within_groups: {normalize_within_groups}")
+
+        if normalize_within_groups and group_size > 1:
+            print(f"  num_groups: {num_groups}")
+            if group_mean is not None:
+                print(f"  group_mean - min: {group_mean.min().item():.4f}, "
+                      f"max: {group_mean.max().item():.4f}, mean: {group_mean.mean().item():.4f}")
+            if group_std is not None:
+                print(f"  group_std - min: {group_std.min().item():.4f}, "
+                      f"max: {group_std.max().item():.4f}, mean: {group_std.mean().item():.4f}")
+            if small_std_count > 0:
+                print(f"  WARNING: {small_std_count} groups have std < 1e-3")
+
+            if normalized_rewards is not None:
+                print(f"  normalized_rewards (before clipping) - min: {normalized_rewards.min().item():.4f}, "
+                      f"max: {normalized_rewards.max().item():.4f}")
+
+        if advantages is not None:
+            print(f"  advantages (after clipping) - min: {advantages.min().item():.4f}, "
+                  f"max: {advantages.max().item():.4f}, mean: {advantages.mean().item():.4f}")
+            if clipped_count > 0:
+                print(f"  WARNING: {clipped_count} advantages were clipped")
+
+    def log_loss_debug(
+        self,
+        new_log_probs: torch.Tensor,
+        old_log_probs: torch.Tensor,
+        advantages: torch.Tensor,
+        completion_mask: torch.Tensor,
+        ref_log_probs: Optional[torch.Tensor] = None,
+        new_log_probs_sum: Optional[torch.Tensor] = None,
+        old_log_probs_sum: Optional[torch.Tensor] = None,
+        ratio: Optional[torch.Tensor] = None,
+        surr1: Optional[torch.Tensor] = None,
+        surr2: Optional[torch.Tensor] = None,
+        policy_loss: Optional[float] = None,
+        kl_penalty: Optional[float] = None,
+        entropy: Optional[float] = None,
+        entropy_coef: float = 0.01,
+        kl_coef: float = 0.0,
+        loss: Optional[float] = None,
+    ):
+        """Log loss computation debug information."""
+        if not self.debug_loss:
+            return
+
+        print(f"\n🔍 LOSS COMPUTATION DEBUG:")
+        print(f"  new_log_probs - shape: {new_log_probs.shape}, min: {new_log_probs.min().item():.4f}, "
+              f"max: {new_log_probs.max().item():.4f}, mean: {new_log_probs.mean().item():.4f}")
+        print(f"  old_log_probs - shape: {old_log_probs.shape}, min: {old_log_probs.min().item():.4f}, "
+              f"max: {old_log_probs.max().item():.4f}, mean: {old_log_probs.mean().item():.4f}")
+        print(f"  advantages - shape: {advantages.shape}, min: {advantages.min().item():.4f}, "
+              f"max: {advantages.max().item():.4f}, mean: {advantages.mean().item():.4f}")
+        print(f"  completion_mask - shape: {completion_mask.shape}, sum: {completion_mask.sum().item()}")
+
+        if new_log_probs_sum is not None and old_log_probs_sum is not None:
+            print(f"  new_log_probs_sum - min: {new_log_probs_sum.min().item():.4f}, "
+                  f"max: {new_log_probs_sum.max().item():.4f}, mean: {new_log_probs_sum.mean().item():.4f}")
+            print(f"  old_log_probs_sum - min: {old_log_probs_sum.min().item():.4f}, "
+                  f"max: {old_log_probs_sum.max().item():.4f}, mean: {old_log_probs_sum.mean().item():.4f}")
+
+        if ratio is not None:
+            log_ratio = new_log_probs_sum - old_log_probs_sum if new_log_probs_sum is not None else None
+            if log_ratio is not None:
+                print(f"  log_ratio (new - old) - min: {log_ratio.min().item():.4f}, "
+                      f"max: {log_ratio.max().item():.4f}")
+            print(f"  ratio - min: {ratio.min().item():.4f}, max: {ratio.max().item():.4f}, "
+                  f"mean: {ratio.mean().item():.4f}")
+            print(f"  ratio > 10: {(ratio > 10).sum().item()} sequences")
+            print(f"  ratio < 0.1: {(ratio < 0.1).sum().item()} sequences")
+
+        if surr1 is not None and surr2 is not None:
+            print(f"  surr1 - min: {surr1.min().item():.4f}, max: {surr1.max().item():.4f}, "
+                  f"mean: {surr1.mean().item():.4f}")
+            print(f"  surr2 - min: {surr2.min().item():.4f}, max: {surr2.max().item():.4f}, "
+                  f"mean: {surr2.mean().item():.4f}")
+
+        if policy_loss is not None:
+            print(f"  policy_loss (before KL/entropy): {policy_loss:.4f}")
+
+        if ref_log_probs is not None:
+            print(f"  ref_log_probs - min: {ref_log_probs.min().item():.4f}, "
+                  f"max: {ref_log_probs.max().item():.4f}, mean: {ref_log_probs.mean().item():.4f}")
+
+        if kl_penalty is not None:
+            print(f"  kl_penalty (raw): {kl_penalty:.4f}")
+            print(f"  kl_penalty * kl_coef: {(kl_coef * kl_penalty):.4f}")
+
+        if entropy is not None:
+            print(f"  entropy (raw): {entropy:.4f}")
+            print(f"  entropy * entropy_coef: {(entropy_coef * entropy):.4f}")
+
+        if loss is not None:
+            print(f"  TOTAL LOSS: {loss:.4f}")
+            if policy_loss is not None and kl_penalty is not None and entropy is not None:
+                print(f"    = policy_loss: {policy_loss:.4f}")
+                print(f"    + kl_term: {(kl_coef * kl_penalty):.4f}")
+                print(f"    - entropy_term: {(entropy_coef * entropy):.4f}")
+
+    def log_gradients_debug(
+        self,
+        mb_idx: int,
+        policy_parameters: Any,
+        gradient_clip: float,
+        norm_before: Optional[float] = None,
+        norm_after: Optional[float] = None,
+    ):
+        """Log gradient norms and clipping debug information."""
+        if not self.debug_gradients:
+            return
+
+        print(f"\n🔍 GRADIENT DEBUG (minibatch {mb_idx}):")
+
+        if norm_before is not None:
+            print(f"  Gradient norm before clipping: {norm_before:.4f}")
+
+        if norm_after is not None:
+            print(f"  Gradient norm after clipping: {norm_after:.4f}")
+            print(f"  Max allowed gradient norm: {gradient_clip}")
+
+            if norm_before is not None and norm_before > gradient_clip:
+                print(f"  ✓ Gradients were clipped: {norm_before:.4f} → {norm_after:.4f}")
+            else:
+                print(f"  ✓ No clipping needed (norm was {norm_before:.4f})" if norm_before else "  ✓ No clipping needed")
 
     def flush(self):
         """Ensure all logs are written to file."""
