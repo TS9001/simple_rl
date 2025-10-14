@@ -153,3 +153,6 @@ plans/*
 
 # generated files
 notebooks/cot_archive/*
+# Dataset cache
+dataset_cache/
+cot_archive/*

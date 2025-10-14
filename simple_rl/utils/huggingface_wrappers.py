@@ -1,8 +1,11 @@
 """HuggingFace model wrappers and utilities."""
 
 import os
+import json
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -200,13 +203,33 @@ class LanguageModel(nn.Module):
 
         Returns:
             Log probabilities [batch_size, seq_len-1] or [batch_size, logits_to_keep]
+            Note: Padding positions (where attention_mask=0) will have log_prob=0.0
         """
+        original_seq_len = input_ids.size(1)
+        left_pad_removed = 0
+
+        # OPTIMIZATION: Remove left padding before computing log probs to save computation
+        if attention_mask is not None:
+            # Find where content starts for each sequence (first non-zero in mask)
+            first_valid = (attention_mask != 0).int().argmax(dim=1)  # [batch_size]
+            min_left_pad = first_valid.min().item()
+
+            if min_left_pad > 0:
+                # Remove common left padding from all sequences
+                input_ids = input_ids[:, min_left_pad:]
+                attention_mask = attention_mask[:, min_left_pad:]
+                left_pad_removed = min_left_pad
+
         # Get logits from model (full forward pass with complete context)
         logits = self.forward(input_ids, attention_mask=attention_mask)
 
         # Shift logits and labels for next token prediction
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = input_ids[:, 1:].contiguous()
+
+        # Also shift attention mask to align with shifted labels
+        if attention_mask is not None:
+            shift_attention_mask = attention_mask[:, 1:].contiguous()
 
         # If logits_to_keep specified, only keep last N positions
         # (saves memory in log_softmax and gather operations)
@@ -219,23 +242,41 @@ class LanguageModel(nn.Module):
                 start_idx = actual_seq_len - logits_to_keep
                 shift_logits = shift_logits[:, start_idx:, :]
                 shift_labels = shift_labels[:, start_idx:]
+                if attention_mask is not None:
+                    shift_attention_mask = shift_attention_mask[:, start_idx:]
 
-        # Compute log probabilities
-        # MPS workaround: For large vocab sizes, move to CPU for log_softmax if on MPS
-        if shift_logits.device.type == 'mps' and shift_logits.size(-1) > 100000:
-            # Move to CPU for log_softmax computation (MPS has issues with large vocab)
+        # MPS WORKAROUND: Compute log probs on CPU for large vocab sizes
+        # MPS has numerical precision issues with large vocabulary log_softmax + gather operations
+        # This causes incorrect zero values in computed log probabilities
+        if shift_logits.device.type == 'mps' and shift_logits.size(-1) > 50000:
             original_device = shift_logits.device
-            shift_logits_cpu = shift_logits.to('cpu')
-            log_probs_all = F.log_softmax(shift_logits_cpu, dim=-1)
-            log_probs_all = log_probs_all.to(original_device)
-            del shift_logits_cpu
-        else:
-            log_probs_all = F.log_softmax(shift_logits, dim=-1)
 
-        # Gather log probs for actual tokens
-        log_probs = torch.gather(
-            log_probs_all, dim=-1, index=shift_labels.unsqueeze(-1)
-        ).squeeze(-1)
+            # Move to CPU for computation
+            shift_logits_cpu = shift_logits.to('cpu')
+            shift_labels_cpu = shift_labels.to('cpu')
+
+            # Compute on CPU
+            log_probs_all_cpu = F.log_softmax(shift_logits_cpu, dim=-1)
+            log_probs_cpu = torch.gather(
+                log_probs_all_cpu, dim=-1, index=shift_labels_cpu.unsqueeze(-1)
+            ).squeeze(-1)
+
+            # Move result back to original device
+            log_probs = log_probs_cpu.to(original_device)
+
+            # Clean up CPU tensors
+            del shift_logits_cpu, shift_labels_cpu, log_probs_all_cpu, log_probs_cpu
+        else:
+            # Standard computation on device
+            log_probs_all = F.log_softmax(shift_logits, dim=-1)
+            log_probs = torch.gather(
+                log_probs_all, dim=-1, index=shift_labels.unsqueeze(-1)
+            ).squeeze(-1)
+
+        # CRITICAL FIX: Mask out padding positions
+        # Set log probs to 0.0 for padding tokens (where attention_mask=0)
+        if attention_mask is not None:
+            log_probs = log_probs * shift_attention_mask.float()
 
         return log_probs
 

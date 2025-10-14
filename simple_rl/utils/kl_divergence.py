@@ -21,6 +21,7 @@ def compute_kl_divergence(
     estimator: str = "k3",
     clamp_min: float = -5.0,
     clamp_max: float = 5.0,
+    reduction: str = "mean",
 ) -> torch.Tensor:
     """
     Compute KL divergence between reference and new policy distributions.
@@ -32,9 +33,10 @@ def compute_kl_divergence(
         estimator: KL estimator type ("mc", "k3", "abs", or "mse")
         clamp_min: Minimum value for log ratio clamping (default: -5.0)
         clamp_max: Maximum value for log ratio clamping (default: 5.0)
+        reduction: How to aggregate KL ("mean" = average per token, "sum" = sum over tokens)
 
     Returns:
-        Scalar KL divergence value (mean over valid tokens)
+        Scalar KL divergence value (mean or sum over valid tokens)
 
     Estimator types:
         - "mc": Monte Carlo approximation (simple difference, can be negative)
@@ -43,13 +45,13 @@ def compute_kl_divergence(
         - "mse": Mean squared error of log ratio (biased but low variance)
     """
     if estimator == "mc":
-        return compute_kl_mc(ref_log_probs, new_log_probs, mask)
+        return compute_kl_mc(ref_log_probs, new_log_probs, mask, reduction)
     elif estimator == "k3":
-        return compute_kl_k3(ref_log_probs, new_log_probs, mask, clamp_min, clamp_max)
+        return compute_kl_k3(ref_log_probs, new_log_probs, mask, clamp_min, clamp_max, reduction)
     elif estimator == "abs":
-        return compute_kl_abs(ref_log_probs, new_log_probs, mask)
+        return compute_kl_abs(ref_log_probs, new_log_probs, mask, reduction)
     elif estimator == "mse":
-        return compute_kl_mse(ref_log_probs, new_log_probs, mask)
+        return compute_kl_mse(ref_log_probs, new_log_probs, mask, reduction)
     else:
         raise ValueError(
             f"Unknown estimator: {estimator}. Choose from: 'mc', 'k3', 'abs', 'mse'"
@@ -60,6 +62,7 @@ def compute_kl_mc(
     ref_log_probs: torch.Tensor,
     new_log_probs: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
+    reduction: str = "mean",
 ) -> torch.Tensor:
     """
     Monte Carlo approximation of KL divergence.
@@ -74,9 +77,10 @@ def compute_kl_mc(
         ref_log_probs: Log probabilities from reference policy [batch, seq_len]
         new_log_probs: Log probabilities from new policy [batch, seq_len]
         mask: Optional mask for valid tokens [batch, seq_len]
+        reduction: How to aggregate KL ("mean" = average per token, "sum" = sum over tokens)
 
     Returns:
-        Scalar KL divergence (mean over valid tokens)
+        Scalar KL divergence (mean or sum over valid tokens)
 
     Example:
         >>> ref = torch.tensor([[-1.0, -2.0], [-0.5, -1.5]])
@@ -88,10 +92,16 @@ def compute_kl_mc(
     kl_per_token = ref_log_probs - new_log_probs
 
     if mask is not None:
-        # Average over valid tokens only
-        return (kl_per_token * mask).sum() / (mask.sum() + 1e-8)
+        kl_sum = (kl_per_token * mask).sum()
+        if reduction == "mean":
+            return kl_sum / (mask.sum() + 1e-8)
+        else:  # "sum"
+            return kl_sum
     else:
-        return kl_per_token.mean()
+        if reduction == "mean":
+            return kl_per_token.mean()
+        else:  # "sum"
+            return kl_per_token.sum()
 
 
 def compute_kl_k3(
@@ -100,6 +110,7 @@ def compute_kl_k3(
     mask: Optional[torch.Tensor] = None,
     clamp_min: float = -5.0,
     clamp_max: float = 5.0,
+    reduction: str = "mean",
 ) -> torch.Tensor:
     """
     Low-variance unbiased KL divergence estimator (k3).
@@ -118,9 +129,10 @@ def compute_kl_k3(
         mask: Optional mask for valid tokens [batch, seq_len]
         clamp_min: Minimum value for log ratio (default: -5.0)
         clamp_max: Maximum value for log ratio (default: 5.0)
+        reduction: How to aggregate KL ("mean" = average per token, "sum" = sum over tokens)
 
     Returns:
-        Scalar KL divergence (mean over valid tokens)
+        Scalar KL divergence (mean or sum over valid tokens)
 
     Example with clamp_max=5.0:
         - If log_ratio = 5.0: kl = exp(5) - 5 - 1 ≈ 148 - 5 - 1 = 142
@@ -146,16 +158,23 @@ def compute_kl_k3(
     kl_per_token = ratio - 1.0 - log_ratio
 
     if mask is not None:
-        # Average over valid tokens only
-        return (kl_per_token * mask).sum() / (mask.sum() + 1e-8)
+        kl_sum = (kl_per_token * mask).sum()
+        if reduction == "mean":
+            return kl_sum / (mask.sum() + 1e-8)
+        else:  # "sum"
+            return kl_sum
     else:
-        return kl_per_token.mean()
+        if reduction == "mean":
+            return kl_per_token.mean()
+        else:  # "sum"
+            return kl_per_token.sum()
 
 
 def compute_kl_abs(
     ref_log_probs: torch.Tensor,
     new_log_probs: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
+    reduction: str = "mean",
 ) -> torch.Tensor:
     """
     Absolute difference KL estimator.
@@ -169,22 +188,31 @@ def compute_kl_abs(
         ref_log_probs: Log probabilities from reference policy [batch, seq_len]
         new_log_probs: Log probabilities from new policy [batch, seq_len]
         mask: Optional mask for valid tokens [batch, seq_len]
+        reduction: How to aggregate KL ("mean" = average per token, "sum" = sum over tokens)
 
     Returns:
-        Scalar KL divergence (mean over valid tokens)
+        Scalar KL divergence (mean or sum over valid tokens)
     """
     kl_per_token = torch.abs(ref_log_probs - new_log_probs)
 
     if mask is not None:
-        return (kl_per_token * mask).sum() / (mask.sum() + 1e-8)
+        kl_sum = (kl_per_token * mask).sum()
+        if reduction == "mean":
+            return kl_sum / (mask.sum() + 1e-8)
+        else:  # "sum"
+            return kl_sum
     else:
-        return kl_per_token.mean()
+        if reduction == "mean":
+            return kl_per_token.mean()
+        else:  # "sum"
+            return kl_per_token.sum()
 
 
 def compute_kl_mse(
     ref_log_probs: torch.Tensor,
     new_log_probs: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
+    reduction: str = "mean",
 ) -> torch.Tensor:
     """
     Mean squared error KL estimator (k2).
@@ -198,9 +226,10 @@ def compute_kl_mse(
         ref_log_probs: Log probabilities from reference policy [batch, seq_len]
         new_log_probs: Log probabilities from new policy [batch, seq_len]
         mask: Optional mask for valid tokens [batch, seq_len]
+        reduction: How to aggregate KL ("mean" = average per token, "sum" = sum over tokens)
 
     Returns:
-        Scalar KL divergence (mean over valid tokens)
+        Scalar KL divergence (mean or sum over valid tokens)
 
     Reference:
         John Schulman's blog: http://joschu.net/blog/kl-approx.html
@@ -209,9 +238,16 @@ def compute_kl_mse(
     kl_per_token = 0.5 * log_diff ** 2
 
     if mask is not None:
-        return (kl_per_token * mask).sum() / (mask.sum() + 1e-8)
+        kl_sum = (kl_per_token * mask).sum()
+        if reduction == "mean":
+            return kl_sum / (mask.sum() + 1e-8)
+        else:  # "sum"
+            return kl_sum
     else:
-        return kl_per_token.mean()
+        if reduction == "mean":
+            return kl_per_token.mean()
+        else:  # "sum"
+            return kl_per_token.sum()
 
 
 def compute_kl_true(

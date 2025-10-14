@@ -208,9 +208,29 @@ def evaluate_on_gsm8k(
         # GRPO instance
         device = model_or_algo.device
 
+        # Build stopping criteria from GRPO config (if available)
+        stopping_criteria = None
+        if hasattr(model_or_algo, 'stop_sequences') and hasattr(model_or_algo, 'use_multi_token_stopping'):
+            if model_or_algo.use_multi_token_stopping:
+                from transformers import StoppingCriteriaList
+                # Import stopping criteria class from GRPO
+                from simple_rl.algorithms.grpo import MultiTokenStoppingCriteria
+
+                stopping_criteria = StoppingCriteriaList([
+                    MultiTokenStoppingCriteria(
+                        stop_sequences=model_or_algo.stop_sequences,
+                        tokenizer=tokenizer,
+                        prompt_length=0  # Will be updated per generation
+                    )
+                ])
+
         def generate_fn(prompt_text):
             inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=512)
             inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            # Update stopping criteria prompt length for this specific generation
+            if stopping_criteria is not None:
+                stopping_criteria[0].prompt_length = inputs["input_ids"].shape[1]
 
             with torch.no_grad():
                 generated_ids, _ = model_or_algo.policy.generate(
@@ -220,6 +240,7 @@ def evaluate_on_gsm8k(
                     temperature=temperature,
                     do_sample=sample,
                     top_p=top_p,
+                    stopping_criteria=stopping_criteria,  # ✓ Now includes stopping!
                 )
 
             # Extract completion
@@ -346,7 +367,8 @@ def evaluate_on_gsm8k(
             format_compliant += 1
 
         # Calculate correctness reward (no partial credit for evaluation)
-        correct_score = compute_correctness_reward(completion, correct_answer, partial_credit=False)
+        # compute_correctness_reward returns (correctness, model_num, gold_num)
+        correct_score, _, _ = compute_correctness_reward(completion, correct_answer, partial_credit=False)
         total_correctness_score += correct_score
 
         # Store result
@@ -487,9 +509,29 @@ def demonstrate_model_responses(
         # GRPO instance
         device = model_or_algo.device
 
+        # Build stopping criteria from GRPO config (if available)
+        stopping_criteria = None
+        if hasattr(model_or_algo, 'stop_sequences') and hasattr(model_or_algo, 'use_multi_token_stopping'):
+            if model_or_algo.use_multi_token_stopping:
+                from transformers import StoppingCriteriaList
+                # Import stopping criteria class from GRPO
+                from simple_rl.algorithms.grpo import MultiTokenStoppingCriteria
+
+                stopping_criteria = StoppingCriteriaList([
+                    MultiTokenStoppingCriteria(
+                        stop_sequences=model_or_algo.stop_sequences,
+                        tokenizer=tokenizer,
+                        prompt_length=0  # Will be updated per generation
+                    )
+                ])
+
         def generate_fn(prompt_text):
             inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=512)
             inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            # Update stopping criteria prompt length for this specific generation
+            if stopping_criteria is not None:
+                stopping_criteria[0].prompt_length = inputs["input_ids"].shape[1]
 
             with torch.no_grad():
                 generated_ids, _ = model_or_algo.policy.generate(
@@ -499,6 +541,7 @@ def demonstrate_model_responses(
                     temperature=temperature,
                     do_sample=True,
                     top_p=top_p,
+                    stopping_criteria=stopping_criteria,  # ✓ Now includes stopping!
                 )
 
             # Extract completion
