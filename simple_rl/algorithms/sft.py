@@ -114,8 +114,16 @@ class SFTDataset(Dataset):
             print("-" * 80)
 
             print(f"\n📊 BREAKDOWN:")
-            print(f"  Prompt: {repr(prompt[:100])}..." if len(prompt) > 100 else f"  Prompt: {repr(prompt)}")
-            print(f"  Completion: {repr(completion[:100])}..." if len(completion) > 100 else f"  Completion: {repr(completion)}")
+            print(
+                f"  Prompt: {repr(prompt[:100])}..."
+                if len(prompt) > 100
+                else f"  Prompt: {repr(prompt)}"
+            )
+            print(
+                f"  Completion: {repr(completion[:100])}..."
+                if len(completion) > 100
+                else f"  Completion: {repr(completion)}"
+            )
             print(f"  Mask prompt tokens: {self.mask_prompt}")
 
             # Tokenization details
@@ -126,7 +134,9 @@ class SFTDataset(Dataset):
             print(f"\n🔢 TOKENIZATION:")
             print(f"  Total tokens: {len(full_ids)}")
             print(f"  Prompt tokens: {prompt_length}")
-            print(f"  Non-masked tokens (for loss): {(labels_flat != -100).sum().item()}")
+            print(
+                f"  Non-masked tokens (for loss): {(labels_flat != -100).sum().item()}"
+            )
 
             if completion_indices[0].numel() > 0:
                 first_completion_idx = completion_indices[0][0].item()
@@ -213,11 +223,25 @@ class SFT(BaseAlgorithm):
         # Load model
         if model is None:
             model_name = config["model"]["model_name"]
+            model_type = config.get("model", {}).get("model_type", "auto")
+
+            # Determine dtype based on config (not just hardware availability)
+            if model_type == "fp16":
+                dtype = torch.float16
+            elif model_type == "bf16":
+                dtype = torch.bfloat16
+            elif model_type == "fp32":
+                dtype = torch.float32
+            else:  # "auto"
+                dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
             # Note: Logger not yet initialized, print is acceptable here
             print(f"Loading model: {model_name}")
+            print(f"Model dtype: {dtype} (from config model_type='{model_type}')")
+
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                torch_dtype=dtype,
                 device_map="auto" if torch.cuda.is_available() else None,
                 trust_remote_code=True,
             )
@@ -246,7 +270,9 @@ class SFT(BaseAlgorithm):
         )
         self.max_grad_norm = training_config.get("max_grad_norm", 1.0)
         self.warmup_steps = training_config.get("warmup_steps", 100)
-        self.enable_gradient_checkpointing = training_config.get("gradient_checkpointing", False)
+        self.enable_gradient_checkpointing = training_config.get(
+            "gradient_checkpointing", False
+        )
         self.weight_decay = training_config.get("weight_decay", 0.01)
         self.label_smoothing = training_config.get("label_smoothing", 0.0)
         # Mixed precision (MPS autocast)
@@ -257,7 +283,9 @@ class SFT(BaseAlgorithm):
             and bool(self.mixed_precision.get("enabled", False))
         )
         _dtype_key = str(self.mixed_precision.get("dtype", "fp16")).lower()
-        self.mps_autocast_dtype = torch.float16 if _dtype_key in ("fp16", "float16") else torch.bfloat16
+        self.mps_autocast_dtype = (
+            torch.float16 if _dtype_key in ("fp16", "float16") else torch.bfloat16
+        )
 
         # Model configuration
         model_config = config.get("model", {})
@@ -299,9 +327,69 @@ class SFT(BaseAlgorithm):
                 name=wandb_config.get("run_name", None),
             )
 
-        self.logger.info(f"✓ SFT initialized with model: {config['model']['model_name']}")
-        self.logger.info(f"  Total parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        self.logger.info(
+            f"✓ SFT initialized with model: {config['model']['model_name']}"
+        )
+        self.logger.info(
+            f"  Total parameters: {sum(p.numel() for p in self.model.parameters()):,}"
+        )
         self.logger.info(f"  Device: {self.device}")
+
+        # Check for NaN/Inf in model weights (critical safety check)
+        self._check_model_weights_sanity()
+
+    def _check_model_weights_sanity(self):
+        """Check if model weights contain NaN or Inf values."""
+        nan_params = []
+        inf_params = []
+
+        for name, param in self.model.named_parameters():
+            if torch.isnan(param).any():
+                nan_params.append(name)
+            if torch.isinf(param).any():
+                inf_params.append(name)
+
+        if nan_params or inf_params:
+            self.logger.error("\n" + "=" * 80)
+            self.logger.error("🚨 CORRUPT MODEL WEIGHTS DETECTED")
+            self.logger.error("=" * 80)
+            if nan_params:
+                self.logger.error(
+                    f"\nParameters with NaN values ({len(nan_params)} total):"
+                )
+                for name in nan_params[:10]:  # Show first 10
+                    self.logger.error(f"  - {name}")
+                if len(nan_params) > 10:
+                    self.logger.error(f"  ... and {len(nan_params) - 10} more")
+            if inf_params:
+                self.logger.error(
+                    f"\nParameters with Inf values ({len(inf_params)} total):"
+                )
+                for name in inf_params[:10]:  # Show first 10
+                    self.logger.error(f"  - {name}")
+                if len(inf_params) > 10:
+                    self.logger.error(f"  ... and {len(inf_params) - 10} more")
+            self.logger.error("\n💡 Possible causes:")
+            self.logger.error("  1. Corrupted checkpoint file")
+            self.logger.error(
+                "  2. Previous training run had NaN loss that corrupted weights"
+            )
+            self.logger.error("  3. Incorrect dtype conversion (e.g., fp16 overflow)")
+            self.logger.error("  4. Model loading error")
+            self.logger.error("\n🔧 Solutions:")
+            self.logger.error(
+                "  1. Delete corrupted checkpoints and retrain from pretrained model"
+            )
+            self.logger.error("  2. Use fp32 instead of fp16 for numerical stability")
+            self.logger.error("  3. Check model loading code for dtype issues")
+            self.logger.error("=" * 80)
+            raise ValueError(
+                f"Model contains NaN/Inf weights! "
+                f"NaN params: {len(nan_params)}, Inf params: {len(inf_params)}. "
+                f"Cannot proceed with training."
+            )
+
+        self.logger.info("  ✓ Model weights are clean (no NaN/Inf)")
 
     def train(
         self,
@@ -339,7 +427,11 @@ class SFT(BaseAlgorithm):
 
         # Calculate total training steps (ceil to avoid under-counting)
         num_epochs = num_episodes or self.num_epochs
-        updates_per_epoch = math.ceil(len(train_dataloader) / self.gradient_accumulation_steps) if len(train_dataloader) > 0 else 0
+        updates_per_epoch = (
+            math.ceil(len(train_dataloader) / self.gradient_accumulation_steps)
+            if len(train_dataloader) > 0
+            else 0
+        )
         num_training_steps = updates_per_epoch * num_epochs
 
         # Initialize optimizer if not already done
@@ -350,7 +442,16 @@ class SFT(BaseAlgorithm):
             for name, param in self.model.named_parameters():
                 if not param.requires_grad:
                     continue
-                if any(nd in name for nd in ["bias", "LayerNorm.weight", "layer_norm.weight", "ln_f.weight", "ln_attn.weight"]):
+                if any(
+                    nd in name
+                    for nd in [
+                        "bias",
+                        "LayerNorm.weight",
+                        "layer_norm.weight",
+                        "ln_f.weight",
+                        "ln_attn.weight",
+                    ]
+                ):
                     no_decay_params.append(param)
                 else:
                     decay_params.append(param)
@@ -376,7 +477,9 @@ class SFT(BaseAlgorithm):
             )
 
         # Enable gradient checkpointing for memory/stability if requested
-        if self.enable_gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
+        if self.enable_gradient_checkpointing and hasattr(
+            self.model, "gradient_checkpointing_enable"
+        ):
             if getattr(self.model, "config", None) is not None:
                 # use_cache must be disabled when using gradient checkpointing
                 if hasattr(self.model.config, "use_cache"):
@@ -385,7 +488,9 @@ class SFT(BaseAlgorithm):
 
         self.logger.info(f"Starting SFT training for {num_epochs} epochs...")
         self.logger.info(f"Batch size: {self.batch_size}")
-        self.logger.info(f"Gradient accumulation steps: {self.gradient_accumulation_steps}")
+        self.logger.info(
+            f"Gradient accumulation steps: {self.gradient_accumulation_steps}"
+        )
         self.logger.info(
             f"Effective batch size: {self.batch_size * self.gradient_accumulation_steps}"
         )
@@ -420,9 +525,7 @@ class SFT(BaseAlgorithm):
             epoch_loss_sum = 0.0  # sum of unscaled (pre-accumulation) losses
             epoch_start_time = time.time()
 
-            progress_bar = tqdm(
-                train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"
-            )
+            progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
 
             for batch_idx, batch in enumerate(progress_bar):
                 batch_start_time = time.time()
@@ -434,15 +537,22 @@ class SFT(BaseAlgorithm):
 
                 # Forward pass
                 if self.use_mps_autocast:
-                    with torch.autocast(device_type="mps", dtype=self.mps_autocast_dtype):
+                    with torch.autocast(
+                        device_type="mps", dtype=self.mps_autocast_dtype
+                    ):
                         outputs = self.model(
-                            input_ids=input_ids, attention_mask=attention_mask, labels=labels
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels,
                         )
                         if self.label_smoothing and self.label_smoothing > 0.0:
                             logits = outputs.logits
                             shift_logits = logits[:, :-1, :].contiguous()
                             shift_labels = labels[:, 1:].contiguous()
-                            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=float(self.label_smoothing))
+                            loss_fct = nn.CrossEntropyLoss(
+                                ignore_index=-100,
+                                label_smoothing=float(self.label_smoothing),
+                            )
                             loss = loss_fct(
                                 shift_logits.view(-1, shift_logits.size(-1)),
                                 shift_labels.view(-1),
@@ -451,13 +561,18 @@ class SFT(BaseAlgorithm):
                             loss = outputs.loss
                 else:
                     outputs = self.model(
-                        input_ids=input_ids, attention_mask=attention_mask, labels=labels
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
                     )
                     if self.label_smoothing and self.label_smoothing > 0.0:
                         logits = outputs.logits
                         shift_logits = logits[:, :-1, :].contiguous()
                         shift_labels = labels[:, 1:].contiguous()
-                        loss_fct = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=float(self.label_smoothing))
+                        loss_fct = nn.CrossEntropyLoss(
+                            ignore_index=-100,
+                            label_smoothing=float(self.label_smoothing),
+                        )
                         loss = loss_fct(
                             shift_logits.view(-1, shift_logits.size(-1)),
                             shift_labels.view(-1),
@@ -467,9 +582,48 @@ class SFT(BaseAlgorithm):
 
                 # Scale loss for gradient accumulation
                 raw_loss_value = float(loss.item())
+
+                # NaN detection - fail fast with helpful error message
+                if math.isnan(raw_loss_value) or math.isinf(raw_loss_value):
+                    self.logger.error("\n" + "=" * 80)
+                    self.logger.error("🚨 NaN/Inf LOSS DETECTED")
+                    self.logger.error("=" * 80)
+                    self.logger.error(f"Epoch: {epoch+1}/{num_epochs}")
+                    self.logger.error(f"Batch: {batch_idx+1}/{len(train_dataloader)}")
+                    self.logger.error(f"Global step: {self.global_step}")
+                    self.logger.error(f"Loss value: {raw_loss_value}")
+                    self.logger.error(
+                        f"Learning rate: {self.scheduler.get_last_lr()[0]:.2e}"
+                    )
+                    self.logger.error(
+                        f"Model dtype: {next(self.model.parameters()).dtype}"
+                    )
+                    self.logger.error("\n💡 Common causes:")
+                    self.logger.error("  1. Learning rate too high (try 1e-6 to 5e-6)")
+                    self.logger.error(
+                        "  2. Using fp16 without mixed precision training"
+                    )
+                    self.logger.error("  3. Gradient explosion (check gradient norms)")
+                    self.logger.error("  4. Bad data (inf/nan in input)")
+                    self.logger.error("\n📊 Debug info:")
+                    self.logger.error(f"  Input shape: {input_ids.shape}")
+                    self.logger.error(
+                        f"  Input has nan: {torch.isnan(input_ids.float()).any().item()}"
+                    )
+                    self.logger.error(f"  Labels shape: {labels.shape}")
+                    self.logger.error(
+                        f"  Non-masked labels: {(labels != -100).sum().item()}"
+                    )
+                    self.logger.error("=" * 80)
+
+                    raise ValueError(
+                        f"NaN/Inf loss detected at step {self.global_step}. "
+                        f"Loss={raw_loss_value}. See logs above for debugging info."
+                    )
+
                 loss = loss / self.gradient_accumulation_steps
                 loss.backward()
-                
+
                 # Track unscaled loss for accurate epoch averaging
                 epoch_loss_sum += raw_loss_value
 
@@ -570,7 +724,9 @@ class SFT(BaseAlgorithm):
             # Flush any remaining gradients if last batch didn't trigger update
             # This handles edge case where len(dataloader) % gradient_accumulation_steps != 0
             if (batch_idx + 1) % self.gradient_accumulation_steps != 0:
-                self.logger.info(f"\nFlushing remaining gradients from last {(batch_idx + 1) % self.gradient_accumulation_steps} batches...")
+                self.logger.info(
+                    f"\nFlushing remaining gradients from last {(batch_idx + 1) % self.gradient_accumulation_steps} batches..."
+                )
                 clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 self.scheduler.step()
@@ -579,7 +735,11 @@ class SFT(BaseAlgorithm):
 
             # Epoch summary
             epoch_time = time.time() - epoch_start_time
-            avg_epoch_loss = epoch_loss_sum / len(train_dataloader) if len(train_dataloader) > 0 else float("nan")
+            avg_epoch_loss = (
+                epoch_loss_sum / len(train_dataloader)
+                if len(train_dataloader) > 0
+                else float("nan")
+            )
             self.logger.info(
                 f"\nEpoch {epoch+1} completed in {epoch_time:.2f}s | Avg Loss: {avg_epoch_loss:.4f}"
             )
@@ -594,7 +754,9 @@ class SFT(BaseAlgorithm):
         self.logger.info(f"Total steps: {self.global_step}")
 
         # Always save final checkpoint
-        final_checkpoint_path = checkpoint_dir / f"checkpoint_step_{self.global_step}_final.pt"
+        final_checkpoint_path = (
+            checkpoint_dir / f"checkpoint_step_{self.global_step}_final.pt"
+        )
         self.save_checkpoint(str(final_checkpoint_path))
         self.logger.info(f"  → Saved final checkpoint to {final_checkpoint_path}")
 
@@ -602,7 +764,9 @@ class SFT(BaseAlgorithm):
             "training_metrics": training_metrics,
             "validation_metrics": validation_metrics,
             "total_time": total_training_time,
-            "final_loss": training_metrics["loss"][-1] if training_metrics["loss"] else None,
+            "final_loss": (
+                training_metrics["loss"][-1] if training_metrics["loss"] else None
+            ),
         }
 
     def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
@@ -651,7 +815,7 @@ class SFT(BaseAlgorithm):
                 lr=self.learning_rate,
                 betas=(0.9, 0.999),
                 eps=1e-8,
-                weight_decay=0.0
+                weight_decay=0.0,
             )
 
         self.optimizer.zero_grad()
@@ -701,15 +865,22 @@ class SFT(BaseAlgorithm):
                 labels = batch["labels"].to(self.device)
 
                 if self.use_mps_autocast:
-                    with torch.autocast(device_type="mps", dtype=self.mps_autocast_dtype):
+                    with torch.autocast(
+                        device_type="mps", dtype=self.mps_autocast_dtype
+                    ):
                         outputs = self.model(
-                            input_ids=input_ids, attention_mask=attention_mask, labels=labels
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels,
                         )
                         if self.label_smoothing and self.label_smoothing > 0.0:
                             logits = outputs.logits
                             shift_logits = logits[:, :-1, :].contiguous()
                             shift_labels = labels[:, 1:].contiguous()
-                            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=float(self.label_smoothing))
+                            loss_fct = nn.CrossEntropyLoss(
+                                ignore_index=-100,
+                                label_smoothing=float(self.label_smoothing),
+                            )
                             loss = loss_fct(
                                 shift_logits.view(-1, shift_logits.size(-1)),
                                 shift_labels.view(-1),
@@ -719,13 +890,18 @@ class SFT(BaseAlgorithm):
                             total_loss += outputs.loss.item()
                 else:
                     outputs = self.model(
-                        input_ids=input_ids, attention_mask=attention_mask, labels=labels
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
                     )
                     if self.label_smoothing and self.label_smoothing > 0.0:
                         logits = outputs.logits
                         shift_logits = logits[:, :-1, :].contiguous()
                         shift_labels = labels[:, 1:].contiguous()
-                        loss_fct = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=float(self.label_smoothing))
+                        loss_fct = nn.CrossEntropyLoss(
+                            ignore_index=-100,
+                            label_smoothing=float(self.label_smoothing),
+                        )
                         loss = loss_fct(
                             shift_logits.view(-1, shift_logits.size(-1)),
                             shift_labels.view(-1),
@@ -798,15 +974,22 @@ class SFT(BaseAlgorithm):
                 labels = batch["labels"].to(self.device)
 
                 if self.use_mps_autocast:
-                    with torch.autocast(device_type="mps", dtype=self.mps_autocast_dtype):
+                    with torch.autocast(
+                        device_type="mps", dtype=self.mps_autocast_dtype
+                    ):
                         outputs = self.model(
-                            input_ids=input_ids, attention_mask=attention_mask, labels=labels
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels,
                         )
                         if self.label_smoothing and self.label_smoothing > 0.0:
                             logits = outputs.logits
                             shift_logits = logits[:, :-1, :].contiguous()
                             shift_labels = labels[:, 1:].contiguous()
-                            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=float(self.label_smoothing))
+                            loss_fct = nn.CrossEntropyLoss(
+                                ignore_index=-100,
+                                label_smoothing=float(self.label_smoothing),
+                            )
                             loss = loss_fct(
                                 shift_logits.view(-1, shift_logits.size(-1)),
                                 shift_labels.view(-1),
@@ -816,13 +999,18 @@ class SFT(BaseAlgorithm):
                             total_loss += outputs.loss.item()
                 else:
                     outputs = self.model(
-                        input_ids=input_ids, attention_mask=attention_mask, labels=labels
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
                     )
                     if self.label_smoothing and self.label_smoothing > 0.0:
                         logits = outputs.logits
                         shift_logits = logits[:, :-1, :].contiguous()
                         shift_labels = labels[:, 1:].contiguous()
-                        loss_fct = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=float(self.label_smoothing))
+                        loss_fct = nn.CrossEntropyLoss(
+                            ignore_index=-100,
+                            label_smoothing=float(self.label_smoothing),
+                        )
                         loss = loss_fct(
                             shift_logits.view(-1, shift_logits.size(-1)),
                             shift_labels.view(-1),
@@ -865,7 +1053,7 @@ class SFT(BaseAlgorithm):
         with torch.no_grad():
             # Process prompts in batches for speed
             for i in range(0, len(prompts), batch_size):
-                batch_prompts = prompts[i:i + batch_size]
+                batch_prompts = prompts[i : i + batch_size]
 
                 # Tokenize batch with padding
                 inputs = self.tokenizer(
@@ -873,7 +1061,7 @@ class SFT(BaseAlgorithm):
                     return_tensors="pt",
                     padding=True,
                     truncation=True,
-                    max_length=512
+                    max_length=512,
                 )
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
@@ -912,8 +1100,12 @@ class SFT(BaseAlgorithm):
         """
         checkpoint = {
             "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict() if self.optimizer else None,
-            "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
+            "optimizer_state_dict": (
+                self.optimizer.state_dict() if self.optimizer else None
+            ),
+            "scheduler_state_dict": (
+                self.scheduler.state_dict() if self.scheduler else None
+            ),
             "config": self.config,
             "global_step": self.global_step,
         }

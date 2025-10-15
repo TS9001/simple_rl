@@ -673,22 +673,25 @@ def main():
     # 2. SFT Training (Optional)
     # --------------------------------------------------------
     if RUN_SFT:
+        # SFT now respects model_type config (fixed bug)
+        # Using fp32 for numerical stability (more stable than fp16, uses more VRAM)
+        # With fp32, can use slightly more aggressive but still safe hyperparameters
         sft_config = {
             "model": {
                 "model_name": MODEL_NAME,
                 "max_length": 512,
                 "device": str(device),
-                "model_type": "fp32",
+                "model_type": "fp32",  # Now properly respected! (was ignored before)
             },
             "training": {
-                "batch_size": 4,
-                "learning_rate": 1e-5,
+                "batch_size": 2,  # Small batch for 16GB GPU with fp32
+                "learning_rate": 5e-6,  # Conservative LR for stability
                 "num_epochs": 3,
-                "gradient_accumulation_steps": 4,
-                "max_grad_norm": 1.0,
-                "warmup_steps": 20,
+                "gradient_accumulation_steps": 8,  # Effective batch size = 2 × 8 = 16
+                "max_grad_norm": 1.0,  # Standard clipping (fp32 is stable)
+                "warmup_steps": 50,  # Moderate warmup
                 "mask_prompt": True,
-                "gradient_checkpointing": False,
+                "gradient_checkpointing": True,  # Reduces VRAM usage
                 "weight_decay": 0.01,
                 "label_smoothing": 0.00,
                 "mixed_precision": {
