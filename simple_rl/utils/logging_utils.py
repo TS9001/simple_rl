@@ -173,9 +173,10 @@ class Logger:
 
         # File handler (detailed format) - force unbuffered writes for real-time monitoring
         class FlushingFileHandler(logging.FileHandler):
+            """File handler that flushes after EVERY write (no buffering)."""
             def emit(self, record):
                 super().emit(record)
-                self.flush()
+                self.flush()  # Force immediate write to disk
 
         file_handler = FlushingFileHandler(log_path / log_file, mode='a')
         file_handler.setLevel(logging.DEBUG)
@@ -184,6 +185,9 @@ class Logger:
 
         # Prevent propagation to root logger
         self.python_logger.propagate = False
+
+        self.info(f"📋 GRPO internal logging to: {log_path / log_file}")
+        self.info("✓ All GRPO messages will be flushed immediately (no buffering)")
 
     def info(self, message: str) -> None:
         """Log info message to console and file."""
@@ -200,6 +204,14 @@ class Logger:
     def error(self, message: str) -> None:
         """Log error message to console and file."""
         self.python_logger.error(message)
+
+    def critical(self, message: str) -> None:
+        """Log critical error message to console and file."""
+        self.python_logger.critical(message)
+
+    def exception(self, message: str) -> None:
+        """Log exception with full traceback to console and file."""
+        self.python_logger.exception(message)
 
     def init_wandb(self, **kwargs) -> None:
         """Initialize wandb logging."""

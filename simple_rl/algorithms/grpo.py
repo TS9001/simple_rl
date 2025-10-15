@@ -681,6 +681,75 @@ class GRPO(BaseAlgorithm):
         old_new_diff = old_new_diff_per_seq.max().item()
         old_ref_diff = old_ref_diff_per_seq.max().item()
 
+        # SAVE COMPLETE LOG PROBS TO FILE FOR DEBUGGING
+        with open("LOGPROBS_FULL_DEBUG.txt", "w") as f:
+            f.write("="*80 + "\n")
+            f.write("LOG PROBABILITY VALIDATION - EPISODE 0, MINIBATCH 1\n")
+            f.write("="*80 + "\n\n")
+
+            f.write(f"Model dtype: {next(self.policy.parameters()).dtype}\n")
+            f.write(f"Device: {self.device}\n")
+            f.write(f"Batch shape: {old_log_probs.shape}\n")
+            f.write(f"Total sequences: {old_log_probs.shape[0]}\n")
+            f.write(f"Max sequence length: {old_log_probs.shape[1]}\n\n")
+
+            f.write("SUMMARY STATISTICS:\n")
+            f.write("-"*80 + "\n")
+            f.write(f"Old-Ref max diff: {old_ref_diff:.6e}\n")
+            f.write(f"Old-New max diff: {old_new_diff:.6e}\n")
+            f.write(f"Old-Ref mean diff: {(old_log_probs - ref_log_probs).abs().mean().item():.6e}\n")
+            f.write(f"Old-New mean diff: {(old_log_probs - new_log_probs).abs().mean().item():.6e}\n\n")
+
+            f.write("="*80 + "\n")
+            f.write("COMPLETE LOG PROBABILITIES FOR ALL SEQUENCES\n")
+            f.write("="*80 + "\n\n")
+
+            # Write complete log probs for every sequence
+            for seq_idx in range(old_log_probs.shape[0]):
+                f.write(f"\n{'='*80}\n")
+                f.write(f"SEQUENCE {seq_idx + 1} / {old_log_probs.shape[0]}\n")
+                f.write(f"{'='*80}\n\n")
+
+                old_seq = old_log_probs[seq_idx].cpu().numpy()
+                new_seq = new_log_probs[seq_idx].cpu().numpy()
+                ref_seq = ref_log_probs[seq_idx].cpu().numpy()
+
+                # Find non-zero positions (valid tokens)
+                nonzero_mask = (old_seq != 0.0) | (new_seq != 0.0) | (ref_seq != 0.0)
+                nonzero_indices = nonzero_mask.nonzero()[0] if nonzero_mask.any() else []
+
+                f.write(f"Valid tokens: {len(nonzero_indices)} / {old_log_probs.shape[1]}\n")
+                f.write(f"Max Old-New diff: {old_new_diff_per_seq[seq_idx].item():.6e}\n")
+                f.write(f"Max Old-Ref diff: {old_ref_diff_per_seq[seq_idx].item():.6e}\n\n")
+
+                f.write(f"{'Token':<8} {'Old LogProb':<15} {'New LogProb':<15} {'Ref LogProb':<15} {'Old-New Diff':<15} {'Old-Ref Diff':<15}\n")
+                f.write("-"*80 + "\n")
+
+                # Write all tokens (including zeros for padding)
+                for token_idx in range(old_log_probs.shape[1]):
+                    old_val = old_seq[token_idx]
+                    new_val = new_seq[token_idx]
+                    ref_val = ref_seq[token_idx]
+                    old_new_diff = abs(old_val - new_val)
+                    old_ref_diff = abs(old_val - ref_val)
+
+                    # Mark if it's a padding token
+                    is_padding = (old_val == 0.0 and new_val == 0.0 and ref_val == 0.0)
+                    marker = " [PAD]" if is_padding else ""
+
+                    f.write(f"{token_idx:<8} {old_val:>14.6f} {new_val:>14.6f} {ref_val:>14.6f} {old_new_diff:>14.6e} {old_ref_diff:>14.6e}{marker}\n")
+
+                f.write("\n")
+
+            f.write("\n" + "="*80 + "\n")
+            f.write("END OF LOG PROBABILITY DUMP\n")
+            f.write("="*80 + "\n")
+
+        print(f"\n✓ Complete log probs saved to: LOGPROBS_FULL_DEBUG.txt")
+        print(f"  - Total sequences: {old_log_probs.shape[0]}")
+        print(f"  - Tokens per sequence: {old_log_probs.shape[1]}")
+        print(f"  - Total values written: {old_log_probs.numel() * 3} (old, new, ref)")
+
         # Dtype-aware thresholds (BF16 + Flash Attention 2 on CUDA is non-deterministic)
         model_dtype = next(self.policy.parameters()).dtype
 
