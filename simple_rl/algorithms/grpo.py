@@ -551,18 +551,9 @@ class GRPO(BaseAlgorithm):
             self.timing_manager.start_timer(f"batch_{batch_idx}_policy_log_probs")
             max_completion_len = completion_ids.size(1)
 
-            # Use autocast on CUDA for BF16 (automatic mixed precision)
-            autocast_dtype = torch.bfloat16 if self.device.type == "cuda" else None
-            autocast_enabled = self.device.type == "cuda"
-
+            # Use same autocast config as training for determinism
             with torch.no_grad():
-                if autocast_enabled:
-                    with torch.autocast(device_type='cuda', dtype=autocast_dtype):
-                        full_log_probs = self.policy.compute_log_probs(
-                            generated_ids,
-                            attention_mask=generated_mask,
-                        )
-                else:
+                with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
                     full_log_probs = self.policy.compute_log_probs(
                         generated_ids,
                         attention_mask=generated_mask,
@@ -583,13 +574,7 @@ class GRPO(BaseAlgorithm):
             if self.kl_coef > 0 and self.ref_policy is not None:
                 self.timing_manager.start_timer(f"batch_{batch_idx}_ref_log_probs")
                 with torch.no_grad():
-                    if autocast_enabled:
-                        with torch.autocast(device_type='cuda', dtype=autocast_dtype):
-                            full_ref_log_probs = self.ref_policy.compute_log_probs(
-                                generated_ids,
-                                attention_mask=generated_mask,
-                            )
-                    else:
+                    with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
                         full_ref_log_probs = self.ref_policy.compute_log_probs(
                             generated_ids,
                             attention_mask=generated_mask,
@@ -686,6 +671,11 @@ class GRPO(BaseAlgorithm):
         ref_log_probs: torch.Tensor,
     ) -> None:
         """Validate log probs in first minibatch to ensure dropout is disabled."""
+        # Ensure all log probs are in FP32 for accurate comparison
+        old_log_probs = old_log_probs.float()
+        new_log_probs = new_log_probs.float()
+        ref_log_probs = ref_log_probs.float()
+
         old_new_diff_per_seq = (old_log_probs - new_log_probs).abs().max(dim=1).values
         old_ref_diff_per_seq = (old_log_probs - ref_log_probs).abs().max(dim=1).values
         old_new_diff = old_new_diff_per_seq.max().item()
