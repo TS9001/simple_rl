@@ -715,14 +715,14 @@ def main():
             "store_completions": False,
         },
         "training": {
-            "batch_size": 16,  # Keep at 16 for full training (not 4 like overfit)
-            "rollout_batch_size": 4,
+            "batch_size": 32,  # Keep at 16 for full training (not 4 like overfit)
+            "rollout_batch_size": 8,
             "gradient_clip": 0.1,  # TIGHTENED from 1.0 → 0.1 for maximum stability
             "max_new_tokens": 400,
             "min_new_tokens": 50,  # LOWERED from 150 → 50 to allow </answer> early stopping
             "temperature": 0.6,
             "num_episodes": 500,
-            "minibatch_size": 32,  # Keep at 32 for full training
+            "minibatch_size": 64,  # Keep at 32 for full training
             "update_epochs": 1,
             "top_p": 0.9,
             "entropy_coef": 0.005,  # Increased from 0.002 → 0.005 for more exploration
@@ -1109,8 +1109,8 @@ def main():
     logger.info("="*60)
 
     visualize_grpo_results(
-        grpo_results[\'training_metrics\'],
-        grpo_results[\'validation_metrics\'],
+        grpo_results['training_metrics'],
+        grpo_results['validation_metrics'],
         grpo,
         logger
     )
