@@ -1032,10 +1032,14 @@ def main():
         logger.info("\nLoading model architecture from config...")
         from transformers import AutoConfig
 
+        # Determine dtype for model
+        dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+        model_torch_dtype = dtype_map.get(model_dtype, torch.float32)
+
         config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
         model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
-        model = model.to(dtype=torch.float32)
-        logger.info("✓ Model architecture loaded (no pretrained weights downloaded)")
+        model = model.to(dtype=model_torch_dtype)
+        logger.info(f"✓ Model architecture loaded with dtype={model_torch_dtype} (no pretrained weights downloaded)")
 
         # Load trained weights from GRPO checkpoint
         # GRPO wraps model in LanguageModel class, so keys have "model." prefix that needs to be removed
@@ -1174,9 +1178,16 @@ def main():
 
         # Load fresh model and tokenizer
         logger.info("\nLoading fresh model and tokenizer...")
+
+        # Determine dtype for model
+        dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+        model_torch_dtype = dtype_map.get(model_dtype, torch.float32)
+
         model = AutoModelForCausalLM.from_pretrained(
-            model_name, dtype=torch.float32, trust_remote_code=True
+            model_name, torch_dtype=model_torch_dtype, trust_remote_code=True
         )
+        logger.info(f"✓ Model loaded with dtype={model_torch_dtype}")
+
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
