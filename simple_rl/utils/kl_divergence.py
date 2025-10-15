@@ -142,6 +142,11 @@ def compute_kl_k3(
     Reference:
         John Schulman's blog: http://joschu.net/blog/kl-approx.html
     """
+    # NUMERICAL STABILITY: Ensure KL computation in FP32
+    # Critical for RL stability - small errors get amplified through gradients
+    ref_log_probs = ref_log_probs.float()
+    new_log_probs = new_log_probs.float()
+
     # Compute log ratio: log(P_ref / P_new) = log(P_ref) - log(P_new)
     log_ratio = ref_log_probs - new_log_probs
 

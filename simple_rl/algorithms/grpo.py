@@ -245,6 +245,21 @@ class GRPO(BaseAlgorithm):
         logging_cfg = self.config.get("logging", {})
         self.log_trajectory_progress = logging_cfg.get("show_trajectory_progress", False)  # Default: False
 
+        # Mixed precision training setup (CUDA only)
+        # Note: BF16 doesn't need gradient scaling (same exponent range as FP32)
+        # FP16 would need GradScaler to prevent gradient underflow
+        self.use_amp = self.device.type == "cuda"
+        self.amp_dtype = torch.bfloat16 if self.use_amp else None
+
+        # Gradient scaler (only needed for FP16, not BF16)
+        # BF16 has same exponent range as FP32, so no underflow issues
+        model_dtype = next(self.policy.parameters()).dtype
+        self.use_grad_scaler = (model_dtype == torch.float16) and self.use_amp
+        if self.use_grad_scaler:
+            self.grad_scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.grad_scaler = None
+
         # Early stopping tokens for generation
         self._setup_stopping_tokens()
 
@@ -536,11 +551,22 @@ class GRPO(BaseAlgorithm):
             self.timing_manager.start_timer(f"batch_{batch_idx}_policy_log_probs")
             max_completion_len = completion_ids.size(1)
 
+            # Use autocast on CUDA for BF16 (automatic mixed precision)
+            autocast_dtype = torch.bfloat16 if self.device.type == "cuda" else None
+            autocast_enabled = self.device.type == "cuda"
+
             with torch.no_grad():
-                full_log_probs = self.policy.compute_log_probs(
-                    generated_ids,
-                    attention_mask=generated_mask,
-                )
+                if autocast_enabled:
+                    with torch.autocast(device_type='cuda', dtype=autocast_dtype):
+                        full_log_probs = self.policy.compute_log_probs(
+                            generated_ids,
+                            attention_mask=generated_mask,
+                        )
+                else:
+                    full_log_probs = self.policy.compute_log_probs(
+                        generated_ids,
+                        attention_mask=generated_mask,
+                    )
 
                 device = full_log_probs.device
                 batch_indices = torch.arange(total_sequences, device=device).unsqueeze(1)
@@ -557,10 +583,17 @@ class GRPO(BaseAlgorithm):
             if self.kl_coef > 0 and self.ref_policy is not None:
                 self.timing_manager.start_timer(f"batch_{batch_idx}_ref_log_probs")
                 with torch.no_grad():
-                    full_ref_log_probs = self.ref_policy.compute_log_probs(
-                        generated_ids,
-                        attention_mask=generated_mask,
-                    )
+                    if autocast_enabled:
+                        with torch.autocast(device_type='cuda', dtype=autocast_dtype):
+                            full_ref_log_probs = self.ref_policy.compute_log_probs(
+                                generated_ids,
+                                attention_mask=generated_mask,
+                            )
+                    else:
+                        full_ref_log_probs = self.ref_policy.compute_log_probs(
+                            generated_ids,
+                            attention_mask=generated_mask,
+                        )
                     ref_log_probs = full_ref_log_probs[batch_indices, source_positions]
                     ref_log_probs = torch.where(valid_mask, ref_log_probs,
                                                 torch.tensor(0.0, device=device, dtype=ref_log_probs.dtype))
@@ -658,123 +691,31 @@ class GRPO(BaseAlgorithm):
         old_new_diff = old_new_diff_per_seq.max().item()
         old_ref_diff = old_ref_diff_per_seq.max().item()
 
-        # Dtype-aware thresholds (BF16 has lower precision and Flash Attention 2 is non-deterministic)
+        # Dtype-aware thresholds (BF16 + Flash Attention 2 on CUDA is non-deterministic)
         model_dtype = next(self.policy.parameters()).dtype
 
-        # Check attention implementation (Flash Attention 2 is highly non-deterministic with BF16)
-        attn_impl = getattr(self.policy.model.config, '_attn_implementation', 'unknown')
-
-        # Save ALL log probs to human-readable text file for debugging
-        with open('LOGPROBS.txt', 'w') as f:
-            f.write("=" * 80 + "\n")
-            f.write("LOG PROBABILITY VALIDATION DATA (Episode 0, Minibatch 1)\n")
-            f.write("=" * 80 + "\n\n")
-
-            # Model metadata
-            f.write("MODEL CONFIGURATION:\n")
-            f.write(f"  dtype: {model_dtype}\n")
-            f.write(f"  attention_implementation: {attn_impl}\n")
-            f.write(f"  device: {self.device}\n")
-            f.write(f"  batch_size: {old_log_probs.shape[0]}\n")
-            f.write(f"  seq_len: {old_log_probs.shape[1]}\n")
-            f.write("\n")
-
-            # Summary statistics
-            f.write("SUMMARY STATISTICS:\n")
-            f.write(f"  old_new_diff_max: {old_new_diff:.6e}\n")
-            f.write(f"  old_new_diff_mean: {(old_log_probs - new_log_probs).abs().mean().item():.6e}\n")
-            f.write(f"  old_ref_diff_max: {old_ref_diff:.6e}\n")
-            f.write(f"  old_ref_diff_mean: {(old_log_probs - ref_log_probs).abs().mean().item():.6e}\n")
-            f.write("\n")
-
-            # Per-sequence max differences
-            f.write("PER-SEQUENCE MAX DIFFERENCES:\n")
-            f.write("  Seq | Old-New Diff | Old-Ref Diff\n")
-            f.write("  " + "-" * 40 + "\n")
-            for i in range(min(old_log_probs.shape[0], 20)):  # Show first 20 sequences
-                f.write(f"  {i:3d} | {old_new_diff_per_seq[i].item():12.6e} | {old_ref_diff_per_seq[i].item():12.6e}\n")
-            if old_log_probs.shape[0] > 20:
-                f.write(f"  ... ({old_log_probs.shape[0] - 20} more sequences)\n")
-            f.write("\n")
-
-            # Full log probs for first few sequences
-            f.write("DETAILED LOG PROBS (First 5 sequences, first 20 tokens):\n")
-            f.write("-" * 80 + "\n")
-            for seq_idx in range(min(5, old_log_probs.shape[0])):
-                f.write(f"\nSequence {seq_idx}:\n")
-                f.write("  Pos | Old LogProb | New LogProb | Ref LogProb | Old-New Diff | Old-Ref Diff\n")
-                f.write("  " + "-" * 75 + "\n")
-                for tok_idx in range(min(20, old_log_probs.shape[1])):
-                    old_val = old_log_probs[seq_idx, tok_idx].item()
-                    new_val = new_log_probs[seq_idx, tok_idx].item()
-                    ref_val = ref_log_probs[seq_idx, tok_idx].item()
-                    old_new = abs(old_val - new_val)
-                    old_ref = abs(old_val - ref_val)
-                    f.write(f"  {tok_idx:3d} | {old_val:11.6f} | {new_val:11.6f} | {ref_val:11.6f} | {old_new:12.6e} | {old_ref:12.6e}\n")
-                if old_log_probs.shape[1] > 20:
-                    f.write(f"  ... ({old_log_probs.shape[1] - 20} more tokens)\n")
-
-            f.write("\n" + "=" * 80 + "\n")
-            f.write("END OF LOG PROBABILITY DATA\n")
-            f.write("=" * 80 + "\n")
-
-        self.logger.info(f"💾 Saved ALL log probs to LOGPROBS.txt (shape: {old_log_probs.shape})")
-
         if model_dtype == torch.bfloat16:
-            # BF16: Very relaxed thresholds due to:
-            # 1. Lower precision (7 bits mantissa vs 23 in FP32)
-            # 2. Flash Attention 2 non-determinism (uses atomic operations that are non-deterministic)
-            # 3. BF16 operations on CUDA can have different rounding across runs
-            ref_threshold = 1e-4  # 100x more relaxed than FP32
-            new_threshold = 0.5  # ~1000x more relaxed (Flash Attention 2 + BF16 can differ significantly)
-            dtype_str = "BF16"
-
-            # Log warning about Flash Attention 2 non-determinism
-            if attn_impl == 'flash_attention_2':
-                self.logger.warning(
-                    "⚠️  Using Flash Attention 2 with BF16 - expect high log prob variance due to non-deterministic operations"
-                )
+            # BF16 on CUDA: Relaxed thresholds due to Flash Attention 2 non-determinism
+            ref_threshold = 1e-4
+            new_threshold = 0.5
         elif model_dtype == torch.float16:
             # FP16: Moderate thresholds
             ref_threshold = 1e-5
             new_threshold = 5e-2
-            dtype_str = "FP16"
         else:
             # FP32: Strict thresholds (original behavior)
             ref_threshold = 1e-6
             new_threshold = 5e-4
-            dtype_str = "FP32"
 
         assert old_ref_diff < ref_threshold, (
-            f"Old and ref log probs differ by {old_ref_diff:.2e} (expected < {ref_threshold:.0e} for {dtype_str}). "
+            f"Old and ref log probs differ by {old_ref_diff:.2e} (expected < {ref_threshold:.0e}). "
             f"This indicates dropout is still active or model corruption"
         )
 
-        # Log warning if difference is high but within acceptable range
-        if old_new_diff >= new_threshold:
-            self.logger.error(
-                f"❌ Log prob validation FAILED: old_new_diff={old_new_diff:.2e} >= {new_threshold:.0e} ({dtype_str}, attn={attn_impl})"
-            )
-            self.logger.error(f"   This may indicate:")
-            self.logger.error(f"   1. Dropout still active (check model config)")
-            self.logger.error(f"   2. Non-deterministic operations in model")
-            self.logger.error(f"   3. Numerical instability with {dtype_str}")
-            assert False, (
-                f"Old and new log probs differ by {old_new_diff:.2e} (expected < {new_threshold:.0e} for {dtype_str}). "
-                f"This indicates dropout is still active or major randomness"
-            )
-        elif old_new_diff > new_threshold / 5:
-            # Warn if difference is significant (> 20% of threshold)
-            self.logger.warning(
-                f"⚠️  Log prob difference is high: {old_new_diff:.2e} "
-                f"(threshold: {new_threshold:.0e} for {dtype_str}, attn={attn_impl}). "
-                f"This is expected with BF16 + Flash Attention 2 but indicates non-determinism."
-            )
-        else:
-            self.logger.info(
-                f"✓ Log prob validation passed: max_diff={old_new_diff:.2e} "
-                f"(threshold: {new_threshold:.0e} for {dtype_str}, attn={attn_impl})"
-            )
+        assert old_new_diff < new_threshold, (
+            f"Old and new log probs differ by {old_new_diff:.2e} (expected < {new_threshold:.0e}). "
+            f"This indicates dropout is still active or major randomness"
+        )
 
     def compute_advantages(
         self,
@@ -973,28 +914,32 @@ class GRPO(BaseAlgorithm):
 
                     new_log_probs_list = []
 
-                    for seq_idx, (seq_gen_ids, seq_attn_mask, seq_old_log_probs, seq_completion_mask, seq_prompt_end_position) in enumerate(zip(
-                        selected_gen_ids, selected_attn_mask, selected_old_log_probs, selected_completion_mask, selected_prompt_end_positions
-                    )):
-                        max_completion_len = seq_old_log_probs.size(0)
-                        mask_valid = int(seq_completion_mask.sum().item())
+                    # Forward pass with autocast (CUDA only)
+                    # BF16: Faster computation, no gradient scaling needed
+                    # FP16: Would need gradient scaling (handled below)
+                    with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
+                        for seq_idx, (seq_gen_ids, seq_attn_mask, seq_old_log_probs, seq_completion_mask, seq_prompt_end_position) in enumerate(zip(
+                            selected_gen_ids, selected_attn_mask, selected_old_log_probs, selected_completion_mask, selected_prompt_end_positions
+                        )):
+                            max_completion_len = seq_old_log_probs.size(0)
+                            mask_valid = int(seq_completion_mask.sum().item())
 
-                        if mask_valid == 0:
-                            seq_new_log_probs = torch.zeros(max_completion_len, device=seq_old_log_probs.device, dtype=seq_old_log_probs.dtype)
-                        else:
-                            full_log_probs = self.policy.compute_log_probs(
-                                seq_gen_ids.unsqueeze(0),
-                                attention_mask=seq_attn_mask.unsqueeze(0),
-                            )
-                            device = full_log_probs.device
-                            completion_positions = torch.arange(max_completion_len, device=device)
-                            source_positions = (seq_prompt_end_position.item() - 1) + completion_positions
-                            source_positions = source_positions.clamp(0, full_log_probs.size(1) - 1)
-                            valid_mask = source_positions < full_log_probs.size(1)
-                            seq_new_log_probs = full_log_probs[0, source_positions]
-                            seq_new_log_probs = torch.where(valid_mask, seq_new_log_probs,
-                                                           torch.tensor(0.0, device=device, dtype=seq_new_log_probs.dtype))
-                        new_log_probs_list.append(seq_new_log_probs)
+                            if mask_valid == 0:
+                                seq_new_log_probs = torch.zeros(max_completion_len, device=seq_old_log_probs.device, dtype=seq_old_log_probs.dtype)
+                            else:
+                                full_log_probs = self.policy.compute_log_probs(
+                                    seq_gen_ids.unsqueeze(0),
+                                    attention_mask=seq_attn_mask.unsqueeze(0),
+                                )
+                                device = full_log_probs.device
+                                completion_positions = torch.arange(max_completion_len, device=device)
+                                source_positions = (seq_prompt_end_position.item() - 1) + completion_positions
+                                source_positions = source_positions.clamp(0, full_log_probs.size(1) - 1)
+                                valid_mask = source_positions < full_log_probs.size(1)
+                                seq_new_log_probs = full_log_probs[0, source_positions]
+                                seq_new_log_probs = torch.where(valid_mask, seq_new_log_probs,
+                                                               torch.tensor(0.0, device=device, dtype=seq_new_log_probs.dtype))
+                            new_log_probs_list.append(seq_new_log_probs)
 
                     mb_old_log_probs = pad_sequence(
                         selected_old_log_probs,
@@ -1038,21 +983,34 @@ class GRPO(BaseAlgorithm):
 
                     self.optimizer.zero_grad()
 
+                    # Loss computation with autocast (CUDA only)
                     self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_loss")
-                    loss, mb_metrics = self.compute_loss(
-                        mb_new_log_probs,
-                        mb_old_log_probs,
-                        mb_advantages,
-                        mb_ref_log_probs,
-                        mb_completion_mask,
-                    )
+                    with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
+                        loss, mb_metrics = self.compute_loss(
+                            mb_new_log_probs,
+                            mb_old_log_probs,
+                            mb_advantages,
+                            mb_ref_log_probs,
+                            mb_completion_mask,
+                        )
                     self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_loss")
 
+                    # Backward pass with optional gradient scaling (FP16 only, not BF16)
                     self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_backward")
-                    loss.backward()
+                    if self.use_grad_scaler:
+                        # FP16: Scale loss to prevent gradient underflow
+                        self.grad_scaler.scale(loss).backward()
+                    else:
+                        # BF16/FP32: No scaling needed
+                        loss.backward()
                     self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_backward")
 
+                    # Gradient clipping (with scaler support for FP16)
                     self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_clip")
+                    if self.use_grad_scaler:
+                        # FP16: Unscale gradients before clipping
+                        self.grad_scaler.unscale_(self.optimizer)
+
                     grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
                         self.policy.parameters(), max_norm=self.gradient_clip
                     )
@@ -1072,8 +1030,15 @@ class GRPO(BaseAlgorithm):
                         theta_before = torch.nn.utils.parameters_to_vector(self.policy.parameters()).float()
                         theta_norm_before = theta_before.norm().item()
 
+                    # Optimizer step (with scaler support for FP16)
                     self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_update")
-                    self.optimizer.step()
+                    if self.use_grad_scaler:
+                        # FP16: Scaled optimizer step + scaler update
+                        self.grad_scaler.step(self.optimizer)
+                        self.grad_scaler.update()
+                    else:
+                        # BF16/FP32: Normal optimizer step
+                        self.optimizer.step()
 
                     with torch.no_grad():
                         theta_after = torch.nn.utils.parameters_to_vector(self.policy.parameters()).float()
@@ -1491,12 +1456,13 @@ class GRPO(BaseAlgorithm):
         # Handle case where ref_policy may be None (when kl_coef=0)
         ref_policy_state = self.ref_policy.state_dict() if self.ref_policy is not None else None
 
-        # Create checkpoint with scheduler state
+        # Create checkpoint with scheduler and scaler state
         checkpoint = {
             "policy_state_dict": self.policy.state_dict(),
             "ref_policy_state_dict": ref_policy_state,
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.lr_scheduler.state_dict() if self.lr_scheduler is not None else None,
+            "scaler_state_dict": self.grad_scaler.state_dict() if self.grad_scaler is not None else None,
             "config": self.config,
             "total_steps": self.total_steps,
             "episode": self.episode,
@@ -1513,6 +1479,10 @@ class GRPO(BaseAlgorithm):
         if self.ref_policy is not None and checkpoint.get("ref_policy_state_dict") is not None:
             self.ref_policy.load_state_dict(checkpoint["ref_policy_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        # Load gradient scaler state if it exists (for FP16 training)
+        if self.grad_scaler is not None and checkpoint.get("scaler_state_dict") is not None:
+            self.grad_scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
         # Get LR values for smart warmup decision
         checkpoint_lr = self.optimizer.param_groups[0]['lr']

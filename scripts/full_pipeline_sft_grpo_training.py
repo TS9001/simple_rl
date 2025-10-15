@@ -846,26 +846,26 @@ def main():
         "training": {
             "batch_size": 32,  # REDUCED from 32 → 16 for BF16 stability (smaller updates)
             "rollout_batch_size": 8,  # REDUCED from 8 → 4 for BF16 stability (less memory pressure)
-            "gradient_clip": 1.0,  # TIGHTENED from 0.1 → 0.05 for BF16 stability (prevent explosion)
+            "gradient_clip": 3.0,  # TIGHTENED from 0.1 → 0.05 for BF16 stability (prevent explosion)
             "max_new_tokens": 800,
             "min_new_tokens": 50,  # LOWERED from 150 → 50 to allow </answer> early stopping
-            "temperature": 0.6,
+            "temperature": 1,
             "num_episodes": 500,
-            "minibatch_size": 64,  # REDUCED from 64 → 32 for BF16 stability (smaller updates)
+            "minibatch_size": 128,  # REDUCED from 64 → 32 for BF16 stability (smaller updates)
             "update_epochs": 1,
             "top_p": 0.9,
             "entropy_coef": 0.005,  # Increased from 0.002 → 0.005 for more exploration
-            "policy_loss_type": "sequence",  # CHANGED from "token" → "sequence" for better gradients
+            "policy_loss_type": "token",  # CHANGED from "token" → "sequence" for better gradients
             "resample_batch_per_episode": True,  # ← CRITICAL: Set to True to disable fixed batch!
             # Clipping parameters (all validated in overfit test)
             "kl_estimator": "k3",
-            "kl_clamp_min": -1.5,  # TIGHTENED from -2.0 → -1.5 for BF16 stability
-            "kl_clamp_max": 1.5,  # TIGHTENED from 2.0 → 1.5 for BF16 stability
+            "kl_clamp_min": -2.0,  # TIGHTENED from -2.0 → -1.5 for BF16 stability
+            "kl_clamp_max": 2.0,  # TIGHTENED from 2.0 → 1.5 for BF16 stability
             "kl_reduction": "mean",
-            "policy_log_ratio_clamp_min": -1.5,  # TIGHTENED from -2.0 → -1.5 for BF16 stability
-            "policy_log_ratio_clamp_max": 1.5,  # TIGHTENED from 2.0 → 1.5 for BF16 stability
-            "advantage_clip_min": -1.5,  # TIGHTENED from -2.0 → -1.5 for BF16 stability
-            "advantage_clip_max": 1.5,  # TIGHTENED from 2.0 → 1.5 for BF16 stability
+            "policy_log_ratio_clamp_min": -2.0,  # TIGHTENED from -2.0 → -1.5 for BF16 stability
+            "policy_log_ratio_clamp_max": 2.0,  # TIGHTENED from 2.0 → 1.5 for BF16 stability
+            "advantage_clip_min": -2.0,  # TIGHTENED from -2.0 → -1.5 for BF16 stability
+            "advantage_clip_max": 2.0,  # TIGHTENED from 2.0 → 1.5 for BF16 stability
             "stop_sequences": ["</answer>"],
         },
         "model": {

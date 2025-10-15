@@ -84,6 +84,12 @@ def compute_ppo_policy_loss(
             "Must provide either clip_epsilon OR both clip_epsilon_low and clip_epsilon_high"
         )
 
+    # NUMERICAL STABILITY: Ensure ratio computation in FP32
+    # Critical for RL stability - policy gradients are sensitive to precision
+    new_log_probs = new_log_probs.float()
+    old_log_probs = old_log_probs.float()
+    completion_mask = completion_mask.float()
+
     # Sum log probs over sequence to get sequence-level log probability
     # This makes policy loss sequence-level (each sequence contributes equally)
     new_log_probs_sum = (new_log_probs * completion_mask).sum(dim=-1)  # [batch]
@@ -188,6 +194,12 @@ def compute_ppo_policy_loss_token_level(
         raise ValueError(
             "Must provide either clip_epsilon OR both clip_epsilon_low and clip_epsilon_high"
         )
+
+    # NUMERICAL STABILITY: Ensure ratio computation in FP32
+    # Critical for RL stability - policy gradients are sensitive to precision
+    new_log_probs = new_log_probs.float()
+    old_log_probs = old_log_probs.float()
+    completion_mask = completion_mask.float()
 
     # Compute log ratio per token: log(π_new(t) / π_old(t))
     log_ratio_per_token = new_log_probs - old_log_probs.detach()  # [batch, seq_len] - detach old policy
