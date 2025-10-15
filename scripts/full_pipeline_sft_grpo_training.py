@@ -9,7 +9,31 @@ This script runs the complete training pipeline:
 3. Evaluation and visualization
 
 Usage:
+    # Local machine:
     python scripts/full_pipeline_sft_grpo_training.py
+
+    # Remote server (keeps running after SSH disconnect):
+    nohup python -u scripts/full_pipeline_sft_grpo_training.py > training.log 2>&1 &
+
+    # Monitor progress from another terminal:
+    tail -f training.log                    # View log output
+    watch -n 5 cat logs/progress.json       # Watch JSON progress
+    python scripts/monitor_training.py      # Use monitoring script
+
+Remote Server Setup:
+    1. Connect to server: ssh user@server
+    2. Navigate to project: cd /path/to/simple_rl
+    3. Start training: nohup python -u scripts/full_pipeline_sft_grpo_training.py > training.log 2>&1 &
+    4. Get process ID: echo $!
+    5. Disconnect safely: exit
+    6. Reconnect and monitor: tail -f training.log
+    7. Kill if needed: kill <PID>
+
+Output Files:
+    - training.log: Complete console output (all print statements)
+    - logs/training_*.log: Structured logging output
+    - logs/progress.json: Real-time progress tracking (updated every episode)
+    - checkpoints/: Model checkpoints (saved every N episodes)
 """
 
 import os
@@ -18,6 +42,8 @@ import hashlib
 import tarfile
 import shutil
 import json
+import time
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -49,6 +75,86 @@ from simple_rl.utils.dataset_cache import (
     save_cot_cache,
 )
 from simple_rl.utils.notebook_logger import setup_notebook_logger
+
+# ============================================================
+# Progress Tracking for Remote Monitoring
+# ============================================================
+
+class ProgressTracker:
+    """Tracks training progress and writes to JSON file for remote monitoring."""
+
+    def __init__(self, log_dir="logs"):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.progress_file = self.log_dir / "progress.json"
+        self.start_time = time.time()
+
+        self.progress = {
+            "status": "initializing",
+            "phase": "setup",
+            "start_time": datetime.now().isoformat(),
+            "last_update": datetime.now().isoformat(),
+            "elapsed_time_seconds": 0,
+            "current_episode": 0,
+            "total_episodes": 0,
+            "progress_percent": 0.0,
+            "latest_metrics": {},
+            "checkpoints": [],
+            "error": None
+        }
+        self._save()
+
+    def update(self, **kwargs):
+        """Update progress with new information."""
+        self.progress.update(kwargs)
+        self.progress["last_update"] = datetime.now().isoformat()
+        self.progress["elapsed_time_seconds"] = int(time.time() - self.start_time)
+
+        # Calculate progress percentage
+        if self.progress["total_episodes"] > 0:
+            self.progress["progress_percent"] = (
+                self.progress["current_episode"] / self.progress["total_episodes"] * 100.0
+            )
+
+        self._save()
+
+    def update_metrics(self, metrics):
+        """Update latest metrics."""
+        self.progress["latest_metrics"] = {
+            k: float(v) if isinstance(v, (int, float, np.number)) else v
+            for k, v in metrics.items()
+        }
+        self.progress["last_update"] = datetime.now().isoformat()
+        self._save()
+
+    def add_checkpoint(self, checkpoint_path):
+        """Record a new checkpoint."""
+        self.progress["checkpoints"].append({
+            "path": str(checkpoint_path),
+            "episode": self.progress["current_episode"],
+            "timestamp": datetime.now().isoformat()
+        })
+        self._save()
+
+    def set_error(self, error_msg):
+        """Record an error."""
+        self.progress["status"] = "error"
+        self.progress["error"] = str(error_msg)
+        self.progress["last_update"] = datetime.now().isoformat()
+        self._save()
+
+    def complete(self):
+        """Mark training as complete."""
+        self.progress["status"] = "completed"
+        self.progress["progress_percent"] = 100.0
+        self.progress["last_update"] = datetime.now().isoformat()
+        self._save()
+
+    def _save(self):
+        """Save progress to JSON file."""
+        with open(self.progress_file, 'w') as f:
+            json.dump(self.progress, f, indent=2)
+
 
 # ============================================================
 # Configuration
@@ -86,39 +192,47 @@ DATASET_CACHE_DIR = "dataset_cache"
 # Helper Functions
 # ============================================================
 
-def download_and_extract_cot_archive(url, extract_path="cot_archive"):
+def download_and_extract_cot_archive(url, extract_path="cot_archive", logger=None):
     """Download and extract the CoT archive if not already done."""
     archive_path = os.path.join(extract_path, "cot.tar.gz")
     if not os.path.exists(extract_path):
         os.makedirs(extract_path, exist_ok=True)
 
     if not os.path.exists(archive_path):
-        print("Downloading CoT archive from reference notebook...")
+        if logger:
+
+            logger.info("Downloading CoT archive from reference notebook...")
         r = requests.get(url, stream=True)
         with open(archive_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
-        print(f"✓ Downloaded to {archive_path}")
+        if logger:
+
+            logger.info(f"✓ Downloaded to {archive_path}")
 
     # Extract the archive if not already extracted
     extract_dir = os.path.join(extract_path, "cot_files")
     if not os.path.exists(extract_dir):
-        print("Extracting CoT archive...")
+        if logger:
+
+            logger.info("Extracting CoT archive...")
         with tarfile.open(archive_path, "r:gz") as tar:
             tar.extractall(path=extract_dir)
-        print(f"✓ Extracted to {extract_dir}")
+        if logger:
+
+            logger.info(f"✓ Extracted to {extract_dir}")
 
     return extract_dir
 
 
-def prepare_cot_dataset_for_sft(system_prompt, num_examples=500):
+def prepare_cot_dataset_for_sft(system_prompt, num_examples=500, logger=None):
     """
     Prepare high-quality CoT examples from the reference notebook's dataset.
     Returns data in the same format as prepare_gsm8k_for_sft().
     """
     cot_url = "https://github.com/aburkov/theLMbook/releases/download/v1.0.0/cot.tar.gz"
-    extract_dir = download_and_extract_cot_archive(cot_url)
+    extract_dir = download_and_extract_cot_archive(cot_url, logger=logger)
 
     # Load GSM8K to get questions
     data = load_dataset('gsm8k', 'main')["train"]
@@ -145,13 +259,18 @@ def prepare_cot_dataset_for_sft(system_prompt, num_examples=500):
         if len(prompts) >= num_examples:
             break
 
-    print(f"\n✓ Loaded {len(prompts)} high-quality CoT examples")
-    print(f"  These have cleaner reasoning than raw GSM8K")
+    if logger:
+
+
+        logger.info(f"\n✓ Loaded {len(prompts)} high-quality CoT examples")
+    if logger:
+
+        logger.info(f"  These have cleaner reasoning than raw GSM8K")
 
     return {"prompts": prompts, "completions": completions}
 
 
-def setup_device():
+def setup_device(logger):
     """Setup and return the appropriate device."""
     # Set random seeds for reproducibility
     torch.manual_seed(42)
@@ -167,23 +286,41 @@ def setup_device():
     else:
         device = torch.device("cpu")
 
-    print(f"Using device: {device}")
+    if logger:
+
+
+        logger.info(f"Using device: {device}")
     return device
 
 
-def run_sft_training(sft_config, sft_train_data_cot, sft_val_data):
+def run_sft_training(sft_config, sft_train_data_cot, sft_val_data, logger):
     """Run SFT training and return results."""
-    print("\n" + "="*60)
-    print("STARTING SFT TRAINING WITH HIGH-QUALITY CoT DATASET")
-    print("="*60)
+    if logger:
+
+        logger.info("\n" + "="*60)
+    if logger:
+
+        logger.info("STARTING SFT TRAINING WITH HIGH-QUALITY CoT DATASET")
+    if logger:
+
+        logger.info("="*60)
 
     # Initialize SFT
-    print("Initializing SFT...")
+    if logger:
+
+        logger.info("Initializing SFT...")
     sft = SFT(config=sft_config, use_wandb=False)
 
-    print(f"Using {len(sft_train_data_cot['prompts'])} high-quality CoT examples")
-    print(f"Note: Checkpoints will be auto-saved every {sft_config['logging']['save_interval']} steps")
-    print("="*60 + "\n")
+    if logger:
+
+
+        logger.info(f"Using {len(sft_train_data_cot['prompts'])} high-quality CoT examples")
+    if logger:
+
+        logger.info(f"Note: Checkpoints will be auto-saved every {sft_config['logging']['save_interval']} steps")
+    if logger:
+
+        logger.info("="*60 + "\n")
 
     # Train the model
     sft_train_data_cot["debug_boundary"] = True
@@ -193,11 +330,22 @@ def run_sft_training(sft_config, sft_train_data_cot, sft_val_data):
         num_episodes=sft_config['training']['num_epochs']
     )
 
-    print("\n" + "="*60)
-    print("SFT TRAINING COMPLETE")
-    print("="*60)
-    print(f"Total time: {sft_results['total_time']:.2f} seconds ({sft_results['total_time']/60:.2f} minutes)")
-    print(f"Final loss: {sft_results['final_loss']:.4f}")
+    if logger:
+
+
+        logger.info("\n" + "="*60)
+    if logger:
+
+        logger.info("SFT TRAINING COMPLETE")
+    if logger:
+
+        logger.info("="*60)
+    if logger:
+
+        logger.info(f"Total time: {sft_results['total_time']:.2f} seconds ({sft_results['total_time']/60:.2f} minutes)")
+    if logger:
+
+        logger.info(f"Final loss: {sft_results['final_loss']:.4f}")
 
     # Save SFT checkpoint
     sft_checkpoint_dir = Path("checkpoints/pipeline_stages/01_after_sft")
@@ -208,13 +356,17 @@ def run_sft_training(sft_config, sft_train_data_cot, sft_val_data):
 
     if os.path.exists(sft_checkpoint_path):
         file_size = os.path.getsize(sft_checkpoint_path) / (1024**3)
-        print(f"✓ Saved SFT checkpoint: {sft_checkpoint_path}")
-        print(f"  Checkpoint size: {file_size:.2f} GB")
+        if logger:
+
+            logger.info(f"✓ Saved SFT checkpoint: {sft_checkpoint_path}")
+        if logger:
+
+            logger.info(f"  Checkpoint size: {file_size:.2f} GB")
 
     return sft, sft_results, sft_checkpoint_path
 
 
-def visualize_grpo_results(grpo_training_metrics, grpo_validation_metrics, grpo):
+def visualize_grpo_results(grpo_training_metrics, grpo_validation_metrics, grpo, logger):
     """Create visualization plots for GRPO training."""
     fig, axes = plt.subplots(5, 2, figsize=(14, 20))
     fig.suptitle('GRPO Training and Validation Metrics', fontsize=16)
@@ -322,31 +474,65 @@ def visualize_grpo_results(grpo_training_metrics, grpo_validation_metrics, grpo)
     output_dir = Path("results/plots")
     output_dir.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_dir / "grpo_training_metrics.png", dpi=150, bbox_inches='tight')
-    print(f"✓ Saved plot to {output_dir / 'grpo_training_metrics.png'}")
+    if logger:
+
+        logger.info(f"✓ Saved plot to {output_dir / 'grpo_training_metrics.png'}")
 
     plt.show()
 
     # Print summary
-    print("\n" + "="*60)
-    print("GRPO TRAINING SUMMARY")
-    print("="*60)
-    print(f"Final Total Loss: {grpo_training_metrics['total_loss'][-1]:.4f}")
-    print(f"Final KL Divergence: {grpo_training_metrics['kl_divergence'][-1]:.4f}")
-    print(f"Final Mean Reward: {grpo_training_metrics['reward_mean'][-1]:.3f}")
-    print(f"Average Reward (last 5 episodes): {np.mean(grpo_training_metrics['reward_mean'][-5:]):.3f}")
-    print(f"Total Tokens Processed: {grpo_training_metrics['total_tokens'][-1]:,}")
-    print(f"Average Processing Speed: {np.mean(grpo_training_metrics['tokens_per_second']):.1f} tokens/second")
+    if logger:
+
+        logger.info("\n" + "="*60)
+    if logger:
+
+        logger.info("GRPO TRAINING SUMMARY")
+    if logger:
+
+        logger.info("="*60)
+    if logger:
+
+        logger.info(f"Final Total Loss: {grpo_training_metrics['total_loss'][-1]:.4f}")
+    if logger:
+
+        logger.info(f"Final KL Divergence: {grpo_training_metrics['kl_divergence'][-1]:.4f}")
+    if logger:
+
+        logger.info(f"Final Mean Reward: {grpo_training_metrics['reward_mean'][-1]:.3f}")
+    if logger:
+
+        logger.info(f"Average Reward (last 5 episodes): {np.mean(grpo_training_metrics['reward_mean'][-5:]):.3f}")
+    if logger:
+
+        logger.info(f"Total Tokens Processed: {grpo_training_metrics['total_tokens'][-1]:,}")
+    if logger:
+
+        logger.info(f"Average Processing Speed: {np.mean(grpo_training_metrics['tokens_per_second']):.1f} tokens/second")
 
     # Gradient statistics
-    print("\n" + "="*60)
-    print("GRADIENT NORM STATISTICS")
-    print("="*60)
-    print(f"Mean Gradient Norm: {np.mean(grpo_training_metrics['grad_norm']):.3f}")
-    print(f"Max Gradient Norm: {np.max(grpo_training_metrics['grad_norm']):.3f}")
-    print(f"Gradient Clip Threshold: {grpo.gradient_clip}")
+    if logger:
+
+        logger.info("\n" + "="*60)
+    if logger:
+
+        logger.info("GRADIENT NORM STATISTICS")
+    if logger:
+
+        logger.info("="*60)
+    if logger:
+
+        logger.info(f"Mean Gradient Norm: {np.mean(grpo_training_metrics['grad_norm']):.3f}")
+    if logger:
+
+        logger.info(f"Max Gradient Norm: {np.max(grpo_training_metrics['grad_norm']):.3f}")
+    if logger:
+
+        logger.info(f"Gradient Clip Threshold: {grpo.gradient_clip}")
     grad_norms = np.array(grpo_training_metrics['grad_norm'])
     clipped_fraction = (grad_norms > grpo.gradient_clip).sum() / len(grad_norms) * 100
-    print(f"Gradients Clipped: {clipped_fraction:.1f}% of updates")
+    if logger:
+
+        logger.info(f"Gradients Clipped: {clipped_fraction:.1f}% of updates")
 
 
 # ============================================================
@@ -360,23 +546,23 @@ def main():
     logger, log_path = setup_notebook_logger("logs", "training")
 
     # Logger already outputs to both console and file automatically
-    print("="*60)
-    print("Full SFT + GRPO Training Pipeline")
-    print("="*60)
-    print(f"📋 Log file: {log_path}")
-    print("="*60)
+    logger.info("="*60)
+    logger.info("Full SFT + GRPO Training Pipeline")
+    logger.info("="*60)
+    logger.info(f"📋 Log file: {log_path}")
+    logger.info("="*60)
 
     # Setup
-    device = setup_device()
-    print(f"Model: {MODEL_NAME}")
-    print(f"System Prompt: {SYSTEM_PROMPT.strip()}")
+    device = setup_device(logger)
+    logger.info(f"Model: {MODEL_NAME}")
+    logger.info(f"System Prompt: {SYSTEM_PROMPT.strip()}")
 
     # --------------------------------------------------------
     # 1. Load and Prepare Dataset (with caching for deterministic loading)
     # --------------------------------------------------------
-    print("\n" + "="*60)
-    print("Loading and Preparing Dataset (with caching)")
-    print("="*60)
+    logger.info("\n" + "="*60)
+    logger.info("Loading and Preparing Dataset (with caching)")
+    logger.info("="*60)
 
     # Define splits (used for cache key generation)
     gsm8k_splits = {
@@ -387,7 +573,7 @@ def main():
     }
 
     # Try to load from cache first
-    print("\n🔍 Checking for cached GSM8K dataset...")
+    logger.info("\n🔍 Checking for cached GSM8K dataset...")
     cached_data = load_gsm8k_cache(
         cache_dir=DATASET_CACHE_DIR,
         splits=gsm8k_splits,
@@ -396,14 +582,14 @@ def main():
 
     if cached_data is not None:
         # Load from cache (fast, deterministic)
-        print("✓ Loading dataset from cache (deterministic)")
+        logger.info("✓ Loading dataset from cache (deterministic)")
         (sft_train_data, sft_val_data, sft_test_data,
          grpo_train_prompts, grpo_train_answers,
          grpo_val_prompts, grpo_val_answers,
          grpo_test_prompts, grpo_test_answers) = cached_data
     else:
         # Load from HuggingFace and process (slow, first time only)
-        print("⏳ Cache not found, loading from HuggingFace and processing...")
+        logger.info("⏳ Cache not found, loading from HuggingFace and processing...")
 
         # Load SFT data
         dataset_sft_train, dataset_val, dataset_test = load_gsm8k_dataset(
@@ -446,7 +632,7 @@ def main():
         )
 
     # Load high-quality CoT dataset (also with caching)
-    print("\n🔍 Checking for cached CoT dataset...")
+    logger.info("\n🔍 Checking for cached CoT dataset...")
     cot_num_examples = 500
     sft_train_data_cot = load_cot_cache(
         cache_dir=DATASET_CACHE_DIR,
@@ -456,8 +642,8 @@ def main():
 
     if sft_train_data_cot is None:
         # Load from source and cache
-        print("⏳ CoT cache not found, downloading and processing...")
-        sft_train_data_cot = prepare_cot_dataset_for_sft(SYSTEM_PROMPT, num_examples=cot_num_examples)
+        logger.info("⏳ CoT cache not found, downloading and processing...")
+        sft_train_data_cot = prepare_cot_dataset_for_sft(SYSTEM_PROMPT, num_examples=cot_num_examples, logger=logger)
 
         # Save to cache
         save_cot_cache(
@@ -467,15 +653,15 @@ def main():
             sft_train_data_cot=sft_train_data_cot
         )
     else:
-        print(f"✓ Loaded {len(sft_train_data_cot['prompts'])} CoT examples from cache")
+        logger.info(f"✓ Loaded {len(sft_train_data_cot['prompts'])} CoT examples from cache")
 
-    print(f"\n{'='*60}")
-    print("Dataset prepared for full pipeline (NO OVERLAP)")
-    print(f"{'='*60}")
-    print(f"SFT Training samples: {len(sft_train_data_cot['prompts'])} (high-quality CoT)")
-    print(f"GRPO Training samples: {len(grpo_train_prompts)}")
-    print(f"Validation samples: {len(sft_val_data['prompts'])}")
-    print(f"Test samples: {len(sft_test_data['prompts'])}")
+    logger.info(f"\n{'='*60}")
+    logger.info("Dataset prepared for full pipeline (NO OVERLAP)")
+    logger.info(f"{'='*60}")
+    logger.info(f"SFT Training samples: {len(sft_train_data_cot['prompts'])} (high-quality CoT)")
+    logger.info(f"GRPO Training samples: {len(grpo_train_prompts)}")
+    logger.info(f"Validation samples: {len(sft_val_data['prompts'])}")
+    logger.info(f"Test samples: {len(sft_test_data['prompts'])}")
 
     # --------------------------------------------------------
     # 2. SFT Training (Optional)
@@ -510,10 +696,10 @@ def main():
         }
 
         sft, sft_results, sft_checkpoint_path = run_sft_training(
-            sft_config, sft_train_data_cot, sft_val_data
+            sft_config, sft_train_data_cot, sft_val_data, logger
         )
     else:
-        print(f"\nSkipping SFT training, loading from checkpoint: {SFT_CHECKPOINT_PATH}")
+        logger.info(f"\nSkipping SFT training, loading from checkpoint: {SFT_CHECKPOINT_PATH}")
         sft_checkpoint_path = SFT_CHECKPOINT_PATH
 
     # --------------------------------------------------------
@@ -522,8 +708,8 @@ def main():
     grpo_config = {
         "algorithm": {
             "name": "grpo",
-            "group_size": 8,  # Keep at 8 (working well in overfit test)
-            "kl_coef": 0.01,  # Increased from 0.1 → 0.15 for more stability
+            "group_size": 16,  # INCREASED from 8 → 16 for more advantage dynamic range
+            "kl_coef": 0.08,  # INCREASED from 0.01 → 0.08 to prevent policy drift
             "clip_epsilon": 0.2,
             "normalize_rewards": True,
             "store_completions": False,
@@ -540,7 +726,7 @@ def main():
             "update_epochs": 1,
             "top_p": 0.9,
             "entropy_coef": 0.005,  # Increased from 0.002 → 0.005 for more exploration
-            "policy_loss_type": "token",
+            "policy_loss_type": "sequence",  # CHANGED from "token" → "sequence" for better gradients
             "resample_batch_per_episode": True,  # ← CRITICAL: Set to True to disable fixed batch!
             # Clipping parameters (all validated in overfit test)
             "kl_estimator": "k3",
@@ -549,8 +735,8 @@ def main():
             "kl_reduction": "mean",
             "policy_log_ratio_clamp_min": -2.0,
             "policy_log_ratio_clamp_max": 2.0,
-            "advantage_clip_min": -3.0,
-            "advantage_clip_max": 3.0,
+            "advantage_clip_min": -2.0,  # TIGHTENED from -3.0 → -2.0 (effective constraint)
+            "advantage_clip_max": 2.0,  # TIGHTENED from 3.0 → 2.0 (effective constraint)
             "stop_sequences": ["</answer>"],
         },
         "model": {
@@ -582,15 +768,17 @@ def main():
         },
         "optimizer": {
             "type": "adamw",
-            "lr": 1e-6,  # DECREASED from 3e-6 → 1e-6 for more stability
+            "lr": 5e-6,  # INCREASED from 1e-6 → 5e-6 (will use warmup when resuming)
             "weight_decay": 0.01,
             "betas": (0.9, 0.999),
             "eps": 1e-8,
             "fused": False,
-            # INCREASED warmup for stability
+            # Warmup parameters (for fresh start)
             "warmup_steps": 30,  # Increased from 10 → 30
             "warmup_start_lr": 1e-9,  # Decreased from 1e-8 → 1e-9
-            "warmup_type": "linear"
+            "warmup_type": "linear",
+            # Resume-specific warmup (when LR changes between checkpoint and config)
+            "resume_warmup_steps": 15,  # Warmup steps when resuming with higher LR
         },
         "optimization": {
             "mixed_precision": {
@@ -613,110 +801,114 @@ def main():
         }
     }
 
-    print("\n" + "="*70)
-    print("GRPO Configuration - UPDATED WITH OVERFIT TEST SETTINGS")
-    print("="*70)
-    print("\n📊 KEY CHANGES FROM OVERFIT TEST:")
-    print("  ✅ KL coefficient:     0.10 → 0.15 (more stability)")
-    print("  ✅ Gradient clip:      1.0 → 0.1 (MUCH tighter for stability)")
-    print("  ✅ Min new tokens:     150 → 50 (allow </answer> early stopping)")
-    print("  ✅ Entropy coef:       0.002 → 0.005 (more exploration)")
-    print("  ✅ Learning rate:      3e-6 → 1e-6 (more conservative)")
-    print("  ✅ Warmup steps:       10 → 30 (longer warmup)")
-    print("  ✅ Warmup start LR:    1e-8 → 1e-9 (lower start)")
-    print("  ✅ RESAMPLE BATCH:     ENABLED (normal training mode - not fixed batch!)")
-    print("\n📊 KEPT FOR FULL TRAINING (not from overfit):")
-    print("  • Batch size:          16 (not 4 - need more data coverage)")
-    print("  • Minibatch size:      32 (not 8 - better for full training)")
-    print("  • Num episodes:        500 (not 100 - full training run)")
-    print("\n⚠️  STOPPING BEHAVIOR:")
-    print("  • min_new_tokens=50: Forces at least 50 tokens before stopping")
-    print("  • stop_sequences=['</answer>']: Stops when </answer> appears")
-    print("  • Result: Model generates 50-400 tokens, stops at </answer> if present")
-    print("\n🧹 MEMORY MANAGEMENT:")
-    print("  • Cache clearing:      ENABLED on MPS (M4 unified memory)")
-    print("  • Garbage collection:  Forced every episode")
-    print("  • Timing data:         Auto-reset every 10 episodes")
-    print("="*70)
+    logger.info("\n" + "="*70)
+    logger.info("GRPO Configuration - STABILITY FIXES APPLIED")
+    logger.info("="*70)
+    logger.info("\n🔧 STABILITY FIXES (to prevent training collapse):")
+    logger.info("  ✅ KL coefficient:     0.01 → 0.08 (8x stronger - prevents policy drift)")
+    logger.info("  ✅ Learning rate:      1e-6 → 5e-6 (5x higher, with warmup on resume)")
+    logger.info("  ✅ Group size:         8 → 16 (more advantage dynamic range)")
+    logger.info("  ✅ Advantage clamps:   ±3.0 → ±2.0 (tighter, effective constraint)")
+    logger.info("  ✅ Policy loss:        token → sequence (better gradient magnitude)")
+    logger.info("\n📊 MAINTAINED FROM PREVIOUS CONFIG:")
+    logger.info("  • Gradient clip:       0.1 (tight for stability)")
+    logger.info("  • Batch size:          16 (good data coverage)")
+    logger.info("  • Minibatch size:      32 (efficient training)")
+    logger.info("  • Num episodes:        500 (full training run)")
+    logger.info("  • Min new tokens:      50 (allow </answer> early stopping)")
+    logger.info("  • Entropy coef:        0.005 (exploration)")
+    logger.info("\n🔄 RESUME BEHAVIOR:")
+    logger.info("  • If resuming with higher LR: 15-step warmup from checkpoint LR → config LR")
+    logger.info("  • If resuming with same/lower LR: No warmup, use config LR immediately")
+    logger.info("  • Past warmup phase: Scheduler disabled, fixed LR used")
+    logger.info("\n⚠️  STOPPING BEHAVIOR:")
+    logger.info("  • min_new_tokens=50: Forces at least 50 tokens before stopping")
+    logger.info("  • stop_sequences=['</answer>']: Stops when </answer> appears")
+    logger.info("  • Result: Model generates 50-400 tokens, stops at </answer> if present")
+    logger.info("\n🧹 MEMORY MANAGEMENT:")
+    logger.info("  • Cache clearing:      ENABLED on MPS (M4 unified memory)")
+    logger.info("  • Garbage collection:  Forced every episode")
+    logger.info("  • Timing data:         Auto-reset every 10 episodes")
+    logger.info("="*70)
 
     # --------------------------------------------------------
     # 4. Initialize GRPO with Checkpoint (SFT or Resume)
     # --------------------------------------------------------
     if CONTINUE_FROM > 0:
         # Resume from GRPO checkpoint
-        print("\n" + "="*60)
-        print(f"RESUMING FROM GRPO CHECKPOINT (Episode {CONTINUE_FROM})")
-        print("="*60)
+        logger.info("\n" + "="*60)
+        logger.info(f"RESUMING FROM GRPO CHECKPOINT (Episode {CONTINUE_FROM})")
+        logger.info("="*60)
 
         grpo_checkpoint_path = Path(f"checkpoints/grpo_qwen_math/checkpoint_episode_{CONTINUE_FROM}.pt")
-        print(f"Checkpoint path: {grpo_checkpoint_path}")
+        logger.info(f"Checkpoint path: {grpo_checkpoint_path}")
 
         # Load GRPO checkpoint
         grpo_checkpoint = torch.load(grpo_checkpoint_path, map_location=device)
 
-        print("\n" + "="*60)
-        print("CHECKPOINT CONTENTS:")
-        print("="*60)
-        print(f"Keys in checkpoint: {list(grpo_checkpoint.keys())}")
-        print(f"Episode: {grpo_checkpoint.get('episode')}")
-        print(f"Total steps: {grpo_checkpoint.get('total_steps')}")
-        print(f"Current episode: {grpo_checkpoint.get('current_episode')}")
+        logger.info("\n" + "="*60)
+        logger.info("CHECKPOINT CONTENTS:")
+        logger.info("="*60)
+        logger.info(f"Keys in checkpoint: {list(grpo_checkpoint.keys())}")
+        logger.info(f"Episode: {grpo_checkpoint.get('episode')}")
+        logger.info(f"Total steps: {grpo_checkpoint.get('total_steps')}")
+        logger.info(f"Current episode: {grpo_checkpoint.get('current_episode')}")
 
         # Show optimizer config from checkpoint
         opt_state = grpo_checkpoint["optimizer_state_dict"]
-        print(f"\nOptimizer state keys: {list(opt_state.keys())}")
+        logger.info(f"\nOptimizer state keys: {list(opt_state.keys())}")
         if "param_groups" in opt_state:
             pg = opt_state["param_groups"][0]
-            print(f"Optimizer param_group[0]:")
+            logger.info(f"Optimizer param_group[0]:")
             for key in ['lr', 'betas', 'eps', 'weight_decay']:
                 if key in pg:
-                    print(f"  {key}: {pg[key]}")
+                    logger.info(f"  {key}: {pg[key]}")
 
         # Show scheduler state from checkpoint
         sched_state = grpo_checkpoint.get("scheduler_state_dict")
-        print(f"\nScheduler state: {sched_state}")
+        logger.info(f"\nScheduler state: {sched_state}")
 
         # Show optimizer config from checkpoint's config
         checkpoint_config = grpo_checkpoint.get("config", {})
         checkpoint_opt_config = checkpoint_config.get("optimizer", {})
-        print(f"\nOptimizer config (from checkpoint):")
-        print(f"  lr: {checkpoint_opt_config.get('lr')}")
-        print(f"  warmup_steps: {checkpoint_opt_config.get('warmup_steps')}")
-        print(f"  warmup_start_lr: {checkpoint_opt_config.get('warmup_start_lr')}")
-        print("="*60)
+        logger.info(f"\nOptimizer config (from checkpoint):")
+        logger.info(f"  lr: {checkpoint_opt_config.get('lr')}")
+        logger.info(f"  warmup_steps: {checkpoint_opt_config.get('warmup_steps')}")
+        logger.info(f"  warmup_start_lr: {checkpoint_opt_config.get('warmup_start_lr')}")
+        logger.info("="*60)
 
         model_name = checkpoint_config["model"]["model_name"]
-        print(f"\nModel: {model_name}")
-        print(f"Resuming from episode: {grpo_checkpoint['episode']}")
+        logger.info(f"\nModel: {model_name}")
+        logger.info(f"Resuming from episode: {grpo_checkpoint['episode']}")
 
         # Load tokenizer only (lightweight, no weights)
-        print("\nLoading tokenizer...")
+        logger.info("\nLoading tokenizer...")
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        print("✓ Tokenizer loaded")
+        logger.info("✓ Tokenizer loaded")
 
         # Load model architecture without pretrained weights (much faster!)
-        print("\nLoading model architecture from config...")
+        logger.info("\nLoading model architecture from config...")
         from transformers import AutoConfig
         config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
         model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
         model = model.to(dtype=torch.float32)
-        print("✓ Model architecture loaded (no pretrained weights downloaded)")
+        logger.info("✓ Model architecture loaded (no pretrained weights downloaded)")
 
         # Load trained weights from GRPO checkpoint
         # GRPO wraps model in LanguageModel class, so keys have "model." prefix that needs to be removed
-        print("\nLoading trained weights from checkpoint...")
+        logger.info("\nLoading trained weights from checkpoint...")
         policy_state = grpo_checkpoint["policy_state_dict"]
 
         # Strip "model." prefix from keys (e.g., "model.model.embed_tokens.weight" -> "model.embed_tokens.weight")
         model_state = {k.replace("model.", "", 1): v for k, v in policy_state.items() if k.startswith("model.")}
 
         model.load_state_dict(model_state)
-        print("✓ Checkpoint weights loaded successfully")
+        logger.info("✓ Checkpoint weights loaded successfully")
 
         # Initialize GRPO
-        print("\nInitializing GRPO and restoring optimizer/scheduler state...")
+        logger.info("\nInitializing GRPO and restoring optimizer/scheduler state...")
         grpo = GRPO(
             config=grpo_config,
             batch_reward_fn=compute_math_rewards_batch,
@@ -725,47 +917,78 @@ def main():
             use_wandb=False
         )
 
-        # Restore optimizer state (momentum, variance, AND learning rate from checkpoint)
+        # Restore optimizer state (momentum, variance, etc.)
         grpo.optimizer.load_state_dict(grpo_checkpoint["optimizer_state_dict"])
+
+        # Get LR values for smart warmup decision
         checkpoint_lr = grpo.optimizer.param_groups[0]['lr']
-
-        print(f"  ✓ Optimizer state restored")
-        print(f"  ✓ Learning rate from checkpoint: {checkpoint_lr:.2e}")
-
-        # CRITICAL: Disable the scheduler when resuming!
-        # At episode 45, we're WAY past warmup (30 steps). We should continue with the checkpoint's LR.
-        # The scheduler was created fresh in GRPO.__init__ and would restart warmup - we don't want that!
+        config_lr = grpo_config["optimizer"]["lr"]
         total_steps = grpo_checkpoint.get("total_steps", 0)
-        warmup_steps = grpo_config["optimizer"]["warmup_steps"]
+        initial_warmup_steps = grpo_config["optimizer"]["warmup_steps"]
 
-        if total_steps >= warmup_steps:
-            # Past warmup - disable scheduler entirely
+        logger.info(f"  ✓ Optimizer state restored")
+        logger.info(f"  Checkpoint LR: {checkpoint_lr:.2e}, Config LR: {config_lr:.2e}")
+
+        # Smart LR handling based on checkpoint vs config
+        lr_increase_ratio = config_lr / checkpoint_lr if checkpoint_lr > 0 else 1.0
+
+        if config_lr > checkpoint_lr and lr_increase_ratio >= 1.5:
+            # Significant LR increase - use warmup to prevent instability
+            resume_warmup_steps = grpo_config["optimizer"].get("resume_warmup_steps", 15)
+            logger.info(f"  LR increasing {lr_increase_ratio:.1f}x - applying {resume_warmup_steps}-step warmup: {checkpoint_lr:.2e} → {config_lr:.2e}")
+
+            # Create a simple linear warmup scheduler
+            from torch.optim.lr_scheduler import LambdaLR
+
+            def warmup_lambda(step):
+                # Linear warmup from checkpoint_lr to config_lr
+                if step < resume_warmup_steps:
+                    alpha = step / resume_warmup_steps
+                    target_lr = checkpoint_lr + alpha * (config_lr - checkpoint_lr)
+                    return target_lr / config_lr  # LambdaLR multiplies by base_lr
+                else:
+                    return 1.0  # Use config_lr
+
+            # Set base LR to config_lr
+            for param_group in grpo.optimizer.param_groups:
+                param_group['lr'] = config_lr
+
+            # Create warmup scheduler
+            grpo.lr_scheduler = LambdaLR(grpo.optimizer, lr_lambda=warmup_lambda)
+
+            # Start at step 0 of warmup
+            grpo.optimizer.param_groups[0]['lr'] = checkpoint_lr
+
+        elif config_lr != checkpoint_lr:
+            # Small change or decrease - apply immediately, disable scheduler
+            for param_group in grpo.optimizer.param_groups:
+                param_group['lr'] = config_lr
             grpo.lr_scheduler = None
-            print(f"  ✓ Scheduler disabled (past warmup: step {total_steps}/{warmup_steps})")
-            print(f"  ✓ Will continue with fixed LR = {checkpoint_lr:.2e}")
+            logger.info(f"  ✓ LR set to {config_lr:.2e} (scheduler disabled)")
+
         else:
-            # Still in warmup phase - need to advance scheduler to correct position
-            print(f"  ⚠️  Still in warmup phase (step {total_steps}/{warmup_steps})")
-            print(f"  ⚠️  Advancing scheduler to step {total_steps}...")
-
-            # Step the scheduler to catch up to where we were
-            for _ in range(total_steps):
-                grpo.lr_scheduler.step()
-
-            final_lr = grpo.optimizer.param_groups[0]['lr']
-            print(f"  ✓ Scheduler advanced, current LR: {final_lr:.2e}")
+            # Same LR - check if we need to continue warmup or disable scheduler
+            if total_steps >= initial_warmup_steps:
+                grpo.lr_scheduler = None
+                logger.info(f"  ✓ Scheduler disabled (past warmup), LR = {config_lr:.2e}")
+            else:
+                logger.info(f"  Still in warmup phase, advancing scheduler to step {total_steps}...")
+                for _ in range(total_steps):
+                    grpo.lr_scheduler.step()
+                final_lr = grpo.optimizer.param_groups[0]['lr']
+                logger.info(f"  ✓ Scheduler advanced, current LR: {final_lr:.2e}")
 
         # CRITICAL: Restore reference policy (the original SFT model, not a copy of trained policy!)
         if "ref_policy_state_dict" in grpo_checkpoint and grpo_checkpoint["ref_policy_state_dict"] is not None:
             grpo.ref_policy.load_state_dict(grpo_checkpoint["ref_policy_state_dict"])
-            print(f"  ✓ Reference policy restored (KL constraint preserved)")
+            logger.info(f"  ✓ Reference policy restored (KL constraint preserved)")
         else:
-            print(f"  ⚠️  WARNING: No reference policy in checkpoint - KL divergence will be incorrect!")
+            logger.info(f"  ⚠️  WARNING: No reference policy in checkpoint - KL divergence will be incorrect!")
 
         # Restore total_steps for proper tracking
         if "total_steps" in grpo_checkpoint:
             grpo.total_steps = grpo_checkpoint["total_steps"]
-            print(f"  ✓ Training steps restored: {grpo.total_steps}")
+            logger.info(f"  ✓ Training steps restored: {grpo.total_steps}")
 
         # Restore episode counter
         # Checkpoint contains the LAST completed episode, so resume at NEXT episode
@@ -773,26 +996,26 @@ def main():
         last_completed_episode = grpo_checkpoint["episode"]
         grpo.current_episode = last_completed_episode + 1
 
-        print(f"  Last completed episode in checkpoint: {last_completed_episode}")
-        print(f"  Will resume training from episode: {grpo.current_episode}")
+        logger.info(f"  Last completed episode in checkpoint: {last_completed_episode}")
+        logger.info(f"  Will resume training from episode: {grpo.current_episode}")
 
-        print("\n" + "="*60)
-        print(f"✓ GRPO successfully resumed from episode {CONTINUE_FROM}")
-        print("="*60)
+        logger.info("\n" + "="*60)
+        logger.info(f"✓ GRPO successfully resumed from episode {CONTINUE_FROM}")
+        logger.info("="*60)
     else:
         # Start from SFT checkpoint or base model
-        print("\n" + "="*60)
-        print("Loading SFT checkpoint and initializing GRPO")
-        print("="*60)
-        print(f"Checkpoint path: {sft_checkpoint_path}")
+        logger.info("\n" + "="*60)
+        logger.info("Loading SFT checkpoint and initializing GRPO")
+        logger.info("="*60)
+        logger.info(f"Checkpoint path: {sft_checkpoint_path}")
 
         # Load SFT checkpoint
         sft_checkpoint = torch.load(sft_checkpoint_path, map_location=device)
         model_name = sft_checkpoint["config"]["model"]["model_name"]
-        print(f"Model: {model_name}")
+        logger.info(f"Model: {model_name}")
 
         # Load fresh model and tokenizer
-        print("\nLoading fresh model and tokenizer...")
+        logger.info("\nLoading fresh model and tokenizer...")
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             dtype=torch.float32,
@@ -803,12 +1026,12 @@ def main():
             tokenizer.pad_token = tokenizer.eos_token
 
         # Load SFT weights
-        print("Loading SFT weights into model...")
+        logger.info("Loading SFT weights into model...")
         model.load_state_dict(sft_checkpoint["model_state_dict"])
-        print("✓ SFT weights loaded successfully")
+        logger.info("✓ SFT weights loaded successfully")
 
         # Initialize GRPO
-        print("\nInitializing GRPO with SFT-trained model...")
+        logger.info("\nInitializing GRPO with SFT-trained model...")
         grpo = GRPO(
             config=grpo_config,
             batch_reward_fn=compute_math_rewards_batch,
@@ -817,9 +1040,9 @@ def main():
             use_wandb=False
         )
 
-        print("\n" + "="*60)
-        print("✓ GRPO successfully initialized with SFT-trained model")
-        print("="*60)
+        logger.info("\n" + "="*60)
+        logger.info("✓ GRPO successfully initialized with SFT-trained model")
+        logger.info("="*60)
 
     # --------------------------------------------------------
     # 5. GRPO Training
@@ -834,9 +1057,9 @@ def main():
         "answers": grpo_val_answers
     }
 
-    print("\n" + "="*60)
-    print("STARTING GRPO TRAINING")
-    print("="*60)
+    logger.info("\n" + "="*60)
+    logger.info("STARTING GRPO TRAINING")
+    logger.info("="*60)
 
     grpo_results = grpo.train(
         train_data=grpo_train_data,
@@ -844,19 +1067,19 @@ def main():
         num_episodes=grpo_config['training']['num_episodes']
     )
 
-    print("\n" + "="*60)
-    print("GRPO TRAINING COMPLETE")
-    print("="*60)
-    print(f"Total time: {grpo_results['total_time']:.2f} seconds ({grpo_results['total_time']/60:.2f} minutes)")
-    print(f"Total tokens processed: {grpo_results['training_metrics']['total_tokens'][-1]:,}")
-    print(f"Final reward: {grpo_results['final_reward']:.3f}")
+    logger.info("\n" + "="*60)
+    logger.info("GRPO TRAINING COMPLETE")
+    logger.info("="*60)
+    logger.info(f"Total time: {grpo_results['total_time']:.2f} seconds ({grpo_results['total_time']/60:.2f} minutes)")
+    logger.info(f"Total tokens processed: {grpo_results['training_metrics']['total_tokens'][-1]:,}")
+    logger.info(f"Final reward: {grpo_results['final_reward']:.3f}")
 
     # --------------------------------------------------------
     # 6. Evaluation
     # --------------------------------------------------------
-    print("\n" + "="*60)
-    print("GRPO MODEL EVALUATION")
-    print("="*60)
+    logger.info("\n" + "="*60)
+    logger.info("GRPO MODEL EVALUATION")
+    logger.info("="*60)
 
     grpo_metrics = evaluate_on_gsm8k(
         grpo,
@@ -881,24 +1104,25 @@ def main():
     # --------------------------------------------------------
     # 7. Visualization
     # --------------------------------------------------------
-    print("\n" + "="*60)
-    print("Creating Visualizations")
-    print("="*60)
+    logger.info("\n" + "="*60)
+    logger.info("Creating Visualizations")
+    logger.info("="*60)
 
     visualize_grpo_results(
-        grpo_results['training_metrics'],
-        grpo_results['validation_metrics'],
-        grpo
+        grpo_results[\'training_metrics\'],
+        grpo_results[\'validation_metrics\'],
+        grpo,
+        logger
     )
 
-    print("\n" + "="*60)
-    print("PIPELINE COMPLETE")
-    print("="*60)
+    logger.info("\n" + "="*60)
+    logger.info("PIPELINE COMPLETE")
+    logger.info("="*60)
 
     # Close logging
     from simple_rl.utils.notebook_logger import close_logger
     close_logger(logger)
-    print(f"✓ Training log saved to: {log_path}")
+    logger.info(f"✓ Training log saved to: {log_path}")
 
 
 if __name__ == "__main__":

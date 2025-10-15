@@ -31,13 +31,14 @@ def get_dtype_from_config(dtype_config: Union[str, torch.dtype, None]) -> Option
         raise ValueError(f"Unsupported dtype specification: {dtype_config!r}")
 
 
-def create_optimizer(model: torch.nn.Module, config: Dict[str, Any]) -> Tuple[torch.optim.Optimizer, Optional[torch.optim.lr_scheduler.LRScheduler]]:
+def create_optimizer(model: torch.nn.Module, config: Dict[str, Any], logger=None) -> Tuple[torch.optim.Optimizer, Optional[torch.optim.lr_scheduler.LRScheduler]]:
     """
     Create optimizer and optional learning rate scheduler from configuration.
 
     Args:
         model: PyTorch model to optimize
         config: Configuration dictionary with optimizer settings
+        logger: Optional logger for info messages
 
     Returns:
         Tuple of (optimizer, optional_scheduler)
@@ -94,7 +95,8 @@ def create_optimizer(model: torch.nn.Module, config: Dict[str, Any]) -> Tuple[to
                 end_factor=1.0,
                 total_iters=warmup_steps
             )
-            print(f"✓ LR warmup enabled: {warmup_steps} steps, {warmup_start_lr:.2e} → {lr:.2e}")
+            if logger:
+                logger.info(f"✓ LR warmup enabled: {warmup_steps} steps, {warmup_start_lr:.2e} → {lr:.2e}")
         else:
             # Constant warmup: stay at warmup_start_lr for warmup_steps, then jump to lr
             scheduler = torch.optim.lr_scheduler.ConstantLR(
@@ -102,7 +104,8 @@ def create_optimizer(model: torch.nn.Module, config: Dict[str, Any]) -> Tuple[to
                 factor=warmup_start_lr / lr,
                 total_iters=warmup_steps
             )
-            print(f"✓ LR warmup enabled (constant): {warmup_steps} steps at {warmup_start_lr:.2e}")
+            if logger:
+                logger.info(f"✓ LR warmup enabled (constant): {warmup_steps} steps at {warmup_start_lr:.2e}")
 
     return optimizer, scheduler
 
@@ -138,15 +141,16 @@ class OptimizerConfig:
         return self.optimizer
 
 
-def configure_optimizer(model: torch.nn.Module, config: Dict[str, Any]) -> Tuple[torch.optim.Optimizer, Optional[torch.optim.lr_scheduler.LRScheduler]]:
+def configure_optimizer(model: torch.nn.Module, config: Dict[str, Any], logger=None) -> Tuple[torch.optim.Optimizer, Optional[torch.optim.lr_scheduler.LRScheduler]]:
     """
     Configure optimizer and optional scheduler for a model using configuration.
 
     Args:
         model: PyTorch model to optimize
         config: Configuration dictionary
+        logger: Optional logger for info messages
 
     Returns:
         Tuple of (optimizer, optional_scheduler)
     """
-    return create_optimizer(model, config)
+    return create_optimizer(model, config, logger=logger)

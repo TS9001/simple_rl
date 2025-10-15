@@ -24,7 +24,6 @@ from torch.nn.utils.rnn import pad_sequence
 from simple_rl.algorithms.base import BaseAlgorithm
 from simple_rl.utils.huggingface_wrappers import LanguageModel
 from simple_rl.utils.device import get_target_device, clear_device_cache
-from simple_rl.utils.amp import create_amp_config
 from simple_rl.utils.optimization import configure_optimizer
 from simple_rl.utils.timing import TimingManager
 from simple_rl.utils.training_config import create_training_config
@@ -86,7 +85,6 @@ class GRPO_Reinforce(BaseAlgorithm):
         assert (
             frozen_params == total_params
         ), f"Not all parameters frozen: {frozen_params}/{total_params}"
-        print(f"✓ Reference model frozen: {frozen_params} parameters")
 
         # Use training config utility
         self.training_config = create_training_config(self.config)
@@ -107,9 +105,6 @@ class GRPO_Reinforce(BaseAlgorithm):
         self.top_k = self.training_config.top_k
         self.top_p = self.training_config.top_p
         self.gradient_clip = self.training_config.gradient_clip
-
-        # Set up AMP configuration
-        self._amp_config = create_amp_config(self.config)
 
         # Set up training components using utilities
         self.optimizer = configure_optimizer(self.policy, self.config)
@@ -504,8 +499,6 @@ class GRPO_Reinforce(BaseAlgorithm):
         total_sequences = len(prompts) * self.group_size
 
         # Process minibatches
-        autocast_ctx = self._amp_config.autocast
-
         for i in range(0, len(prompts), self.minibatch_size):
             end_idx = min(i + self.minibatch_size, len(prompts))
             mb_prompts = prompts[i:end_idx]
@@ -528,11 +521,10 @@ class GRPO_Reinforce(BaseAlgorithm):
             # Compute advantages
             advantages = self.compute_advantages(rewards)
 
-            # Compute loss under autocast context
-            with autocast_ctx:
-                loss, mb_metrics = self.compute_loss(
-                    log_probs, advantages, ref_log_probs, completion_mask
-                )
+            # Compute loss
+            loss, mb_metrics = self.compute_loss(
+                log_probs, advantages, ref_log_probs, completion_mask
+            )
 
             # Weight loss by fraction of sequences in this minibatch for proper averaging
             mb_sequences = len(mb_prompts) * self.group_size
@@ -541,10 +533,7 @@ class GRPO_Reinforce(BaseAlgorithm):
 
             # Backward pass (accumulate gradients)
             self.timing_manager.start_timer("backward_pass")
-            if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
-                self._amp_config.grad_scaler.scale(scaled_loss).backward()
-            else:
-                scaled_loss.backward()
+            scaled_loss.backward()
             self.timing_manager.end_timer("backward_pass")
 
             # Accumulate metrics (use weighted values to match actual training)
@@ -573,9 +562,6 @@ class GRPO_Reinforce(BaseAlgorithm):
 
         # Gradient clipping on accumulated gradients
         self.timing_manager.start_timer("gradient_clipping")
-        if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
-            self._amp_config.grad_scaler.unscale_(self.optimizer)
-
         torch.nn.utils.clip_grad_norm_(
             self.policy.parameters(), max_norm=self.gradient_clip
         )
@@ -583,11 +569,7 @@ class GRPO_Reinforce(BaseAlgorithm):
 
         # Update parameters
         self.timing_manager.start_timer("parameter_update")
-        if self._amp_config.enabled and self._amp_config.grad_scaler is not None:
-            self._amp_config.grad_scaler.step(self.optimizer)
-            self._amp_config.grad_scaler.update()
-        else:
-            self.optimizer.step()
+        self.optimizer.step()
         self.timing_manager.end_timer("parameter_update")
 
         # Update statistics
@@ -618,8 +600,6 @@ class GRPO_Reinforce(BaseAlgorithm):
         Returns:
             Dictionary of final metrics
         """
-        print(f"Starting GRPO training for {num_episodes} episodes...")
-
         final_metrics = {}
 
         for episode in range(num_episodes):
@@ -691,7 +671,6 @@ class GRPO_Reinforce(BaseAlgorithm):
                 )
 
         # Print final comprehensive timing summary
-        print(f"\n[TRAINING] Completed {num_episodes} episodes")
         self.timing_manager.print_timing_summary("FINAL TRAINING PERFORMANCE ANALYSIS")
 
         return final_metrics

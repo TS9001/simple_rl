@@ -20,6 +20,7 @@ import numpy as np
 import math
 
 from .base import BaseAlgorithm
+from simple_rl.utils.logging_utils import create_logger
 
 
 class SFTDataset(Dataset):
@@ -197,6 +198,7 @@ class SFT(BaseAlgorithm):
         # Load tokenizer
         if tokenizer is None:
             model_name = config["model"]["model_name"]
+            # Note: Logger not yet initialized, print is acceptable here
             print(f"Loading tokenizer: {model_name}")
             self.tokenizer = AutoTokenizer.from_pretrained(
                 model_name, trust_remote_code=True
@@ -211,6 +213,7 @@ class SFT(BaseAlgorithm):
         # Load model
         if model is None:
             model_name = config["model"]["model_name"]
+            # Note: Logger not yet initialized, print is acceptable here
             print(f"Loading model: {model_name}")
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
@@ -280,7 +283,12 @@ class SFT(BaseAlgorithm):
         # Training state
         self.global_step = 0
 
-        # Initialize wandb if requested
+        # Initialize logger
+        self.logger = create_logger(self.config)
+        if use_wandb:
+            self.logger.init_wandb()
+
+        # Initialize wandb if requested (legacy support)
         if use_wandb:
             import wandb
 
@@ -291,9 +299,9 @@ class SFT(BaseAlgorithm):
                 name=wandb_config.get("run_name", None),
             )
 
-        print(f"✓ SFT initialized with model: {config['model']['model_name']}")
-        print(f"  Total parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-        print(f"  Device: {self.device}")
+        self.logger.info(f"✓ SFT initialized with model: {config['model']['model_name']}")
+        self.logger.info(f"  Total parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        self.logger.info(f"  Device: {self.device}")
 
     def train(
         self,
@@ -375,13 +383,13 @@ class SFT(BaseAlgorithm):
                     self.model.config.use_cache = False
             self.model.gradient_checkpointing_enable()
 
-        print(f"Starting SFT training for {num_epochs} epochs...")
-        print(f"Batch size: {self.batch_size}")
-        print(f"Gradient accumulation steps: {self.gradient_accumulation_steps}")
-        print(
+        self.logger.info(f"Starting SFT training for {num_epochs} epochs...")
+        self.logger.info(f"Batch size: {self.batch_size}")
+        self.logger.info(f"Gradient accumulation steps: {self.gradient_accumulation_steps}")
+        self.logger.info(
             f"Effective batch size: {self.batch_size * self.gradient_accumulation_steps}"
         )
-        print("=" * 50)
+        self.logger.info("=" * 50)
 
         # Training metrics storage
         training_metrics = {
@@ -501,7 +509,7 @@ class SFT(BaseAlgorithm):
 
                     # Logging
                     if self.global_step % self.log_interval == 0:
-                        print(
+                        self.logger.info(
                             f"\nStep {self.global_step} | "
                             f"Loss: {loss.item() * self.gradient_accumulation_steps:.4f} | "
                             f"LR: {current_lr:.2e} | "
@@ -528,16 +536,16 @@ class SFT(BaseAlgorithm):
                         and val_data is not None
                         and self.global_step % self.validation_interval == 0
                     ):
-                        print(f"\n{'='*60}")
-                        print(f"VALIDATION AT STEP {self.global_step}")
-                        print(f"{'='*60}")
+                        self.logger.info(f"\n{'='*60}")
+                        self.logger.info(f"VALIDATION AT STEP {self.global_step}")
+                        self.logger.info(f"{'='*60}")
 
                         val_metrics = self._validate(val_data)
 
                         validation_metrics["step"].append(self.global_step)
                         validation_metrics["loss"].append(val_metrics["loss"])
 
-                        print(f"Validation Loss: {val_metrics['loss']:.4f}")
+                        self.logger.info(f"Validation Loss: {val_metrics['loss']:.4f}")
 
                         if self.use_wandb:
                             import wandb
@@ -557,12 +565,12 @@ class SFT(BaseAlgorithm):
                             checkpoint_dir / f"checkpoint_step_{self.global_step}.pt"
                         )
                         self.save_checkpoint(str(checkpoint_path))
-                        print(f"  → Saved checkpoint to {checkpoint_path}")
+                        self.logger.info(f"  → Saved checkpoint to {checkpoint_path}")
 
             # Flush any remaining gradients if last batch didn't trigger update
             # This handles edge case where len(dataloader) % gradient_accumulation_steps != 0
             if (batch_idx + 1) % self.gradient_accumulation_steps != 0:
-                print(f"\nFlushing remaining gradients from last {(batch_idx + 1) % self.gradient_accumulation_steps} batches...")
+                self.logger.info(f"\nFlushing remaining gradients from last {(batch_idx + 1) % self.gradient_accumulation_steps} batches...")
                 clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 self.scheduler.step()
@@ -572,23 +580,23 @@ class SFT(BaseAlgorithm):
             # Epoch summary
             epoch_time = time.time() - epoch_start_time
             avg_epoch_loss = epoch_loss_sum / len(train_dataloader) if len(train_dataloader) > 0 else float("nan")
-            print(
+            self.logger.info(
                 f"\nEpoch {epoch+1} completed in {epoch_time:.2f}s | Avg Loss: {avg_epoch_loss:.4f}"
             )
-            print("=" * 50)
+            self.logger.info("=" * 50)
         # Training complete
         total_training_time = time.time() - training_start_time
-        print("=" * 50)
-        print("Training complete!")
-        print(
+        self.logger.info("=" * 50)
+        self.logger.info("Training complete!")
+        self.logger.info(
             f"Total training time: {total_training_time:.2f} seconds ({total_training_time/60:.2f} minutes)"
         )
-        print(f"Total steps: {self.global_step}")
+        self.logger.info(f"Total steps: {self.global_step}")
 
         # Always save final checkpoint
         final_checkpoint_path = checkpoint_dir / f"checkpoint_step_{self.global_step}_final.pt"
         self.save_checkpoint(str(final_checkpoint_path))
-        print(f"  → Saved final checkpoint to {final_checkpoint_path}")
+        self.logger.info(f"  → Saved final checkpoint to {final_checkpoint_path}")
 
         return {
             "training_metrics": training_metrics,
@@ -734,9 +742,9 @@ class SFT(BaseAlgorithm):
             "perplexity": np.exp(avg_loss),
         }
 
-        print(f"Evaluation Results:")
-        print(f"  Loss: {metrics['loss']:.4f}")
-        print(f"  Perplexity: {metrics['perplexity']:.2f}")
+        self.logger.info(f"Evaluation Results:")
+        self.logger.info(f"  Loss: {metrics['loss']:.4f}")
+        self.logger.info(f"  Perplexity: {metrics['perplexity']:.2f}")
 
         return metrics
 
@@ -931,5 +939,5 @@ class SFT(BaseAlgorithm):
 
         self.global_step = checkpoint.get("global_step", 0)
 
-        print(f"✓ Loaded checkpoint from {path}")
-        print(f"  Resumed at step: {self.global_step}")
+        self.logger.info(f"✓ Loaded checkpoint from {path}")
+        self.logger.info(f"  Resumed at step: {self.global_step}")

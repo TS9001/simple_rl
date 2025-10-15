@@ -1,6 +1,8 @@
 """Logging and metrics utilities."""
 
+import logging
 import wandb
+from pathlib import Path
 from typing import Dict, Any, Optional
 
 
@@ -118,7 +120,7 @@ class MetricsAggregator:
 
 
 class Logger:
-    """Combined logging utility with wandb and console output."""
+    """Combined logging utility with wandb, console, and file output."""
 
     def __init__(self, config: Dict[str, Any]):
         """
@@ -131,6 +133,73 @@ class Logger:
         self.wandb_logger = WandbLogger(config) if config.get("use_wandb", False) else None
         self.metrics_aggregator = MetricsAggregator()
         self.total_steps = 0
+
+        # Set up Python logging for console + file output
+        self._setup_python_logger()
+
+    def _setup_python_logger(self) -> None:
+        """Set up Python logging with console and file handlers."""
+        # Get logging configuration
+        logging_config = self.config.get("logging", {})
+        log_level = logging_config.get("level", "INFO")
+        log_dir = logging_config.get("log_dir", "logs")
+        log_file = logging_config.get("log_file", "training.log")
+
+        # Create log directory
+        log_path = Path(log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+
+        # Create logger (use a unique name per config to avoid conflicts)
+        logger_name = f"simple_rl_{id(self)}"
+        self.python_logger = logging.getLogger(logger_name)
+        self.python_logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+
+        # Prevent duplicate handlers
+        if self.python_logger.handlers:
+            return
+
+        # Create formatters
+        detailed_formatter = logging.Formatter(
+            fmt="%(asctime)s | %(levelname)-8s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        simple_formatter = logging.Formatter("%(message)s")
+
+        # Console handler (simple format)
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(simple_formatter)
+        self.python_logger.addHandler(console_handler)
+
+        # File handler (detailed format) - force unbuffered writes for real-time monitoring
+        class FlushingFileHandler(logging.FileHandler):
+            def emit(self, record):
+                super().emit(record)
+                self.flush()
+
+        file_handler = FlushingFileHandler(log_path / log_file, mode='a')
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(detailed_formatter)
+        self.python_logger.addHandler(file_handler)
+
+        # Prevent propagation to root logger
+        self.python_logger.propagate = False
+
+    def info(self, message: str) -> None:
+        """Log info message to console and file."""
+        self.python_logger.info(message)
+
+    def debug(self, message: str) -> None:
+        """Log debug message to console and file."""
+        self.python_logger.debug(message)
+
+    def warning(self, message: str) -> None:
+        """Log warning message to console and file."""
+        self.python_logger.warning(message)
+
+    def error(self, message: str) -> None:
+        """Log error message to console and file."""
+        self.python_logger.error(message)
 
     def init_wandb(self, **kwargs) -> None:
         """Initialize wandb logging."""

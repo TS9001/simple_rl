@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from simple_rl.utils.device import get_target_device, apply_device_optimizations, clear_device_cache
-# from simple_rl.utils.compilation import ModelCompilationManager  # COMMENTED OUT - compilation disabled
 from simple_rl.utils.model_loading import load_huggingface_model_and_tokenizer, setup_tokenizer_and_model_config
 
 
@@ -77,20 +76,17 @@ class LanguageModel(nn.Module):
         self.vocab_size = self.model.config.vocab_size
         self.hidden_size = self.model.config.hidden_size
 
-        # Track compile state / optimizations
-        # self._compilation_manager = ModelCompilationManager(config)  # COMMENTED OUT - compilation disabled
+        # Track optimizations
         self._using_bettertransformer: bool = False
 
         # Resolve initial device placement and apply optimizations
         super().to(target_device)
-        # self._ensure_compiled()  # COMMENTED OUT - compilation disabled
         apply_device_optimizations()
 
     def to(self, *args, **kwargs):
         """Override to() to re-run backend-specific setup after device moves."""
 
         module = super().to(*args, **kwargs)
-        # self._ensure_compiled()  # COMMENTED OUT - compilation disabled
         apply_device_optimizations()
         return module
 
@@ -121,13 +117,6 @@ class LanguageModel(nn.Module):
         )
         return outputs.logits
 
-    # COMMENTED OUT - compilation disabled
-    # def _ensure_compiled(self) -> None:
-    #     """Compile the underlying model based on available backends."""
-    #     # Use the compilation manager
-    #     self.model = self._compilation_manager.ensure_compiled(self.model, self.device)
-
-
     def generate(
         self,
         prompt_ids: torch.Tensor,
@@ -154,8 +143,6 @@ class LanguageModel(nn.Module):
         Returns:
             Tuple of (generated_ids, attention_mask)
         """
-        # self._ensure_compiled()  # COMMENTED OUT - compilation disabled
-
         # Use default eos_token_id unless overridden in kwargs
         if 'eos_token_id' not in kwargs:
             kwargs['eos_token_id'] = self.tokenizer.eos_token_id

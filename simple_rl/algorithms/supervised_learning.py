@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 from .base import BaseAlgorithm
+from simple_rl.utils.logging_utils import create_logger
 
 
 class SupervisedLearning(BaseAlgorithm):
@@ -57,7 +58,12 @@ class SupervisedLearning(BaseAlgorithm):
         else:  # regression
             self.criterion = nn.MSELoss()
 
-        # Initialize wandb if requested
+        # Initialize logger
+        self.logger = create_logger(self.config)
+        if use_wandb:
+            self.logger.init_wandb()
+
+        # Initialize wandb if requested (legacy support)
         if use_wandb:
             wandb.init(
                 project=config.get("project_name", "supervised-learning"),
@@ -119,19 +125,16 @@ class SupervisedLearning(BaseAlgorithm):
             if self.use_wandb:
                 wandb.log(metrics)
 
-            # Print progress
+            # Log progress
             if epoch % max(1, num_epochs // 10) == 0:
-                print(
-                    f"Epoch {epoch}/{num_epochs} - Train Loss: {train_metrics['loss']:.4f}",
-                    end="",
-                )
+                msg = f"Epoch {epoch}/{num_epochs} - Train Loss: {train_metrics['loss']:.4f}"
                 if self.task_type == "classification" and "accuracy" in train_metrics:
-                    print(f", Train Acc: {train_metrics['accuracy']:.4f}", end="")
+                    msg += f", Train Acc: {train_metrics['accuracy']:.4f}"
                 if val_metrics:
-                    print(f", Val Loss: {val_metrics['loss']:.4f}", end="")
+                    msg += f", Val Loss: {val_metrics['loss']:.4f}"
                     if self.task_type == "classification":
-                        print(f", Val Acc: {val_metrics['accuracy']:.4f}", end="")
-                print()
+                        msg += f", Val Acc: {val_metrics['accuracy']:.4f}"
+                self.logger.info(msg)
 
             final_metrics = metrics
 

@@ -41,7 +41,8 @@ def save_dataset_cache(
     dataset_name: str,
     splits: Dict[str, str],
     system_prompt: str,
-    data: Dict[str, Any]
+    data: Dict[str, Any],
+    logger=None
 ) -> Path:
     """
     Save processed dataset to disk.
@@ -52,6 +53,7 @@ def save_dataset_cache(
         splits: Dictionary of split names and specifications
         system_prompt: System prompt used
         data: Dictionary containing processed data to save
+        logger: Optional logger for info messages
 
     Returns:
         Path to saved cache file
@@ -74,14 +76,16 @@ def save_dataset_cache(
         "data": data
     }
 
-    print(f"\n💾 Saving dataset cache to: {cache_file}")
+    if logger:
+        logger.info(f"\n💾 Saving dataset cache to: {cache_file}")
     with open(cache_file, 'w', encoding='utf-8') as f:
         json.dump(cache_data, f, indent=2, ensure_ascii=False)
 
-    # Print file size
+    # Log file size
     size_mb = cache_file.stat().st_size / (1024 * 1024)
-    print(f"   Cache file size: {size_mb:.2f} MB")
-    print(f"   ✓ Dataset cached successfully")
+    if logger:
+        logger.info(f"   Cache file size: {size_mb:.2f} MB")
+        logger.info(f"   ✓ Dataset cached successfully")
 
     return cache_file
 
@@ -90,7 +94,8 @@ def load_dataset_cache(
     cache_dir: str,
     dataset_name: str,
     splits: Dict[str, str],
-    system_prompt: str
+    system_prompt: str,
+    logger=None
 ) -> Optional[Dict[str, Any]]:
     """
     Load processed dataset from cache if available.
@@ -100,6 +105,7 @@ def load_dataset_cache(
         dataset_name: Name of the dataset
         splits: Dictionary of split names and specifications
         system_prompt: System prompt used
+        logger: Optional logger for info messages
 
     Returns:
         Cached data dictionary if found, None otherwise
@@ -111,10 +117,12 @@ def load_dataset_cache(
     cache_file = cache_path / f"{dataset_name}_{cache_key}.json"
 
     if not cache_file.exists():
-        print(f"\n📂 No cache found for {dataset_name} (key: {cache_key})")
+        if logger:
+            logger.info(f"\n📂 No cache found for {dataset_name} (key: {cache_key})")
         return None
 
-    print(f"\n📂 Loading dataset from cache: {cache_file}")
+    if logger:
+        logger.info(f"\n📂 Loading dataset from cache: {cache_file}")
 
     try:
         with open(cache_file, 'r', encoding='utf-8') as f:
@@ -127,16 +135,19 @@ def load_dataset_cache(
             metadata.get("system_prompt") == system_prompt):
 
             size_mb = cache_file.stat().st_size / (1024 * 1024)
-            print(f"   Cache file size: {size_mb:.2f} MB")
-            print(f"   ✓ Cache loaded successfully")
+            if logger:
+                logger.info(f"   Cache file size: {size_mb:.2f} MB")
+                logger.info(f"   ✓ Cache loaded successfully")
 
             return cache_data.get("data")
         else:
-            print(f"   ⚠️  Cache metadata mismatch, will reload from source")
+            if logger:
+                logger.info(f"   ⚠️  Cache metadata mismatch, will reload from source")
             return None
 
     except Exception as e:
-        print(f"   ⚠️  Error loading cache: {e}")
+        if logger:
+            logger.info(f"   ⚠️  Error loading cache: {e}")
         return None
 
 

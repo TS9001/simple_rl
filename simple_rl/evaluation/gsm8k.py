@@ -29,7 +29,8 @@ from simple_rl.rewards import (
 def load_gsm8k_dataset(
     train_split: str = "train[:2000]",
     val_split: str = "test[200:1200]",
-    test_split: str = "test[:200]"
+    test_split: str = "test[:200]",
+    logger=None
 ) -> Tuple[Any, Any, Any]:
     """
     Load GSM8K math dataset splits.
@@ -38,19 +39,22 @@ def load_gsm8k_dataset(
         train_split: Training split specification
         val_split: Validation split specification
         test_split: Test split specification
+        logger: Optional logger for info messages
 
     Returns:
         Tuple of (train_dataset, val_dataset, test_dataset)
     """
-    print("Loading GSM8K math dataset...")
+    if logger:
+        logger.info("Loading GSM8K math dataset...")
 
     dataset_train = load_dataset("gsm8k", "main", split=train_split)
     dataset_val = load_dataset("gsm8k", "main", split=val_split)
     dataset_test = load_dataset("gsm8k", "main", split=test_split)
 
-    print(f"  Training samples: {len(dataset_train)}")
-    print(f"  Validation samples: {len(dataset_val)}")
-    print(f"  Test samples: {len(dataset_test)}")
+    if logger:
+        logger.info(f"  Training samples: {len(dataset_train)}")
+        logger.info(f"  Validation samples: {len(dataset_val)}")
+        logger.info(f"  Test samples: {len(dataset_test)}")
 
     return dataset_train, dataset_val, dataset_test
 
@@ -158,6 +162,7 @@ def evaluate_on_gsm8k(
     save_results: bool = False,
     results_file: str = "eval_results.json",
     step: int = 0,
+    logger=None,
 ) -> Dict[str, Any]:
     """
     Evaluate a model on GSM8K test set.
@@ -180,6 +185,7 @@ def evaluate_on_gsm8k(
         save_results: If True, save detailed results to JSON file
         results_file: Base path for results file (will be modified with step/date)
         step: Step/episode number for tracking training progress
+        logger: Optional logger for info messages
 
     Returns:
         Dictionary with evaluation metrics:
@@ -311,13 +317,15 @@ def evaluate_on_gsm8k(
 
     results = []
 
-    print(f"\nEvaluating {model_name} on {len(eval_prompts)} GSM8K problems...")
-    print("=" * 60)
+    if logger:
+        logger.info(f"\nEvaluating {model_name} on {len(eval_prompts)} GSM8K problems...")
+        logger.info("=" * 60)
 
     # Check if we can use batched generation (much faster!)
     if hasattr(model_or_algo, 'generate') and hasattr(model_or_algo, 'model'):
         # SFT instance - use batched generation for speed
-        print("Using batched generation for speed...")
+        if logger:
+            logger.info("Using batched generation for speed...")
         completions = model_or_algo.generate(
             prompts=eval_prompts,
             max_new_tokens=max_new_tokens,
@@ -327,14 +335,16 @@ def evaluate_on_gsm8k(
         )
     else:
         # GRPO or raw model - generate one by one (slower)
-        print("Generating responses one by one...")
+        if logger:
+            logger.info("Generating responses one by one...")
         completions = []
         for prompt in tqdm(eval_prompts, desc="Generating"):
             completion = generate_fn(prompt)
             completions.append(completion)
 
     # Now evaluate all completions
-    print("Evaluating responses...")
+    if logger:
+        logger.info("Evaluating responses...")
     for prompt, correct_answer, completion in tqdm(zip(eval_prompts, eval_answers, completions),
                                                      total=len(eval_prompts), desc="Evaluating"):
         # Extract model's answer
@@ -399,13 +409,14 @@ def evaluate_on_gsm8k(
     }
 
     # Print summary
-    print(f"\n{model_name} Evaluation Results:")
-    print(f"  Total Correct: {total_correct}/{n} ({total_correct/n*100:.1f}%)")
-    print(f"  Exact Match Accuracy: {metrics['exact_accuracy']:.1f}%")
-    print(f"  Numeric Accuracy: {metrics['numeric_accuracy']:.1f}%")
-    print(f"  Format Compliance: {metrics['format_compliance']:.1f}%")
-    print(f"  Avg Format Score: {metrics['avg_format_score']:.3f}")
-    print(f"  Avg Correctness Score: {metrics['avg_correctness_score']:.3f}")
+    if logger:
+        logger.info(f"\n{model_name} Evaluation Results:")
+        logger.info(f"  Total Correct: {total_correct}/{n} ({total_correct/n*100:.1f}%)")
+        logger.info(f"  Exact Match Accuracy: {metrics['exact_accuracy']:.1f}%")
+        logger.info(f"  Numeric Accuracy: {metrics['numeric_accuracy']:.1f}%")
+        logger.info(f"  Format Compliance: {metrics['format_compliance']:.1f}%")
+        logger.info(f"  Avg Format Score: {metrics['avg_format_score']:.3f}")
+        logger.info(f"  Avg Correctness Score: {metrics['avg_correctness_score']:.3f}")
 
     # Save results to file if requested
     if save_results:
@@ -462,7 +473,8 @@ def evaluate_on_gsm8k(
         with open(results_path, 'w') as f:
             json.dump(output_data, f, indent=2)
 
-        print(f"\n✓ Detailed results saved to: {results_path}")
+        if logger:
+            logger.info(f"\n✓ Detailed results saved to: {results_path}")
 
     return metrics
 
@@ -475,7 +487,8 @@ def demonstrate_model_responses(
     max_new_tokens: int = 400,  # Increased to 400 to handle longer CoT completions (avg 288 tokens)
     temperature: float = 1.0,
     top_p: float = 1.0,
-    title: str = "MODEL RESPONSE EXAMPLES"
+    title: str = "MODEL RESPONSE EXAMPLES",
+    logger=None
 ) -> List[Dict[str, Any]]:
     """
     Demonstrate actual model responses on a few examples.
@@ -489,6 +502,7 @@ def demonstrate_model_responses(
         temperature: Sampling temperature
         top_p: Nucleus sampling parameter
         title: Title for the demonstration section
+        logger: Optional logger for info messages
 
     Returns:
         List of demonstration results with prompt, answers, and correctness info
@@ -594,9 +608,10 @@ def demonstrate_model_responses(
 
             return completion
 
-    print("\n" + "=" * 60)
-    print(title)
-    print("=" * 60)
+    if logger:
+        logger.info("\n" + "=" * 60)
+        logger.info(title)
+        logger.info("=" * 60)
 
     # Select random examples
     indices = np.random.choice(len(test_prompts), min(num_examples, len(test_prompts)), replace=False)
@@ -606,41 +621,49 @@ def demonstrate_model_responses(
     results = []
 
     for i, (prompt, correct_answer) in enumerate(zip(demo_prompts, demo_answers), 1):
-        print(f"\nExample {i}:")
-        print(f"Problem: {prompt[:150]}...")
-        print(f"Correct Answer: {correct_answer}")
-        print("-" * 40)
+        if logger:
+            logger.info(f"\nExample {i}:")
+            logger.info(f"Problem: {prompt[:150]}...")
+            logger.info(f"Correct Answer: {correct_answer}")
+            logger.info("-" * 40)
 
         # Generate completion
         completion = generate_fn(prompt)
 
         # Show more of the response (800 chars) to see if <answer> tags exist
-        print(f"Model Response:\n{completion[:800]}{'...' if len(completion) > 800 else ''}")
+        if logger:
+            logger.info(f"Model Response:\n{completion[:800]}{'...' if len(completion) > 800 else ''}")
 
         # Extract and check answer
         model_answer = extract_answer_from_model_output(completion)
-        print(f"\nExtracted Answer: {model_answer if model_answer else 'None (format issue)'}")
+        if logger:
+            logger.info(f"\nExtracted Answer: {model_answer if model_answer else 'None (format issue)'}")
 
         # Check correctness
         is_correct = False
         if model_answer:
             if model_answer == correct_answer:
-                print("Status: ✓ CORRECT (exact match)")
+                if logger:
+                    logger.info("Status: ✓ CORRECT (exact match)")
                 is_correct = True
             else:
                 model_num = extract_single_number(model_answer)
                 correct_num = extract_single_number(correct_answer)
                 if model_num and correct_num and abs(model_num - correct_num) < 0.01:
-                    print("Status: ✓ CORRECT (numeric)")
+                    if logger:
+                        logger.info("Status: ✓ CORRECT (numeric)")
                     is_correct = True
                 else:
-                    print("Status: ✗ INCORRECT")
+                    if logger:
+                        logger.info("Status: ✗ INCORRECT")
         else:
-            print("Status: ✗ NO ANSWER")
+            if logger:
+                logger.info("Status: ✗ NO ANSWER")
 
         # Check format
         has_format = all(tag in completion for tag in ["<reasoning>", "</reasoning>", "<answer>", "</answer>"])
-        print(f"Format Compliance: {'Yes' if has_format else 'No'}")
+        if logger:
+            logger.info(f"Format Compliance: {'Yes' if has_format else 'No'}")
 
         results.append({
             'prompt': prompt[:100],
@@ -653,7 +676,8 @@ def demonstrate_model_responses(
     # Summary
     correct_count = sum(r['is_correct'] for r in results)
     format_count = sum(r['has_format'] for r in results)
-    print(f"\n{'-'*60}")
-    print(f"Summary: {correct_count}/{len(results)} correct, {format_count}/{len(results)} with proper format")
+    if logger:
+        logger.info(f"\n{'-'*60}")
+        logger.info(f"Summary: {correct_count}/{len(results)} correct, {format_count}/{len(results)} with proper format")
 
     return results
