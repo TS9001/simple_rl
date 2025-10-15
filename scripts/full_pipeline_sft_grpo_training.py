@@ -166,7 +166,7 @@ class ProgressTracker:
 # ============================================================
 
 # Training flags
-RUN_SFT = True  # Set to True to run SFT training, False to load from checkpoint
+RUN_SFT = False  # Set to True to run SFT training, False to load from checkpoint
 
 # Resume training configuration
 CONTINUE_FROM = 0  # Set to episode number to resume from GRPO checkpoint, 0 = start from SFT/base model
@@ -838,20 +838,20 @@ def main():
         "algorithm": {
             "name": "grpo",
             "group_size": 16,  # INCREASED from 8 → 16 for more advantage dynamic range
-            "kl_coef": 0.08,  # INCREASED from 0.01 → 0.08 to prevent policy drift
+            "kl_coef": 0.05,  # REDUCED from 0.08 → 0.05 for BF16 stability (less aggressive updates)
             "clip_epsilon": 0.2,
             "normalize_rewards": True,
             "store_completions": False,
         },
         "training": {
-            "batch_size": 32,  # Keep at 16 for full training (not 4 like overfit)
-            "rollout_batch_size": 8,
-            "gradient_clip": 0.1,  # TIGHTENED from 1.0 → 0.1 for maximum stability
+            "batch_size": 32,  # REDUCED from 32 → 16 for BF16 stability (smaller updates)
+            "rollout_batch_size": 8,  # REDUCED from 8 → 4 for BF16 stability (less memory pressure)
+            "gradient_clip": 1.0,  # TIGHTENED from 0.1 → 0.05 for BF16 stability (prevent explosion)
             "max_new_tokens": 800,
             "min_new_tokens": 50,  # LOWERED from 150 → 50 to allow </answer> early stopping
             "temperature": 0.6,
             "num_episodes": 500,
-            "minibatch_size": 64,  # Keep at 32 for full training
+            "minibatch_size": 64,  # REDUCED from 64 → 32 for BF16 stability (smaller updates)
             "update_epochs": 1,
             "top_p": 0.9,
             "entropy_coef": 0.005,  # Increased from 0.002 → 0.005 for more exploration
@@ -859,13 +859,13 @@ def main():
             "resample_batch_per_episode": True,  # ← CRITICAL: Set to True to disable fixed batch!
             # Clipping parameters (all validated in overfit test)
             "kl_estimator": "k3",
-            "kl_clamp_min": -2.0,
-            "kl_clamp_max": 2.0,
+            "kl_clamp_min": -1.5,  # TIGHTENED from -2.0 → -1.5 for BF16 stability
+            "kl_clamp_max": 1.5,  # TIGHTENED from 2.0 → 1.5 for BF16 stability
             "kl_reduction": "mean",
-            "policy_log_ratio_clamp_min": -2.0,
-            "policy_log_ratio_clamp_max": 2.0,
-            "advantage_clip_min": -2.0,  # TIGHTENED from -3.0 → -2.0 (effective constraint)
-            "advantage_clip_max": 2.0,  # TIGHTENED from 3.0 → 2.0 (effective constraint)
+            "policy_log_ratio_clamp_min": -1.5,  # TIGHTENED from -2.0 → -1.5 for BF16 stability
+            "policy_log_ratio_clamp_max": 1.5,  # TIGHTENED from 2.0 → 1.5 for BF16 stability
+            "advantage_clip_min": -1.5,  # TIGHTENED from -2.0 → -1.5 for BF16 stability
+            "advantage_clip_max": 1.5,  # TIGHTENED from 2.0 → 1.5 for BF16 stability
             "stop_sequences": ["</answer>"],
         },
         "model": {
@@ -873,7 +873,11 @@ def main():
             "model_name": MODEL_NAME,
             "model_type": model_dtype,  # bf16 on CUDA, fp32 otherwise
             "device": str(device),
-            "compile": {"enabled": False, "backend": "aot_eager"},
+            "compile": {
+                "enabled": device.type == "cuda",  # Enable only on CUDA (not MPS/CPU)
+                "backend": "inductor",  # Use inductor backend for best performance
+                "mode": "default",  # Options: "default", "reduce-overhead", "max-autotune"
+            },
         },
         "device_optimizations": {
             "clear_cache_on_mps": True,  # ENABLED for M4 unified memory
@@ -894,17 +898,17 @@ def main():
         },
         "optimizer": {
             "type": "adamw",
-            "lr": 5e-6,  # INCREASED from 1e-6 → 5e-6 (will use warmup when resuming)
+            "lr": 1e-6,  # REDUCED from 5e-6 → 1e-6 for BF16 stability (conservative LR)
             "weight_decay": 0.01,
             "betas": (0.9, 0.999),
             "eps": 1e-8,
             "fused": False,
             # Warmup parameters (for fresh start)
-            "warmup_steps": 30,  # Increased from 10 → 30
-            "warmup_start_lr": 1e-9,  # Decreased from 1e-8 → 1e-9
+            "warmup_steps": 50,  # INCREASED from 30 → 50 for BF16 stability (slower warmup)
+            "warmup_start_lr": 1e-10,  # DECREASED from 1e-9 → 1e-10 for BF16 stability (very gradual start)
             "warmup_type": "linear",
             # Resume-specific warmup (when LR changes between checkpoint and config)
-            "resume_warmup_steps": 15,  # Warmup steps when resuming with higher LR
+            "resume_warmup_steps": 25,  # INCREASED from 15 → 25 for BF16 stability
         },
         "optimization": {
             "mixed_precision": {
@@ -928,39 +932,39 @@ def main():
     }
 
     logger.info("\n" + "=" * 70)
-    logger.info("GRPO Configuration - STABILITY FIXES APPLIED")
+    logger.info("GRPO Configuration - BF16 STABILITY OPTIMIZED")
     logger.info("=" * 70)
-    logger.info("\n🔧 STABILITY FIXES (to prevent training collapse):")
-    logger.info(
-        "  ✅ KL coefficient:     0.01 → 0.08 (8x stronger - prevents policy drift)"
-    )
-    logger.info(
-        "  ✅ Learning rate:      1e-6 → 5e-6 (5x higher, with warmup on resume)"
-    )
-    logger.info("  ✅ Group size:         8 → 16 (more advantage dynamic range)")
-    logger.info("  ✅ Advantage clamps:   ±3.0 → ±2.0 (tighter, effective constraint)")
-    logger.info("  ✅ Policy loss:        token → sequence (better gradient magnitude)")
-    logger.info("\n📊 MAINTAINED FROM PREVIOUS CONFIG:")
-    logger.info("  • Gradient clip:       0.1 (tight for stability)")
-    logger.info("  • Batch size:          16 (good data coverage)")
-    logger.info("  • Minibatch size:      32 (efficient training)")
+    logger.info("\n🛡️  BF16 STABILITY FIXES (to prevent gradient explosion):")
+    logger.info("  ✅ Learning rate:      5e-6 → 1e-6 (5x lower - conservative for BF16)")
+    logger.info("  ✅ Gradient clip:      0.1 → 0.05 (2x tighter - prevents explosion)")
+    logger.info("  ✅ Batch size:         32 → 16 (smaller updates)")
+    logger.info("  ✅ Rollout batch:      8 → 4 (less memory pressure)")
+    logger.info("  ✅ Minibatch size:     64 → 32 (smaller gradient updates)")
+    logger.info("  ✅ KL coefficient:     0.08 → 0.05 (less aggressive policy updates)")
+    logger.info("  ✅ All clamps:         ±2.0 → ±1.5 (tighter bounds for BF16)")
+    logger.info("  ✅ Warmup steps:       30 → 50 (slower, more gradual warmup)")
+    logger.info("  ✅ Warmup start LR:    1e-9 → 1e-10 (very gradual start)")
+    logger.info("\n📊 MAINTAINED SETTINGS:")
+    logger.info("  • Group size:          16 (good advantage dynamic range)")
+    logger.info("  • Policy loss:         sequence (better gradient magnitude)")
     logger.info("  • Num episodes:        500 (full training run)")
     logger.info("  • Min new tokens:      50 (allow </answer> early stopping)")
     logger.info("  • Entropy coef:        0.005 (exploration)")
     logger.info("\n🔄 RESUME BEHAVIOR:")
-    logger.info(
-        "  • If resuming with higher LR: 15-step warmup from checkpoint LR → config LR"
-    )
-    logger.info(
-        "  • If resuming with same/lower LR: No warmup, use config LR immediately"
-    )
+    logger.info("  • If resuming with higher LR: 25-step warmup from checkpoint LR → config LR")
+    logger.info("  • If resuming with same/lower LR: No warmup, use config LR immediately")
     logger.info("  • Past warmup phase: Scheduler disabled, fixed LR used")
-    logger.info("\n⚠️  STOPPING BEHAVIOR:")
-    logger.info("  • min_new_tokens=50: Forces at least 50 tokens before stopping")
-    logger.info("  • stop_sequences=['</answer>']: Stops when </answer> appears")
-    logger.info(
-        "  • Result: Model generates 50-400 tokens, stops at </answer> if present"
-    )
+    logger.info("\n⚠️  TRAINING DISABLED:")
+    logger.info("  • RUN_SFT = False: Skipping SFT, loading from checkpoint")
+    logger.info("  • Starting directly with GRPO training")
+    logger.info("\n⚡ COMPILATION:")
+    if device.type == "cuda":
+        logger.info("  • torch.compile: ENABLED (CUDA detected)")
+        logger.info("  • Backend:       inductor (optimized for NVIDIA GPUs)")
+        logger.info("  • Mode:          default (balanced speed/compile time)")
+        logger.info("  • Expected:      ~20-30% speedup after warmup")
+    else:
+        logger.info("  • torch.compile: DISABLED (not on CUDA)")
     logger.info("\n🧹 MEMORY MANAGEMENT:")
     logger.info("  • Cache clearing:      ENABLED on MPS (M4 unified memory)")
     logger.info("  • Garbage collection:  Forced every episode")

@@ -78,10 +78,36 @@ class LanguageModel(nn.Module):
 
         # Track optimizations
         self._using_bettertransformer: bool = False
+        self._compiled: bool = False
 
         # Resolve initial device placement and apply optimizations
         super().to(target_device)
         apply_device_optimizations()
+
+        # Apply torch.compile if enabled (only on CUDA for stability)
+        compile_config = model_config.get("compile", {})
+        if compile_config.get("enabled", False):
+            try:
+                backend = compile_config.get("backend", "inductor")
+                mode = compile_config.get("mode", "default")
+
+                print(f"🔥 Compiling model with torch.compile (backend={backend}, mode={mode})...")
+                print(f"   Note: First forward pass will be slow (compilation), then ~20-30% faster")
+
+                # Compile the underlying HuggingFace model
+                self.model = torch.compile(
+                    self.model,
+                    backend=backend,
+                    mode=mode,
+                    fullgraph=False,  # Allow graph breaks (more flexible)
+                )
+                self._compiled = True
+                print(f"   ✓ Model compiled successfully")
+
+            except Exception as e:
+                print(f"   ⚠️  Compilation failed: {e}")
+                print(f"   Continuing without compilation...")
+                self._compiled = False
 
     def to(self, *args, **kwargs):
         """Override to() to re-run backend-specific setup after device moves."""

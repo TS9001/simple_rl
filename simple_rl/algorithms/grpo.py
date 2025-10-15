@@ -664,37 +664,61 @@ class GRPO(BaseAlgorithm):
         # Check attention implementation (Flash Attention 2 is highly non-deterministic with BF16)
         attn_impl = getattr(self.policy.model.config, '_attn_implementation', 'unknown')
 
-        # Save ALL log probs to file for debugging
-        # Include full tensors with all sequences and all token positions
-        logprobs_data = {
-            # Full log probability tensors [batch_size, seq_len]
-            'old_log_probs': old_log_probs.cpu(),  # From trajectory generation
-            'new_log_probs': new_log_probs.cpu(),  # Recomputed during training
-            'ref_log_probs': ref_log_probs.cpu(),  # From frozen reference model
-
-            # Per-sequence differences [batch_size]
-            'old_new_diff_per_seq': old_new_diff_per_seq.cpu(),
-            'old_ref_diff_per_seq': old_ref_diff_per_seq.cpu(),
-
-            # Pointwise differences (all positions) [batch_size, seq_len]
-            'old_new_diff_all': (old_log_probs - new_log_probs).abs().cpu(),
-            'old_ref_diff_all': (old_log_probs - ref_log_probs).abs().cpu(),
-
-            # Summary statistics
-            'old_new_diff_max': old_new_diff,
-            'old_ref_diff_max': old_ref_diff,
-            'old_new_diff_mean': (old_log_probs - new_log_probs).abs().mean().item(),
-            'old_ref_diff_mean': (old_log_probs - ref_log_probs).abs().mean().item(),
+        # Save ALL log probs to human-readable text file for debugging
+        with open('LOGPROBS.txt', 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("LOG PROBABILITY VALIDATION DATA (Episode 0, Minibatch 1)\n")
+            f.write("=" * 80 + "\n\n")
 
             # Model metadata
-            'model_dtype': str(model_dtype),
-            'attention_implementation': attn_impl,
-            'device': str(self.device),
-            'batch_size': old_log_probs.shape[0],
-            'seq_len': old_log_probs.shape[1],
-        }
-        torch.save(logprobs_data, 'LOGPROBS.pt')
-        self.logger.info(f"💾 Saved ALL log probs to LOGPROBS.pt (shape: {old_log_probs.shape})")
+            f.write("MODEL CONFIGURATION:\n")
+            f.write(f"  dtype: {model_dtype}\n")
+            f.write(f"  attention_implementation: {attn_impl}\n")
+            f.write(f"  device: {self.device}\n")
+            f.write(f"  batch_size: {old_log_probs.shape[0]}\n")
+            f.write(f"  seq_len: {old_log_probs.shape[1]}\n")
+            f.write("\n")
+
+            # Summary statistics
+            f.write("SUMMARY STATISTICS:\n")
+            f.write(f"  old_new_diff_max: {old_new_diff:.6e}\n")
+            f.write(f"  old_new_diff_mean: {(old_log_probs - new_log_probs).abs().mean().item():.6e}\n")
+            f.write(f"  old_ref_diff_max: {old_ref_diff:.6e}\n")
+            f.write(f"  old_ref_diff_mean: {(old_log_probs - ref_log_probs).abs().mean().item():.6e}\n")
+            f.write("\n")
+
+            # Per-sequence max differences
+            f.write("PER-SEQUENCE MAX DIFFERENCES:\n")
+            f.write("  Seq | Old-New Diff | Old-Ref Diff\n")
+            f.write("  " + "-" * 40 + "\n")
+            for i in range(min(old_log_probs.shape[0], 20)):  # Show first 20 sequences
+                f.write(f"  {i:3d} | {old_new_diff_per_seq[i].item():12.6e} | {old_ref_diff_per_seq[i].item():12.6e}\n")
+            if old_log_probs.shape[0] > 20:
+                f.write(f"  ... ({old_log_probs.shape[0] - 20} more sequences)\n")
+            f.write("\n")
+
+            # Full log probs for first few sequences
+            f.write("DETAILED LOG PROBS (First 5 sequences, first 20 tokens):\n")
+            f.write("-" * 80 + "\n")
+            for seq_idx in range(min(5, old_log_probs.shape[0])):
+                f.write(f"\nSequence {seq_idx}:\n")
+                f.write("  Pos | Old LogProb | New LogProb | Ref LogProb | Old-New Diff | Old-Ref Diff\n")
+                f.write("  " + "-" * 75 + "\n")
+                for tok_idx in range(min(20, old_log_probs.shape[1])):
+                    old_val = old_log_probs[seq_idx, tok_idx].item()
+                    new_val = new_log_probs[seq_idx, tok_idx].item()
+                    ref_val = ref_log_probs[seq_idx, tok_idx].item()
+                    old_new = abs(old_val - new_val)
+                    old_ref = abs(old_val - ref_val)
+                    f.write(f"  {tok_idx:3d} | {old_val:11.6f} | {new_val:11.6f} | {ref_val:11.6f} | {old_new:12.6e} | {old_ref:12.6e}\n")
+                if old_log_probs.shape[1] > 20:
+                    f.write(f"  ... ({old_log_probs.shape[1] - 20} more tokens)\n")
+
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("END OF LOG PROBABILITY DATA\n")
+            f.write("=" * 80 + "\n")
+
+        self.logger.info(f"💾 Saved ALL log probs to LOGPROBS.txt (shape: {old_log_probs.shape})")
 
         if model_dtype == torch.bfloat16:
             # BF16: Very relaxed thresholds due to:
