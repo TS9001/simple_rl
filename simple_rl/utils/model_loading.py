@@ -55,11 +55,14 @@ def create_model_loader_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(dtype_cfg, str):
             target_dtype = alias_map.get(dtype_cfg.lower())
             if target_dtype is not None:
-                loader_kwargs["dtype"] = target_dtype
+                loader_kwargs["torch_dtype"] = target_dtype
     else:
-        # Default to fp16 on CUDA/MPS if unspecified
-        if torch.cuda.is_available() or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
-            loader_kwargs["dtype"] = torch.float16
+        # Default to bf16 on CUDA (better stability than fp16)
+        # Default to fp32 on MPS (better stability)
+        if torch.cuda.is_available():
+            loader_kwargs["torch_dtype"] = torch.bfloat16
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            loader_kwargs["torch_dtype"] = torch.float32
 
     # CUDA-specific optimizations
     if torch.cuda.is_available():
@@ -93,9 +96,7 @@ def setup_tokenizer_and_model_config(model, tokenizer) -> None:
 
 
 def load_huggingface_model_and_tokenizer(
-    model_name: str,
-    config: Dict[str, Any],
-    **additional_kwargs
+    model_name: str, config: Dict[str, Any], **additional_kwargs
 ) -> Tuple[Any, Any]:
     """
     Load HuggingFace model and tokenizer with configuration.
