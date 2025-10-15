@@ -74,7 +74,7 @@ from simple_rl.utils.dataset_cache import (
     load_cot_cache,
     save_cot_cache,
 )
-from simple_rl.utils.notebook_logger import setup_notebook_logger
+from simple_rl.utils.logging import setup_logging
 
 # ============================================================
 # Progress Tracking for Remote Monitoring
@@ -543,7 +543,13 @@ def main():
     # --------------------------------------------------------
     # Initialize Logging (console + file)
     # --------------------------------------------------------
-    logger, log_path = setup_notebook_logger("logs", "training")
+    from datetime import datetime
+    log_dir = Path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"training_{timestamp}.log"
+
+    logger = setup_logging(level="INFO", log_file=str(log_path))
 
     # Logger already outputs to both console and file automatically
     logger.info("="*60)
@@ -1119,9 +1125,7 @@ def main():
     logger.info("PIPELINE COMPLETE")
     logger.info("="*60)
 
-    # Close logging
-    from simple_rl.utils.notebook_logger import close_logger
-    close_logger(logger)
+    # Final message
     logger.info(f"✓ Training log saved to: {log_path}")
 
 
