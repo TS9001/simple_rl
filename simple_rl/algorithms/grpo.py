@@ -710,9 +710,9 @@ class GRPO(BaseAlgorithm):
                 f.write(f"SEQUENCE {seq_idx + 1} / {old_log_probs.shape[0]}\n")
                 f.write(f"{'='*80}\n\n")
 
-                old_seq = old_log_probs[seq_idx].cpu().numpy()
-                new_seq = new_log_probs[seq_idx].cpu().numpy()
-                ref_seq = ref_log_probs[seq_idx].cpu().numpy()
+                old_seq = old_log_probs[seq_idx].detach().cpu().numpy()
+                new_seq = new_log_probs[seq_idx].detach().cpu().numpy()
+                ref_seq = ref_log_probs[seq_idx].detach().cpu().numpy()
 
                 # Find non-zero positions (valid tokens)
                 nonzero_mask = (old_seq != 0.0) | (new_seq != 0.0) | (ref_seq != 0.0)
