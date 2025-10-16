@@ -1278,13 +1278,18 @@ class GRPO(BaseAlgorithm):
                         selected_completion_mask,
                     )
 
+                    # CRITICAL: Ensure new log probs are on GPU (may be on CPU if offloading enabled)
+                    # Must do this BEFORE validation and loss computation
+                    if mb_new_log_probs.device != self.device:
+                        mb_new_log_probs = mb_new_log_probs.to(self.device)
+
                     # Create padded completion mask to match log probs shape (vectorized, no loop)
                     mb_completion_mask = pad_sequence(
                         selected_completion_mask,
                         batch_first=True,
                         padding_value=0
                     )
-                    
+
                     # Ensure completion mask is on GPU for loss computation
                     if mb_completion_mask.device != self.device:
                         mb_completion_mask = mb_completion_mask.to(self.device)
@@ -1296,10 +1301,10 @@ class GRPO(BaseAlgorithm):
                         # Ensure all validation inputs are on GPU
                         val_gen_ids = [g.to(self.device) if g.device != self.device else g for g in selected_gen_ids]
                         val_prompt_end = selected_prompt_end_positions.to(self.device) if selected_prompt_end_positions.device != self.device else selected_prompt_end_positions
-                        
+
                         self._validate_logprobs_episode_zero(
                             mb_old_log_probs,  # Already on GPU
-                            mb_new_log_probs,  # Already on GPU
+                            mb_new_log_probs,  # Now on GPU
                             mb_ref_log_probs,  # Already on GPU
                             val_gen_ids,
                             val_prompt_end,
