@@ -170,7 +170,7 @@ class ProgressTracker:
 # ============================================================
 
 # Training flags
-RUN_SFT = True  # Set to True to run SFT training, False to load from checkpoint
+RUN_SFT = False  # Set to True to run SFT training, False to load from checkpoint
 
 # Resume training configuration
 CONTINUE_FROM = 0  # Set to episode number to resume from GRPO checkpoint, 0 = start from SFT/base model
@@ -194,6 +194,13 @@ Respond in the following format:
 SFT_CHECKPOINT_PATH = (
     Path("checkpoints/pipeline_stages/01_after_sft") / "sft_complete.pt"
 )
+
+# Check if SFT checkpoint exists when needed
+if not RUN_SFT and CONTINUE_FROM == 0:
+    if not SFT_CHECKPOINT_PATH.exists():
+        print(f"⚠️  Warning: SFT checkpoint not found at {SFT_CHECKPOINT_PATH}")
+        print("   Automatically enabling SFT training (RUN_SFT = True)")
+        RUN_SFT = True
 
 # Dataset cache directory (for deterministic loading)
 DATASET_CACHE_DIR = "dataset_cache"

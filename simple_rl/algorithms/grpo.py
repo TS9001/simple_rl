@@ -849,6 +849,8 @@ class GRPO(BaseAlgorithm):
         old_log_probs: torch.Tensor,
         new_log_probs: torch.Tensor,
         ref_log_probs: torch.Tensor,
+        generated_ids: List[torch.Tensor] = None,
+        prompt_end_positions: torch.Tensor = None,
     ) -> None:
         """Validate log probs in first minibatch to ensure dropout is disabled."""
         # Ensure all log probs are in FP32 for accurate comparison
@@ -861,10 +863,10 @@ class GRPO(BaseAlgorithm):
         old_new_diff = old_new_diff_per_seq.max().item()
         old_ref_diff = old_ref_diff_per_seq.max().item()
 
-        # SAVE COMPLETE LOG PROBS TO FILE FOR DEBUGGING
+        # SAVE COMPLETE LOG PROBS AND INPUTS TO FILE FOR DEBUGGING
         with open("LOGPROBS_FULL_DEBUG.txt", "w") as f:
             f.write("="*80 + "\n")
-            f.write("LOG PROBABILITY VALIDATION - EPISODE 0, MINIBATCH 1\n")
+            f.write("LOG PROBABILITY AND INPUT VALIDATION - EPISODE 0, MINIBATCH 1\n")
             f.write("="*80 + "\n\n")
 
             f.write(f"Model dtype: {next(self.policy.parameters()).dtype}\n")
@@ -884,7 +886,7 @@ class GRPO(BaseAlgorithm):
             f.write("COMPLETE LOG PROBABILITIES FOR ALL SEQUENCES\n")
             f.write("="*80 + "\n\n")
 
-            # Write complete log probs for every sequence
+            # Write complete log probs and inputs for every sequence
             for seq_idx in range(old_log_probs.shape[0]):
                 f.write(f"\n{'='*80}\n")
                 f.write(f"SEQUENCE {seq_idx + 1} / {old_log_probs.shape[0]}\n")
@@ -894,6 +896,28 @@ class GRPO(BaseAlgorithm):
                 new_seq = new_log_probs[seq_idx].detach().cpu().numpy()
                 ref_seq = ref_log_probs[seq_idx].detach().cpu().numpy()
 
+                # Get the generated IDs for this sequence if available
+                if generated_ids is not None and seq_idx < len(generated_ids):
+                    gen_ids = generated_ids[seq_idx]
+                    prompt_end = prompt_end_positions[seq_idx].item() if prompt_end_positions is not None else 0
+
+                    # Decode full sequence to see context
+                    full_text = self.policy.tokenizer.decode(gen_ids, skip_special_tokens=False)
+                    f.write(f"Full generated text:\n{full_text}\n\n")
+
+                    # Get prompt text
+                    if prompt_end > 0:
+                        prompt_ids = gen_ids[:prompt_end]
+                        prompt_text = self.policy.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                        f.write(f"Prompt (first {prompt_end} tokens):\n{prompt_text}\n\n")
+
+                    # Get completion IDs (what the log probs are computed over)
+                    completion_ids = gen_ids[prompt_end:]
+                    completion_text = self.policy.tokenizer.decode(completion_ids, skip_special_tokens=False)
+                    f.write(f"Completion (tokens {prompt_end} onwards):\n{completion_text}\n\n")
+                else:
+                    gen_ids = None
+
                 # Find non-zero positions (valid tokens)
                 nonzero_mask = (old_seq != 0.0) | (new_seq != 0.0) | (ref_seq != 0.0)
                 nonzero_indices = nonzero_mask.nonzero()[0] if nonzero_mask.any() else []
@@ -902,10 +926,11 @@ class GRPO(BaseAlgorithm):
                 f.write(f"Max Old-New diff: {old_new_diff_per_seq[seq_idx].item():.6e}\n")
                 f.write(f"Max Old-Ref diff: {old_ref_diff_per_seq[seq_idx].item():.6e}\n\n")
 
-                f.write(f"{'Token':<8} {'Old LogProb':<15} {'New LogProb':<15} {'Ref LogProb':<15} {'Old-New Diff':<15} {'Old-Ref Diff':<15}\n")
-                f.write("-"*80 + "\n")
+                # Enhanced header with INPUTS column
+                f.write(f"{'Token':<8} {'Input Token':<20} {'Old LogProb':<15} {'New LogProb':<15} {'Ref LogProb':<15} {'Old-New Diff':<15} {'Old-Ref Diff':<15}\n")
+                f.write("-"*120 + "\n")
 
-                # Write all tokens (including zeros for padding)
+                # Write all tokens with their inputs
                 for token_idx in range(old_log_probs.shape[1]):
                     old_val = old_seq[token_idx]
                     new_val = new_seq[token_idx]
@@ -913,11 +938,25 @@ class GRPO(BaseAlgorithm):
                     old_new_diff = abs(old_val - new_val)
                     old_ref_diff = abs(old_val - ref_val)
 
+                    # Get the actual input token for this position
+                    input_token_str = "[N/A]"
+                    if gen_ids is not None and prompt_end_positions is not None:
+                        prompt_end = prompt_end_positions[seq_idx].item()
+                        # The token that was predicted at this position
+                        # Note: log_probs[i] corresponds to predicting token at position prompt_end + i + 1
+                        actual_token_pos = prompt_end + token_idx + 1
+                        if actual_token_pos < len(gen_ids):
+                            token_id = gen_ids[actual_token_pos].item()
+                            # Decode single token
+                            input_token_str = self.policy.tokenizer.decode([token_id], skip_special_tokens=False)
+                            # Escape special characters for display
+                            input_token_str = repr(input_token_str)[1:-1][:20]  # Limit to 20 chars
+
                     # Mark if it's a padding token
                     is_padding = (old_val == 0.0 and new_val == 0.0 and ref_val == 0.0)
                     marker = " [PAD]" if is_padding else ""
 
-                    f.write(f"{token_idx:<8} {old_val:>14.6f} {new_val:>14.6f} {ref_val:>14.6f} {old_new_diff:>14.6e} {old_ref_diff:>14.6e}{marker}\n")
+                    f.write(f"{token_idx:<8} {input_token_str:<20} {old_val:>14.6f} {new_val:>14.6f} {ref_val:>14.6f} {old_new_diff:>14.6e} {old_ref_diff:>14.6e}{marker}\n")
 
                 f.write("\n")
 
@@ -925,10 +964,69 @@ class GRPO(BaseAlgorithm):
             f.write("END OF LOG PROBABILITY DUMP\n")
             f.write("="*80 + "\n")
 
-        print(f"\n✓ Complete log probs saved to: LOGPROBS_FULL_DEBUG.txt")
+        # Also save a separate INPUTS file for easier inspection
+        with open("INPUTS_DEBUG.txt", "w") as f:
+            f.write("="*80 + "\n")
+            f.write("INPUT SEQUENCES FOR OLD, NEW, AND REF MODELS\n")
+            f.write("="*80 + "\n\n")
+            f.write("Note: All three models (old, new, ref) use the SAME input sequences.\n")
+            f.write("The inputs are reconstructed from the generated token IDs.\n\n")
+
+            for seq_idx in range(old_log_probs.shape[0]):
+                f.write(f"\n{'='*60}\n")
+                f.write(f"SEQUENCE {seq_idx + 1} / {old_log_probs.shape[0]}\n")
+                f.write(f"{'='*60}\n\n")
+
+                if generated_ids is not None and seq_idx < len(generated_ids):
+                    gen_ids = generated_ids[seq_idx]
+                    prompt_end = prompt_end_positions[seq_idx].item() if prompt_end_positions is not None else 0
+
+                    # Show full sequence
+                    full_text = self.policy.tokenizer.decode(gen_ids, skip_special_tokens=False)
+                    f.write("FULL SEQUENCE:\n")
+                    f.write(f"{full_text}\n\n")
+
+                    # Show prompt/completion split
+                    if prompt_end > 0:
+                        prompt_ids = gen_ids[:prompt_end]
+                        completion_ids = gen_ids[prompt_end:]
+
+                        prompt_text = self.policy.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                        completion_text = self.policy.tokenizer.decode(completion_ids, skip_special_tokens=False)
+
+                        f.write(f"PROMPT (tokens 0-{prompt_end-1}):\n")
+                        f.write(f"{prompt_text}\n\n")
+
+                        f.write(f"COMPLETION (tokens {prompt_end}-{len(gen_ids)-1}):\n")
+                        f.write(f"{completion_text}\n\n")
+
+                        # Show token-by-token breakdown for completion
+                        f.write("TOKEN-BY-TOKEN BREAKDOWN (Completion only):\n")
+                        f.write("-"*60 + "\n")
+                        f.write(f"{'Position':<10} {'Token ID':<10} {'Token Text':<30}\n")
+                        f.write("-"*60 + "\n")
+
+                        for i, token_id in enumerate(completion_ids):
+                            token_text = self.policy.tokenizer.decode([token_id.item()], skip_special_tokens=False)
+                            # Escape special characters for display
+                            token_text_repr = repr(token_text)[1:-1]
+                            f.write(f"{i:<10} {token_id.item():<10} {token_text_repr:<30}\n")
+
+                    f.write("\n")
+                else:
+                    f.write("No generated IDs available for this sequence\n\n")
+
+            f.write("="*80 + "\n")
+            f.write("END OF INPUTS DUMP\n")
+            f.write("="*80 + "\n")
+
+        print(f"\n✓ Complete log probs and inputs saved to:")
+        print(f"  - LOGPROBS_FULL_DEBUG.txt: Full log probabilities with input tokens")
+        print(f"  - INPUTS_DEBUG.txt: Detailed input sequences and token breakdown")
         print(f"  - Total sequences: {old_log_probs.shape[0]}")
         print(f"  - Tokens per sequence: {old_log_probs.shape[1]}")
         print(f"  - Total values written: {old_log_probs.numel() * 3} (old, new, ref)")
+        print(f"  - INPUTS: Token text for each position is included for all models")
 
         # Dtype-aware thresholds (BF16 + Flash Attention 2 on CUDA is non-deterministic)
         model_dtype = next(self.policy.parameters()).dtype
@@ -1185,7 +1283,8 @@ class GRPO(BaseAlgorithm):
 
                     if self.episode == 0 and epoch == 0 and mb_idx == 1:
                         self._validate_log_probs_episode_zero(
-                            mb_old_log_probs, mb_new_log_probs, mb_ref_log_probs
+                            mb_old_log_probs, mb_new_log_probs, mb_ref_log_probs,
+                            selected_gen_ids, selected_prompt_end_positions
                         )
 
                     self.optimizer.zero_grad()
