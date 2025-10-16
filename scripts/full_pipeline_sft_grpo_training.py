@@ -170,7 +170,7 @@ class ProgressTracker:
 # ============================================================
 
 # Training flags
-RUN_SFT = False  # Set to True to run SFT training, False to load from checkpoint
+RUN_SFT = True  # Set to True to run SFT training, False to load from checkpoint
 
 # Resume training configuration
 CONTINUE_FROM = 0  # Set to episode number to resume from GRPO checkpoint, 0 = start from SFT/base model
