@@ -484,17 +484,16 @@ class GRPO(BaseAlgorithm):
                 
                 # CRITICAL: Immediately offload chunk to CPU to free GPU memory
                 # Only keep one chunk on GPU at a time, accumulate on CPU
-                if self.device.type == "cuda":
+                if self.device.type == "cuda" and self.offload_generated_to_cpu:
                     chunk_log_probs = chunk_log_probs.cpu()
                     # Clear CUDA cache after each chunk
                     torch.cuda.empty_cache()
-                
+
                 all_completion_log_probs.append(chunk_log_probs)
-            
-            # Concatenate all chunks (on CPU if offloaded, then move back to GPU)
+
+            # Concatenate all chunks (KEEP ON CPU if offloaded - don't move back!)
             result = torch.cat(all_completion_log_probs, dim=0)
-            if self.device.type == "cuda" and result.device.type == "cpu":
-                result = result.to(device)
+            # DON'T move back to GPU! Minibatches will bring slices to GPU as needed
             return result
         else:
             # Process entire batch at once
@@ -1148,12 +1147,19 @@ class GRPO(BaseAlgorithm):
 
         # Compute frozen old/ref logprobs once, right before optimization
         # Use unified method to ensure IDENTICAL computation for all types
+        # These will be kept on CPU if offloading is enabled
         old_log_probs = self.compute_logprobs(
             "old", generated_ids, attention_mask, prompt_end_positions, completion_mask
         )
         ref_log_probs = self.compute_logprobs(
             "ref", generated_ids, attention_mask, prompt_end_positions, completion_mask
         )
+
+        # CRITICAL: Clear CUDA cache after computing old/ref logprobs
+        # This frees GPU memory before starting optimization
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+            self.logger.info(f"  Logprobs computed and offloaded. old/ref on {'CPU' if old_log_probs.device.type == 'cpu' else 'GPU'}")
 
         self.timing_manager.start_timer("advantage_computation")
         advantages, advantage_stats = self.compute_advantages(
@@ -1213,6 +1219,10 @@ class GRPO(BaseAlgorithm):
                     mb_indices = indices[mb_start:mb_end]
                     mb_advantages = advantages[mb_indices]
 
+                    # Ensure advantages are on GPU
+                    if mb_advantages.device != self.device:
+                        mb_advantages = mb_advantages.to(self.device)
+
                     # Select minibatch data
                     selected_gen_ids = [generated_ids[idx] for idx in mb_indices]
                     selected_attn_mask = [attention_mask[idx] for idx in mb_indices]
@@ -1220,8 +1230,14 @@ class GRPO(BaseAlgorithm):
                     selected_prompt_end_positions = prompt_end_positions[mb_indices]
 
                     # Extract minibatch slices from batch tensors
+                    # Move to GPU if they're on CPU (due to offloading)
                     mb_old_log_probs = old_log_probs[mb_indices]
                     mb_ref_log_probs = ref_log_probs[mb_indices]
+
+                    if mb_old_log_probs.device != self.device:
+                        mb_old_log_probs = mb_old_log_probs.to(self.device)
+                    if mb_ref_log_probs.device != self.device:
+                        mb_ref_log_probs = mb_ref_log_probs.to(self.device)
 
                     self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_recompute")
 
