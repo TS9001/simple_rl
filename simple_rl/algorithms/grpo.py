@@ -50,7 +50,8 @@ class MultiTokenStoppingCriteria(StoppingCriteria):
             tokenizer: HuggingFace tokenizer
             prompt_length: Length of the prompt (to only check generated tokens)
         """
-        self.stop_sequences = stop_sequences
+        # Normalize to a list of non-empty strings; treat None as disabled
+        self.stop_sequences = [s for s in (stop_sequences or []) if isinstance(s, str) and s]
         self.tokenizer = tokenizer
         self.prompt_length = prompt_length
 
@@ -268,22 +269,35 @@ class GRPO(BaseAlgorithm):
 
     def _setup_stopping_tokens(self):
         """Set up additional stopping tokens for early termination."""
-        # Multi-token stopping sequences (more robust than single-token stopping)
-        self.stop_sequences = self.config.get("training", {}).get("stop_sequences", ["</answer>"])
-        self.use_multi_token_stopping = len(self.stop_sequences) > 0
+        # Read config value (default to ["</answer>"] only when not provided)
+        raw_stop = self.config.get("training", {}).get("stop_sequences", ["</answer>"])
 
-        # Legacy single-token stopping (kept for backward compatibility)
-        # Try to encode </answer> tag as stopping token
+        # Normalize and enable/disable multi-token stopping
+        if raw_stop is None:
+            self.stop_sequences = []
+            self.use_multi_token_stopping = False
+        else:
+            if isinstance(raw_stop, str):
+                norm = [raw_stop]
+            else:
+                try:
+                    norm = list(raw_stop)
+                except Exception:
+                    norm = []
+            # Keep only non-empty strings
+            self.stop_sequences = [s for s in norm if isinstance(s, str) and s]
+            self.use_multi_token_stopping = len(self.stop_sequences) > 0
+
+        # Legacy single-token stopping: only when enabled and explicitly using </answer>
         self.answer_end_token_id = None
-        try:
-            # Encode the closing answer tag
-            encoded = self.policy.tokenizer.encode("</answer>", add_special_tokens=False)
-            if encoded:
-                # Use the last token (most specific)
-                self.answer_end_token_id = encoded[-1]
-        except Exception:
-            # If encoding fails, just use default EOS
-            pass
+        if self.use_multi_token_stopping and any(s == "</answer>" for s in self.stop_sequences):
+            try:
+                encoded = self.policy.tokenizer.encode("</answer>", add_special_tokens=False)
+                if encoded:
+                    self.answer_end_token_id = encoded[-1]
+            except Exception:
+                # If encoding fails, just use default EOS
+                pass
 
     def reset_timings(self):
         """Reset timing data."""
