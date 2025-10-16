@@ -448,7 +448,8 @@ class GRPO(BaseAlgorithm):
             [batch_size, max_completion_len] tensor of log probs (right-padded, no prompts)
         """
         batch_size = len(generated_ids)
-        device = generated_ids[0].device
+        # Use model's device, not tensor device (tensors may be on CPU due to offloading)
+        device = next(model.model.parameters()).device
 
         # Find max completion length for padding
         max_completion_len = max(mask.size(0) for mask in completion_mask)
