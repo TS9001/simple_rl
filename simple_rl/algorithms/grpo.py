@@ -842,308 +842,65 @@ class GRPO(BaseAlgorithm):
         else:
             return log_probs  # Keep gradients for new
 
-    def _validate_log_probs_episode_zero(
+    def _validate_logprobs_episode_zero(
         self,
-        old_log_probs: torch.Tensor,
-        new_log_probs: torch.Tensor,
-        ref_log_probs: torch.Tensor,
-        generated_ids: List[torch.Tensor] = None,
-        prompt_end_positions: torch.Tensor = None,
-    ) -> None:
-        """Validate log probs in first minibatch to ensure dropout is disabled."""
-        # Ensure all log probs are in FP32 for accurate comparison
-        old_log_probs = old_log_probs.float()
-        new_log_probs = new_log_probs.float()
-        ref_log_probs = ref_log_probs.float()
-
-        old_new_diff_per_seq = (old_log_probs - new_log_probs).abs().max(dim=1).values
-        old_ref_diff_per_seq = (old_log_probs - ref_log_probs).abs().max(dim=1).values
-        old_new_diff = old_new_diff_per_seq.max().item()
-        old_ref_diff = old_ref_diff_per_seq.max().item()
-
-        # SAVE COMPLETE LOG PROBS AND INPUTS TO FILE FOR DEBUGGING
-        with open("LOGPROBS_FULL_DEBUG.txt", "w") as f:
-            f.write("="*80 + "\n")
-            f.write("LOG PROBABILITY AND INPUT VALIDATION - EPISODE 0, MINIBATCH 1\n")
-            f.write("="*80 + "\n\n")
-
-            f.write(f"Model dtype: {next(self.policy.parameters()).dtype}\n")
-            f.write(f"Device: {self.device}\n")
-            f.write(f"Batch shape: {old_log_probs.shape}\n")
-            f.write(f"Total sequences: {old_log_probs.shape[0]}\n")
-            f.write(f"Max sequence length: {old_log_probs.shape[1]}\n\n")
-
-            f.write("SUMMARY STATISTICS:\n")
-            f.write("-"*80 + "\n")
-            f.write(f"Old-Ref max diff: {old_ref_diff:.6e}\n")
-            f.write(f"Old-New max diff: {old_new_diff:.6e}\n")
-            f.write(f"Old-Ref mean diff: {(old_log_probs - ref_log_probs).abs().mean().item():.6e}\n")
-            f.write(f"Old-New mean diff: {(old_log_probs - new_log_probs).abs().mean().item():.6e}\n\n")
-
-            f.write("="*80 + "\n")
-            f.write("COMPLETE LOG PROBABILITIES FOR ALL SEQUENCES\n")
-            f.write("="*80 + "\n\n")
-
-            # Write complete log probs and inputs for every sequence
-            for seq_idx in range(old_log_probs.shape[0]):
-                f.write(f"\n{'='*80}\n")
-                f.write(f"SEQUENCE {seq_idx + 1} / {old_log_probs.shape[0]}\n")
-                f.write(f"{'='*80}\n\n")
-
-                old_seq = old_log_probs[seq_idx].detach().cpu().numpy()
-                new_seq = new_log_probs[seq_idx].detach().cpu().numpy()
-                ref_seq = ref_log_probs[seq_idx].detach().cpu().numpy()
-
-                # Get the generated IDs for this sequence if available
-                if generated_ids is not None and seq_idx < len(generated_ids):
-                    gen_ids = generated_ids[seq_idx]
-                    prompt_end = prompt_end_positions[seq_idx].item() if prompt_end_positions is not None else 0
-
-                    # Decode full sequence to see context
-                    full_text = self.policy.tokenizer.decode(gen_ids, skip_special_tokens=False)
-                    f.write(f"Full generated text:\n{full_text}\n\n")
-
-                    # Get prompt text
-                    if prompt_end > 0:
-                        prompt_ids = gen_ids[:prompt_end]
-                        prompt_text = self.policy.tokenizer.decode(prompt_ids, skip_special_tokens=False)
-                        f.write(f"Prompt (first {prompt_end} tokens):\n{prompt_text}\n\n")
-
-                    # Get completion IDs (what the log probs are computed over)
-                    completion_ids = gen_ids[prompt_end:]
-                    completion_text = self.policy.tokenizer.decode(completion_ids, skip_special_tokens=False)
-                    f.write(f"Completion (tokens {prompt_end} onwards):\n{completion_text}\n\n")
-                else:
-                    gen_ids = None
-
-                # Find non-zero positions (valid tokens)
-                nonzero_mask = (old_seq != 0.0) | (new_seq != 0.0) | (ref_seq != 0.0)
-                nonzero_indices = nonzero_mask.nonzero()[0] if nonzero_mask.any() else []
-
-                f.write(f"Valid tokens: {len(nonzero_indices)} / {old_log_probs.shape[1]}\n")
-                f.write(f"Max Old-New diff: {old_new_diff_per_seq[seq_idx].item():.6e}\n")
-                f.write(f"Max Old-Ref diff: {old_ref_diff_per_seq[seq_idx].item():.6e}\n\n")
-
-                # Enhanced header with INPUTS column
-                f.write(f"{'Token':<8} {'Input Token':<20} {'Old LogProb':<15} {'New LogProb':<15} {'Ref LogProb':<15} {'Old-New Diff':<15} {'Old-Ref Diff':<15}\n")
-                f.write("-"*120 + "\n")
-
-                # Write all tokens with their inputs
-                for token_idx in range(old_log_probs.shape[1]):
-                    old_val = old_seq[token_idx]
-                    new_val = new_seq[token_idx]
-                    ref_val = ref_seq[token_idx]
-                    old_new_diff = abs(old_val - new_val)
-                    old_ref_diff = abs(old_val - ref_val)
-
-                    # Get the actual input token for this position
-                    input_token_str = "[N/A]"
-                    if gen_ids is not None and prompt_end_positions is not None:
-                        prompt_end = prompt_end_positions[seq_idx].item()
-                        # The token that was predicted at this position
-                        # Note: log_probs[i] corresponds to predicting token at position prompt_end + i + 1
-                        actual_token_pos = prompt_end + token_idx + 1
-                        if actual_token_pos < len(gen_ids):
-                            token_id = gen_ids[actual_token_pos].item()
-                            # Decode single token
-                            input_token_str = self.policy.tokenizer.decode([token_id], skip_special_tokens=False)
-                            # Escape special characters for display
-                            input_token_str = repr(input_token_str)[1:-1][:20]  # Limit to 20 chars
-
-                    # Mark if it's a padding token
-                    is_padding = (old_val == 0.0 and new_val == 0.0 and ref_val == 0.0)
-                    marker = " [PAD]" if is_padding else ""
-
-                    f.write(f"{token_idx:<8} {input_token_str:<20} {old_val:>14.6f} {new_val:>14.6f} {ref_val:>14.6f} {old_new_diff:>14.6e} {old_ref_diff:>14.6e}{marker}\n")
-
-                f.write("\n")
-
-            f.write("\n" + "="*80 + "\n")
-            f.write("END OF LOG PROBABILITY DUMP\n")
-            f.write("="*80 + "\n")
-
-        # Also save a separate INPUTS file for easier inspection
-        with open("INPUTS_DEBUG.txt", "w") as f:
-            f.write("="*80 + "\n")
-            f.write("INPUT SEQUENCES FOR OLD, NEW, AND REF MODELS\n")
-            f.write("="*80 + "\n\n")
-            f.write("Note: All three models (old, new, ref) use the SAME input sequences.\n")
-            f.write("The inputs are reconstructed from the generated token IDs.\n\n")
-
-            for seq_idx in range(old_log_probs.shape[0]):
-                f.write(f"\n{'='*60}\n")
-                f.write(f"SEQUENCE {seq_idx + 1} / {old_log_probs.shape[0]}\n")
-                f.write(f"{'='*60}\n\n")
-
-                if generated_ids is not None and seq_idx < len(generated_ids):
-                    gen_ids = generated_ids[seq_idx]
-                    prompt_end = prompt_end_positions[seq_idx].item() if prompt_end_positions is not None else 0
-
-                    # Show full sequence
-                    full_text = self.policy.tokenizer.decode(gen_ids, skip_special_tokens=False)
-                    f.write("FULL SEQUENCE:\n")
-                    f.write(f"{full_text}\n\n")
-
-                    # Show prompt/completion split
-                    if prompt_end > 0:
-                        prompt_ids = gen_ids[:prompt_end]
-                        completion_ids = gen_ids[prompt_end:]
-
-                        prompt_text = self.policy.tokenizer.decode(prompt_ids, skip_special_tokens=False)
-                        completion_text = self.policy.tokenizer.decode(completion_ids, skip_special_tokens=False)
-
-                        f.write(f"PROMPT (tokens 0-{prompt_end-1}):\n")
-                        f.write(f"{prompt_text}\n\n")
-
-                        f.write(f"COMPLETION (tokens {prompt_end}-{len(gen_ids)-1}):\n")
-                        f.write(f"{completion_text}\n\n")
-
-                        # Show token-by-token breakdown for completion
-                        f.write("TOKEN-BY-TOKEN BREAKDOWN (Completion only):\n")
-                        f.write("-"*60 + "\n")
-                        f.write(f"{'Position':<10} {'Token ID':<10} {'Token Text':<30}\n")
-                        f.write("-"*60 + "\n")
-
-                        for i, token_id in enumerate(completion_ids):
-                            token_text = self.policy.tokenizer.decode([token_id.item()], skip_special_tokens=False)
-                            # Escape special characters for display
-                            token_text_repr = repr(token_text)[1:-1]
-                            f.write(f"{i:<10} {token_id.item():<10} {token_text_repr:<30}\n")
-
-                    f.write("\n")
-                else:
-                    f.write("No generated IDs available for this sequence\n\n")
-
-            f.write("="*80 + "\n")
-            f.write("END OF INPUTS DUMP\n")
-            f.write("="*80 + "\n")
-
-        print(f"\n✓ Complete log probs and inputs saved to:")
-        print(f"  - LOGPROBS_FULL_DEBUG.txt: Full log probabilities with input tokens")
-        print(f"  - INPUTS_DEBUG.txt: Detailed input sequences and token breakdown")
-        print(f"  - Total sequences: {old_log_probs.shape[0]}")
-        print(f"  - Tokens per sequence: {old_log_probs.shape[1]}")
-        print(f"  - Total values written: {old_log_probs.numel() * 3} (old, new, ref)")
-        print(f"  - INPUTS: Token text for each position is included for all models")
-
-        # Dtype-aware thresholds
-        # With eval() forced for all logprob types, old/new/ref should be nearly identical
-        # Small differences can still occur due to numerical precision and kernel non-determinism
-        model_dtype = next(self.policy.parameters()).dtype
-
-        if model_dtype == torch.bfloat16:
-            # BF16: Slightly relaxed thresholds due to lower precision
-            # Flash Attention 2 can still have some non-determinism, but eval() greatly reduces it
-            ref_threshold = 1e-4
-            new_threshold = 1e-4  # Tightened from 2.0 since eval() ensures consistent kernels
-        elif model_dtype == torch.float16:
-            # FP16: Moderate thresholds
-            ref_threshold = 1e-5
-            new_threshold = 1e-5  # Tightened from 5e-2 since eval() ensures consistent kernels
-        else:
-            # FP32: Strict thresholds (original behavior)
-            ref_threshold = 1e-6
-            new_threshold = 1e-6  # Tightened from 5e-4 since eval() ensures consistent kernels
-
-        assert old_ref_diff < ref_threshold, (
-            f"Old and ref log probs differ by {old_ref_diff:.2e} (expected < {ref_threshold:.0e}). "
-            f"This indicates model corruption or different model states"
-        )
-
-        assert old_new_diff < new_threshold, (
-            f"Old and new log probs differ by {old_new_diff:.2e} (expected < {new_threshold:.0e}). "
-            f"With eval() enforced, old and new should be nearly identical. "
-            f"This indicates an issue with the unified logprob computation."
-        )
-
-    def _validate_log_probs_episode_zero_single_sequence(
-        self,
-        generated_ids: List[torch.Tensor],
-        attention_mask: List[torch.Tensor],
-        prompt_end_positions: torch.Tensor,
-        completion_mask: List[torch.Tensor],
+        mb_old_log_probs: torch.Tensor,
+        mb_new_log_probs: torch.Tensor,
+        mb_ref_log_probs: torch.Tensor,
+        selected_gen_ids: List[torch.Tensor] = None,
+        selected_prompt_end_positions: torch.Tensor = None,
     ) -> None:
         """
-        Validate log probs by computing sequences ONE-BY-ONE.
+        Validate that old/new/ref logprobs are consistent (episode 0 check).
         
-        This eliminates ALL padding differences and isolates the real consistency issue.
-        If old/new/ref still differ here, it's a genuine non-determinism problem.
+        This ensures the unified logprob computation produces identical results
+        and that gradient flow is set up correctly.
         """
+        from logprobs_debugger import validate_logprobs, save_logprobs_debug
+        
         print("\n" + "="*80)
-        print("SINGLE-SEQUENCE VALIDATION (NO PADDING)")
+        print("LOGPROBS VALIDATION - EPISODE 0, MINIBATCH 1")
         print("="*80)
-        print("Computing each sequence individually to eliminate batch padding artifacts...")
-        print()
         
-        num_sequences = len(generated_ids)
-        max_diff_old_new = 0.0
-        max_diff_old_ref = 0.0
-        max_diff_seq_idx = 0
-        
-        for seq_idx in range(num_sequences):
-            # Extract single sequence
-            single_gen_ids = [generated_ids[seq_idx]]
-            single_attn_mask = [attention_mask[seq_idx]]
-            single_prompt_end = prompt_end_positions[seq_idx:seq_idx+1]
-            single_completion_mask = [completion_mask[seq_idx]]
-            
-            # Compute old, new, ref for THIS SINGLE SEQUENCE (no padding needed!)
-            old_lp = self.compute_logprobs("old", single_gen_ids, single_attn_mask, single_prompt_end, single_completion_mask)[0]
-            new_lp = self.compute_logprobs("new", single_gen_ids, single_attn_mask, single_prompt_end, single_completion_mask)[0]
-            ref_lp = self.compute_logprobs("ref", single_gen_ids, single_attn_mask, single_prompt_end, single_completion_mask)[0]
-            
-            # Compute differences
-            old_new_diff = (old_lp - new_lp.detach()).abs().max().item()
-            old_ref_diff = (old_lp - ref_lp).abs().max().item()
-            
-            if old_new_diff > max_diff_old_new:
-                max_diff_old_new = old_new_diff
-                max_diff_seq_idx = seq_idx
-            
-            max_diff_old_ref = max(max_diff_old_ref, old_ref_diff)
-            
-            print(f"  Seq {seq_idx+1}/{num_sequences}: Old-New={old_new_diff:.6e}, Old-Ref={old_ref_diff:.6e}")
-        
-        print()
-        print(f"Maximum Old-New diff: {max_diff_old_new:.6e} (sequence {max_diff_seq_idx+1})")
-        print(f"Maximum Old-Ref diff: {max_diff_old_ref:.6e}")
-        print()
-        
-        # Dtype-aware thresholds
+        # Validate
         model_dtype = next(self.policy.parameters()).dtype
-        if model_dtype == torch.bfloat16:
-            ref_threshold = 1e-4
-            new_threshold = 1e-4
-        elif model_dtype == torch.float16:
-            ref_threshold = 1e-5
-            new_threshold = 1e-5
-        else:
-            ref_threshold = 1e-6
-            new_threshold = 1e-6
+        results = validate_logprobs(
+            mb_old_log_probs,
+            mb_new_log_probs.detach(),  # Detach for comparison
+            mb_ref_log_probs,
+            model_dtype,
+            save_on_fail=True,
+            generated_ids=selected_gen_ids,
+            prompt_end_positions=selected_prompt_end_positions,
+            tokenizer=self.policy.tokenizer,
+            output_dir=".",
+        )
         
-        # Validate old-ref (should be identical with param requires_grad matching)
-        if max_diff_old_ref >= ref_threshold:
-            print(f"❌ FAILED: Old-Ref diff {max_diff_old_ref:.2e} >= threshold {ref_threshold:.0e}")
-            print(f"   Old and Ref should be identical at episode 0 (both from same initial weights).")
-            raise AssertionError(
-                f"Old and ref log probs differ by {max_diff_old_ref:.2e} (expected < {ref_threshold:.0e})"
-            )
-        else:
-            print(f"✅ PASSED: Old-Ref diff {max_diff_old_ref:.2e} < threshold {ref_threshold:.0e}")
+        # Report results
+        print(f"Old-Ref diff: {results['old_ref_diff']:.6e} (threshold: {results['ref_threshold']:.0e})")
+        print(f"Old-New diff: {results['old_new_diff']:.6e} (threshold: {results['new_threshold']:.0e})")
+        print()
         
-        if max_diff_old_new >= new_threshold:
-            print(f"❌ FAILED: Old-New diff {max_diff_old_new:.2e} >= threshold {new_threshold:.0e}")
-            print(f"   Even with NO PADDING, old and new differ!")
-            print(f"   This is a genuine non-determinism issue (eval mode, Flash Attention, etc.)")
-            raise AssertionError(
-                f"Old and new log probs differ by {max_diff_old_new:.2e} (expected < {new_threshold:.0e}) "
-                f"even when computed one-by-one with identical inputs"
-            )
+        if results['old_ref_pass']:
+            print(f"✅ PASSED: Old-Ref consistency check")
         else:
-            print(f"✅ PASSED: Old-New diff {max_diff_old_new:.2e} < threshold {new_threshold:.0e}")
+            print(f"❌ FAILED: Old-Ref diff {results['old_ref_diff']:.2e} >= threshold {results['ref_threshold']:.0e}")
+            raise AssertionError(
+                f"Old and ref log probs differ by {results['old_ref_diff']:.2e} "
+                f"(expected < {results['ref_threshold']:.0e})"
+            )
+        
+        if results['old_new_pass']:
+            print(f"✅ PASSED: Old-New consistency check")
+        else:
+            print(f"❌ FAILED: Old-New diff {results['old_new_diff']:.2e} >= threshold {results['new_threshold']:.0e}")
+            raise AssertionError(
+                f"Old and new log probs differ by {results['old_new_diff']:.2e} "
+                f"(expected < {results['new_threshold']:.0e})"
+            )
         
         print("="*80)
-        print("✅ ALL SINGLE-SEQUENCE VALIDATIONS PASSED")
+        print("✅ ALL VALIDATIONS PASSED")
         print("="*80)
         print()
 
@@ -1373,13 +1130,13 @@ class GRPO(BaseAlgorithm):
                     self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_recompute")
 
                     if self.episode == 0 and epoch == 0 and mb_idx == 1:
-                        # Validate by computing sequences ONE-BY-ONE to eliminate padding differences
-                        # This isolates the real consistency issue from batch padding artifacts
-                        self._validate_log_probs_episode_zero_single_sequence(
-                            selected_gen_ids, 
-                            selected_attn_mask,
+                        # Validate logprobs consistency (saves debug files on failure)
+                        self._validate_logprobs_episode_zero(
+                            mb_old_log_probs,
+                            mb_new_log_probs,
+                            mb_ref_log_probs,
+                            selected_gen_ids,
                             selected_prompt_end_positions,
-                            selected_completion_mask
                         )
 
                     self.optimizer.zero_grad()
