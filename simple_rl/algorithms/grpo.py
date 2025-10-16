@@ -210,6 +210,10 @@ class GRPO(BaseAlgorithm):
         self.top_k = self.training_config.top_k
         self.top_p = self.training_config.top_p
         self.gradient_clip = self.training_config.gradient_clip
+        
+        # Logprobs batch size for chunked processing (memory optimization)
+        # If None, processes entire batch at once
+        self.logprobs_batch_size = self.config.get("training", {}).get("logprobs_batch_size", None)
 
         # Logger (initialize before optimizer so it can log warmup info)
         self.logger = create_logger(self.config)
@@ -423,10 +427,10 @@ class GRPO(BaseAlgorithm):
         requires_grad: bool = False,
     ) -> torch.Tensor:
         """
-        Fully vectorized batch computation of log probabilities.
+        Fully vectorized batch computation of log probabilities with chunking support.
 
-        This method processes ALL sequences in parallel without loops.
-        It ensures OLD, NEW, and REF logprobs are computed identically.
+        Processes sequences in chunks to reduce memory usage.
+        Uses self.logprobs_batch_size to control chunk size.
 
         Args:
             model: LanguageModel instance (policy or ref_policy)
@@ -445,43 +449,117 @@ class GRPO(BaseAlgorithm):
         # Find max completion length for padding
         max_completion_len = max(mask.size(0) for mask in completion_mask)
 
-        # Pad all sequences to same length for batch processing
-        from torch.nn.utils.rnn import pad_sequence
+        # Determine chunk size
+        chunk_size = self.logprobs_batch_size if self.logprobs_batch_size is not None else batch_size
 
-        # Pad generated_ids and attention_mask
+        # Process in chunks if chunk_size < batch_size
+        if chunk_size < batch_size:
+            all_completion_log_probs = []
+            
+            for chunk_start in range(0, batch_size, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, batch_size)
+                
+                # Get chunk
+                chunk_gen_ids = generated_ids[chunk_start:chunk_end]
+                chunk_attn_mask = attention_mask[chunk_start:chunk_end]
+                chunk_prompt_end_pos = prompt_end_positions[chunk_start:chunk_end]
+                chunk_completion_mask = completion_mask[chunk_start:chunk_end]
+                
+                # Process chunk
+                chunk_log_probs = self._compute_chunk_log_probs(
+                    model=model,
+                    generated_ids=chunk_gen_ids,
+                    attention_mask=chunk_attn_mask,
+                    prompt_end_positions=chunk_prompt_end_pos,
+                    completion_mask=chunk_completion_mask,
+                    max_completion_len=max_completion_len,
+                    requires_grad=requires_grad,
+                    device=device,
+                )
+                
+                all_completion_log_probs.append(chunk_log_probs)
+            
+            # Concatenate all chunks
+            return torch.cat(all_completion_log_probs, dim=0)
+        else:
+            # Process entire batch at once
+            return self._compute_chunk_log_probs(
+                model=model,
+                generated_ids=generated_ids,
+                attention_mask=attention_mask,
+                prompt_end_positions=prompt_end_positions,
+                completion_mask=completion_mask,
+                max_completion_len=max_completion_len,
+                requires_grad=requires_grad,
+                device=device,
+            )
+
+    def _compute_chunk_log_probs(
+        self,
+        model: Any,
+        generated_ids: List[torch.Tensor],
+        attention_mask: List[torch.Tensor],
+        prompt_end_positions: torch.Tensor,
+        completion_mask: List[torch.Tensor],
+        max_completion_len: int,
+        requires_grad: bool,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Compute log probs for a single chunk of sequences.
+        
+        This is the core vectorized computation used by _compute_batch_log_probs_vectorized.
+        """
+        from torch.nn.utils.rnn import pad_sequence
+        
+        chunk_size = len(generated_ids)
+
+        # Pad all sequences to same length for batch processing
         padded_ids = pad_sequence(generated_ids, batch_first=True, padding_value=self.policy.tokenizer.pad_token_id)
         padded_attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
 
         # Pad completion masks to max_completion_len (vectorized, no loop)
         padded_completion_mask = pad_sequence(completion_mask, batch_first=True, padding_value=0)
+        
+        # Ensure completion mask has correct length
+        if padded_completion_mask.size(1) < max_completion_len:
+            padding = torch.zeros(
+                chunk_size, 
+                max_completion_len - padded_completion_mask.size(1),
+                device=device,
+                dtype=padded_completion_mask.dtype
+            )
+            padded_completion_mask = torch.cat([padded_completion_mask, padding], dim=1)
+        elif padded_completion_mask.size(1) > max_completion_len:
+            padded_completion_mask = padded_completion_mask[:, :max_completion_len]
 
-        # Compute log probs for entire batch (vectorized)
-        # This returns [batch_size, seq_len-1] in fp32
+        # Compute log probs for chunk (vectorized)
+        # This returns [chunk_size, seq_len-1] in fp32
         with torch.set_grad_enabled(requires_grad):
-            batch_log_probs = model.compute_log_probs(
+            chunk_log_probs = model.compute_log_probs(
                 padded_ids,
                 attention_mask=padded_attention_mask,
-            )  # [B, S-1] in fp32
+            )  # [C, S-1] in fp32
 
         # Extract completion portions (vectorized)
         # Create batch indices and position indices for gathering
-        batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)  # [B, 1]
+        batch_indices = torch.arange(chunk_size, device=device).unsqueeze(1)  # [C, 1]
         completion_positions = torch.arange(max_completion_len, device=device).unsqueeze(0)  # [1, L]
 
         # Compute source positions for each sequence
         # prompt_end_positions[i] points to first completion token in generated_ids[i]
-        # batch_log_probs[i, j] predicts token at position j+1, so offset by -1
-        source_positions = (prompt_end_positions.unsqueeze(1) - 1) + completion_positions  # [B, L]
+        # chunk_log_probs[i, j] predicts token at position j+1, so offset by -1
+        source_positions = (prompt_end_positions.unsqueeze(1) - 1) + completion_positions  # [C, L]
 
         # Clamp positions to valid range
-        max_valid_position = batch_log_probs.size(1) - 1
+        max_valid_position = chunk_log_probs.size(1) - 1
         source_positions_clamped = source_positions.clamp(0, max_valid_position)
 
         # Track valid positions (before sequence end)
-        valid_mask = source_positions < batch_log_probs.size(1)  # [B, L]
+        valid_mask = source_positions < chunk_log_probs.size(1)  # [C, L]
 
         # Gather log probs using advanced indexing (fully vectorized)
-        completion_log_probs = batch_log_probs[batch_indices, source_positions_clamped]  # [B, L]
+        completion_log_probs = chunk_log_probs[batch_indices, source_positions_clamped]  # [C, L]
 
         # Zero out invalid positions (beyond sequence length)
         completion_log_probs = torch.where(
