@@ -518,6 +518,14 @@ class GRPO(BaseAlgorithm):
         
         chunk_size = len(generated_ids)
 
+        # Move tensors to GPU if they're on CPU (due to offloading)
+        # This is necessary for torch.compile compatibility
+        if generated_ids[0].device != device:
+            generated_ids = [g.to(device) for g in generated_ids]
+            attention_mask = [a.to(device) for a in attention_mask]
+            prompt_end_positions = prompt_end_positions.to(device)
+            completion_mask = [c.to(device) for c in completion_mask]
+
         # Pad all sequences to same length for batch processing
         padded_ids = pad_sequence(generated_ids, batch_first=True, padding_value=self.policy.tokenizer.pad_token_id)
         padded_attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
