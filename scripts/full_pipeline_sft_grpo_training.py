@@ -857,7 +857,7 @@ def main():
             "batch_size": 16,  # REDUCED from 32 → 16 for BF16 stability (smaller updates)
             "rollout_batch_size": 4,  # REDUCED from 8 → 4 for BF16 stability (less memory pressure)
             "gradient_clip": 1.0,  # TIGHTENED from 0.1 → 0.05 for BF16 stability (prevent explosion)
-            "max_new_tokens": 256,
+            "max_new_tokens": 500,
             "min_new_tokens": 50,  # LOWERED from 150 → 50 to allow </answer> early stopping
             "temperature": 0.8,
             "num_episodes": 500,

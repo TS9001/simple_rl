@@ -218,14 +218,16 @@ class LanguageModel(nn.Module):
             Log probabilities [batch_size, seq_len-1] or [batch_size, logits_to_keep]
             Note: Padding positions (where attention_mask=0) will have log_prob=0.0
         """
-        original_seq_len = input_ids.size(1)
-        left_pad_removed = 0
-
-        logits = self.forward(input_ids, attention_mask=attention_mask).float()
+        # MEMORY OPTIMIZATION: Keep logits in BF16, only convert final log_probs to FP32
+        # This saves ~75% memory (3 huge FP32 tensors → 2 BF16 + 1 small FP32)
+        logits = self.forward(input_ids, attention_mask=attention_mask)  # Keep in model dtype (BF16)
 
         # Shift logits and labels for next token prediction
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = input_ids[:, 1:].contiguous()
+
+        # Free original logits immediately (no longer needed)
+        del logits
 
         # Also shift attention mask to align with shifted labels
         if attention_mask is not None:
@@ -245,12 +247,19 @@ class LanguageModel(nn.Module):
                 if attention_mask is not None:
                     shift_attention_mask = shift_attention_mask[:, start_idx:]
 
+        # MEMORY OPTIMIZATION: Compute log_softmax in BF16, only gather in FP32
+        log_probs_all = F.log_softmax(shift_logits, dim=-1)  # Still in model dtype (BF16)
 
-        log_probs_all = F.log_softmax(shift_logits, dim=-1)
+        # Free shift_logits immediately after log_softmax (no longer needed)
+        del shift_logits
+
+        # Gather the specific log probs we need, then convert to FP32
         log_probs = torch.gather(
             log_probs_all, dim=-1, index=shift_labels.unsqueeze(-1)
-        ).squeeze(-1)
+        ).squeeze(-1).float()  # Convert ONLY the extracted values to FP32
 
+        # Free log_probs_all immediately after gather (no longer needed)
+        del log_probs_all
 
         if attention_mask is not None:
             log_probs = log_probs * shift_attention_mask.float()
