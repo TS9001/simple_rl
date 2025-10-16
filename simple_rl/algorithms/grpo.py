@@ -482,11 +482,15 @@ class GRPO(BaseAlgorithm):
                     device=device,
                 )
                 
+                # CRITICAL: Detach to free computation graph immediately (prevents accumulation)
+                # This is crucial when using torch.enable_grad() for old/ref logprobs
+                chunk_log_probs = chunk_log_probs.detach()
+
                 # CRITICAL: Immediately offload chunk to CPU to free GPU memory
                 # Only keep one chunk on GPU at a time, accumulate on CPU
                 if self.device.type == "cuda" and self.offload_generated_to_cpu:
                     chunk_log_probs = chunk_log_probs.cpu()
-                    # Clear CUDA cache after each chunk
+                    # Clear CUDA cache after each chunk to free gradient graph memory
                     torch.cuda.empty_cache()
 
                 all_completion_log_probs.append(chunk_log_probs)
@@ -497,7 +501,7 @@ class GRPO(BaseAlgorithm):
             return result
         else:
             # Process entire batch at once
-            return self._compute_chunk_log_probs(
+            result = self._compute_chunk_log_probs(
                 model=model,
                 generated_ids=generated_ids,
                 attention_mask=attention_mask,
@@ -507,6 +511,10 @@ class GRPO(BaseAlgorithm):
                 requires_grad=requires_grad,
                 device=device,
             )
+            # Detach if old/ref to free computation graph
+            if not requires_grad:
+                result = result.detach()
+            return result
 
     def _compute_chunk_log_probs(
         self,
@@ -943,15 +951,15 @@ class GRPO(BaseAlgorithm):
             # CRITICAL: Compute ALL with torch.enable_grad() for consistent kernels
             # Both policy and ref_policy have requires_grad=True (same state)
             # This ensures old/new/ref use identical computation paths
+            # (Flash Attention and other kernels can differ based on grad tracking)
             with torch.enable_grad():
-                # NO autocast - logprobs must be computed in FP32 for numerical stability
                 log_probs = self._compute_batch_log_probs_vectorized(
                     model=model,
                     generated_ids=generated_ids,
                     attention_mask=attention_mask,
                     prompt_end_positions=prompt_end_positions,
                     completion_mask=completion_mask,
-                    requires_grad=True,  # Always True for consistent kernels
+                    requires_grad=(logprob_type == "new"),  # Only new needs grad for backward
                 )
         finally:
             # Restore model state
