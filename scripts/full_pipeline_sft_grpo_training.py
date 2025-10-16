@@ -847,14 +847,14 @@ def main():
     grpo_config = {
         "algorithm": {
             "name": "grpo",
-            "group_size": 4,  # INCREASED from 8 → 16 for more advantage dynamic range
+            "group_size": 16,  # INCREASED from 8 → 16 for more advantage dynamic range
             "kl_coef": 0.03,  # REDUCED from 0.08 → 0.05 for BF16 stability (less aggressive updates)
             "clip_epsilon": 0.2,
             "normalize_rewards": True,
             "store_completions": False,
         },
         "training": {
-            "batch_size": 8,  # REDUCED from 32 → 16 for BF16 stability (smaller updates)
+            "batch_size": 16,  # REDUCED from 32 → 16 for BF16 stability (smaller updates)
             "rollout_batch_size": 8,  # REDUCED from 8 → 4 for BF16 stability (less memory pressure)
             "gradient_clip": 1.0,  # TIGHTENED from 0.1 → 0.05 for BF16 stability (prevent explosion)
             "max_new_tokens": 256,
@@ -914,7 +914,7 @@ def main():
             "eps": 1e-8,
             "fused": False,
             # Warmup parameters (for fresh start)
-            "warmup_steps": 50,  # INCREASED from 30 → 50 for BF16 stability (slower warmup)
+            "warmup_steps": 30,  # INCREASED from 30 → 50 for BF16 stability (slower warmup)
             "warmup_start_lr": 1e-10,  # DECREASED from 1e-9 → 1e-10 for BF16 stability (very gradual start)
             "warmup_type": "linear",
             # Resume-specific warmup (when LR changes between checkpoint and config)
