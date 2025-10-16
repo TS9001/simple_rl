@@ -1255,10 +1255,12 @@ class GRPO(BaseAlgorithm):
                     selected_prompt_end_positions = prompt_end_positions[mb_indices_cpu]
 
                     # Extract minibatch slices from batch tensors
-                    # Move to GPU if they're on CPU (due to offloading)
-                    mb_old_log_probs = old_log_probs[mb_indices]
-                    mb_ref_log_probs = ref_log_probs[mb_indices]
+                    # Use CPU indices if tensors are on CPU (due to offloading)
+                    indices_for_logprobs = mb_indices_cpu if old_log_probs.device.type == 'cpu' else mb_indices
+                    mb_old_log_probs = old_log_probs[indices_for_logprobs]
+                    mb_ref_log_probs = ref_log_probs[indices_for_logprobs]
 
+                    # Move to GPU for loss computation
                     if mb_old_log_probs.device != self.device:
                         mb_old_log_probs = mb_old_log_probs.to(self.device)
                     if mb_ref_log_probs.device != self.device:
