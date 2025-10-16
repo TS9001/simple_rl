@@ -1259,10 +1259,16 @@ def main():
         grpo_test_prompts,
         grpo_test_answers,
         len(grpo_test_prompts),
+        max_new_tokens=min(grpo_config["training"]["max_new_tokens"], 256),
+        temperature=1.0,
+        top_p=1.0,
         model_name="GRPO Model (After RL Training)",
         save_results=True,
         results_file="results/grpo_eval_results.json",
         step=grpo_config["training"]["num_episodes"],
+        batch_size=8,
+        use_stopping_criteria=False,
+        sample=False,
     )
 
     # Show examples

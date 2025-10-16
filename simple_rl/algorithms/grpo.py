@@ -1692,14 +1692,17 @@ class GRPO(BaseAlgorithm):
                     val_data["prompts"],
                     val_data["answers"],
                     validation_num_samples,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
+                    max_new_tokens=min(max_new_tokens, 256),
+                    temperature=1.0,
+                    top_p=1.0,
                     model_name=f"Episode {episode + 1}",
                     save_results=True,
                     results_file="results/grpo_eval_results.json",
                     step=episode + 1,
-                    logger=self.logger
+                    logger=self.logger,
+                    batch_size=8,
+                    use_stopping_criteria=False,
+                    sample=False,
                 )
 
                 # Store validation metrics

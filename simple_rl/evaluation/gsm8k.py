@@ -163,6 +163,9 @@ def evaluate_on_gsm8k(
     results_file: str = "eval_results.json",
     step: int = 0,
     logger=None,
+    *,
+    batch_size: int = 8,
+    use_stopping_criteria: bool = True,
 ) -> Dict[str, Any]:
     """
     Evaluate a model on GSM8K test set.
@@ -215,18 +218,19 @@ def evaluate_on_gsm8k(
         device = model_or_algo.device
 
         # Build stopping criteria from GRPO config (if available)
-        stopping_criteria = None
-        if hasattr(model_or_algo, 'stop_sequences') and hasattr(model_or_algo, 'use_multi_token_stopping'):
+        stopping_criteria_tpl = None
+        if use_stopping_criteria and hasattr(model_or_algo, 'stop_sequences') and hasattr(model_or_algo, 'use_multi_token_stopping'):
             if model_or_algo.use_multi_token_stopping:
                 from transformers import StoppingCriteriaList
                 # Import stopping criteria class from GRPO
                 from simple_rl.algorithms.grpo import MultiTokenStoppingCriteria
 
-                stopping_criteria = StoppingCriteriaList([
+                # Template (prompt_length will be set per-call when not batched)
+                stopping_criteria_tpl = StoppingCriteriaList([
                     MultiTokenStoppingCriteria(
                         stop_sequences=model_or_algo.stop_sequences,
                         tokenizer=tokenizer,
-                        prompt_length=0  # Will be updated per generation
+                        prompt_length=0
                     )
                 ])
 
@@ -235,7 +239,9 @@ def evaluate_on_gsm8k(
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
             # Update stopping criteria prompt length for this specific generation
-            if stopping_criteria is not None:
+            stopping_criteria = None
+            if stopping_criteria_tpl is not None:
+                stopping_criteria = stopping_criteria_tpl
                 stopping_criteria[0].prompt_length = inputs["input_ids"].shape[1]
 
             with torch.no_grad():
@@ -246,7 +252,7 @@ def evaluate_on_gsm8k(
                     temperature=temperature,
                     do_sample=sample,
                     top_p=top_p,
-                    stopping_criteria=stopping_criteria,  # ✓ Now includes stopping!
+                    stopping_criteria=stopping_criteria,
                 )
 
             # Extract completion
@@ -331,10 +337,42 @@ def evaluate_on_gsm8k(
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
-            batch_size=8  # Process 8 prompts at a time
+            batch_size=batch_size
         )
+    elif hasattr(model_or_algo, 'policy'):
+        # GRPO instance - batched generation via policy
+        if logger:
+            logger.info("Using batched generation for GRPO (faster)...")
+        completions = []
+        for i in range(0, len(eval_prompts), batch_size):
+            batch_prompts = eval_prompts[i:i+batch_size]
+            inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=512)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            # NOTE: MultiTokenStoppingCriteria is disabled in batch mode (prompt lengths vary).
+            # If needed, implement token-id based stopping per sequence.
+            with torch.no_grad():
+                gen_ids, _ = model_or_algo.policy.generate(
+                    prompt_ids=inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask", None),
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    do_sample=sample,
+                    top_p=top_p,
+                )
+
+            # Extract per-sample completions using attention mask to find prompt lengths
+            attn = inputs.get("attention_mask", None)
+            if attn is None:
+                prompt_lens = [inputs["input_ids"].shape[1]] * gen_ids.size(0)
+            else:
+                prompt_lens = attn.sum(dim=1).tolist()
+
+            for row, plen in zip(gen_ids, prompt_lens):
+                comp_ids = row[plen:]
+                completions.append(model_or_algo.policy.decode(comp_ids.unsqueeze(0))[0].strip())
     else:
-        # GRPO or raw model - generate one by one (slower)
+        # Raw model - generate one by one
         if logger:
             logger.info("Generating responses one by one...")
         completions = []
