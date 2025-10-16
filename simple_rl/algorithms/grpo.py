@@ -429,6 +429,7 @@ class GRPO(BaseAlgorithm):
         prompt_end_positions: torch.Tensor,
         completion_mask: List[torch.Tensor],
         requires_grad: bool = False,
+        keep_gradients: bool = False,
     ) -> torch.Tensor:
         """
         Fully vectorized batch computation of log probabilities with chunking support.
@@ -442,7 +443,8 @@ class GRPO(BaseAlgorithm):
             attention_mask: List of [seq_len] attention mask tensors
             prompt_end_positions: [batch_size] tensor of prompt end positions
             completion_mask: List of [completion_len] mask tensors
-            requires_grad: Whether to compute gradients (True for new, False for old/ref)
+            requires_grad: Whether to compute gradients (True for all types for kernel consistency)
+            keep_gradients: Whether to keep gradients (True for new, False for old/ref)
 
         Returns:
             [batch_size, max_completion_len] tensor of log probs (right-padded, no prompts)
@@ -481,17 +483,21 @@ class GRPO(BaseAlgorithm):
                     requires_grad=requires_grad,
                     device=device,
                 )
-                
+
                 # CRITICAL: Detach to free computation graph immediately (prevents accumulation)
+                # Only detach for old/ref (keep_gradients=False), NOT for new (keep_gradients=True)
                 # This is crucial when using torch.enable_grad() for old/ref logprobs
-                chunk_log_probs = chunk_log_probs.detach()
+                if not keep_gradients:
+                    chunk_log_probs = chunk_log_probs.detach()
 
                 # CRITICAL: Immediately offload chunk to CPU to free GPU memory
                 # Only keep one chunk on GPU at a time, accumulate on CPU
                 if self.device.type == "cuda" and self.offload_generated_to_cpu:
                     chunk_log_probs = chunk_log_probs.cpu()
                     # Clear CUDA cache after each chunk to free gradient graph memory
-                    torch.cuda.empty_cache()
+                    # (only for old/ref since new doesn't detach)
+                    if not keep_gradients:
+                        torch.cuda.empty_cache()
 
                 all_completion_log_probs.append(chunk_log_probs)
 
@@ -511,8 +517,9 @@ class GRPO(BaseAlgorithm):
                 requires_grad=requires_grad,
                 device=device,
             )
-            # Detach if old/ref to free computation graph
-            if not requires_grad:
+            # Detach if old/ref (keep_gradients=False) to free computation graph
+            # Keep gradients for new (keep_gradients=True)
+            if not keep_gradients:
                 result = result.detach()
             return result
 
@@ -961,6 +968,7 @@ class GRPO(BaseAlgorithm):
                     prompt_end_positions=prompt_end_positions,
                     completion_mask=completion_mask,
                     requires_grad=True,  # ALWAYS True for consistent kernels (detach later for old/ref)
+                    keep_gradients=(logprob_type == "new"),  # Only keep gradients for new, detach old/ref
                 )
         finally:
             # Restore model state
