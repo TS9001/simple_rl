@@ -1189,7 +1189,6 @@ class GRPO(BaseAlgorithm):
         # This frees GPU memory before starting optimization
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
-            self.logger.info(f"  Logprobs computed and offloaded. old/ref on {'CPU' if old_log_probs.device.type == 'cpu' else 'GPU'}")
 
         self.timing_manager.start_timer("advantage_computation")
         advantages, advantage_stats = self.compute_advantages(

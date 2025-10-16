@@ -170,7 +170,7 @@ class ProgressTracker:
 # ============================================================
 
 # Training flags
-RUN_SFT = False  # Set to True to run SFT training, False to load from checkpoint
+RUN_SFT = True  # Set to True to run SFT training, False to load from checkpoint
 
 # Resume training configuration
 CONTINUE_FROM = 0  # Set to episode number to resume from GRPO checkpoint, 0 = start from SFT/base model
@@ -814,16 +814,16 @@ def main():
                 "batch_size": (
                     4 if model_dtype == "bf16" else 2
                 ),  # Larger batch with bf16
-                "learning_rate": 5e-6,  # Conservative LR for stability
-                "num_epochs": 3,
+                "learning_rate": 5e-5,  # Conservative LR for stability
+                "num_epochs": 1,
                 "gradient_accumulation_steps": (
                     4 if model_dtype == "bf16" else 8
                 ),  # Effective batch = 16
                 "max_grad_norm": 1.0,  # Standard clipping
-                "warmup_steps": 50,  # Moderate warmup
+                "warmup_steps": 0,  # Moderate warmup
                 "mask_prompt": True,
                 "gradient_checkpointing": True,  # Reduces VRAM usage
-                "weight_decay": 0.01,
+                "weight_decay": 0.00,
                 "label_smoothing": 0.00,
                 "mixed_precision": {"enabled": False, "dtype": model_dtype},
             },
@@ -856,12 +856,12 @@ def main():
         "training": {
             "batch_size": 16,  # REDUCED from 32 → 16 for BF16 stability (smaller updates)
             "rollout_batch_size": 4,  # REDUCED from 8 → 4 for BF16 stability (less memory pressure)
-            "gradient_clip": 1.0,  # TIGHTENED from 0.1 → 0.05 for BF16 stability (prevent explosion)
+            "gradient_clip": 3.0,  # TIGHTENED from 0.1 → 0.05 for BF16 stability (prevent explosion)
             "max_new_tokens": 500,
             "min_new_tokens": 50,  # LOWERED from 150 → 50 to allow </answer> early stopping
             "temperature": 0.8,
             "num_episodes": 500,
-            "minibatch_size": 32,  # REDUCED from 64 → 32 for BF16 stability (smaller updates)
+            "minibatch_size": 64,  # REDUCED from 64 → 32 for BF16 stability (smaller updates)
             "update_epochs": 1,
             "top_p": 0.9,
             "entropy_coef": 0.005,  # Increased from 0.002 → 0.005 for more exploration
@@ -911,13 +911,13 @@ def main():
         },
         "optimizer": {
             "type": "adamw",
-            "lr": 1e-6,  # REDUCED from 5e-6 → 1e-6 for BF16 stability (conservative LR)
+            "lr": 5e-6,  # REDUCED from 5e-6 → 1e-6 for BF16 stability (conservative LR)
             "weight_decay": 0.01,
             "betas": (0.9, 0.999),
             "eps": 1e-8,
             "fused": False,
             # Warmup parameters (for fresh start)
-            "warmup_steps": 30,  # INCREASED from 30 → 50 for BF16 stability (slower warmup)
+            "warmup_steps": 0,  # INCREASED from 30 → 50 for BF16 stability (slower warmup)
             "warmup_start_lr": 1e-10,  # DECREASED from 1e-9 → 1e-10 for BF16 stability (very gradual start)
             "warmup_type": "linear",
             # Resume-specific warmup (when LR changes between checkpoint and config)
