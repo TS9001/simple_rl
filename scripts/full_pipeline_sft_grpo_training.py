@@ -867,7 +867,9 @@ def main():
             "entropy_coef": 0.005,  # Increased from 0.002 → 0.005 for more exploration
             "policy_loss_type": "token",  # CHANGED from "token" → "sequence" for better gradients
             "resample_batch_per_episode": True,  # ← CRITICAL: Set to True to disable fixed batch!
+            # Memory optimization parameters
             "logprobs_batch_size": 64,  # Chunk logprob computation to reduce memory usage (None = no chunking)
+            "offload_generated_to_cpu": True,  # Offload generated sequences to CPU after generation (saves GPU memory)
             # Clipping parameters (all validated in overfit test)
             "kl_estimator": "k3",
             "kl_clamp_min": -1.5,  # TIGHTENED from -2.0 → -1.5 for BF16 stability

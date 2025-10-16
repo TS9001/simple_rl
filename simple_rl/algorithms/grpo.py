@@ -214,6 +214,10 @@ class GRPO(BaseAlgorithm):
         # Logprobs batch size for chunked processing (memory optimization)
         # If None, processes entire batch at once
         self.logprobs_batch_size = self.config.get("training", {}).get("logprobs_batch_size", None)
+        
+        # CPU offloading for generated sequences (memory optimization)
+        # If True, moves generated sequences to CPU after generation and brings chunks back for logprobs
+        self.offload_generated_to_cpu = self.config.get("training", {}).get("offload_generated_to_cpu", True)
 
         # Logger (initialize before optimizer so it can log warmup info)
         self.logger = create_logger(self.config)
@@ -766,13 +770,22 @@ class GRPO(BaseAlgorithm):
             replicated_prompt_end_positions = generation["prompt_end_positions"]
             total_sequences = generation["total_sequences"]
 
-            all_generated_ids.append(generated_ids.detach())
-            all_generated_mask.append(generated_mask.detach())
-            all_prompt_end_positions.append(replicated_prompt_end_positions.detach())
+            # Offload to CPU to save GPU memory (if enabled)
+            if self.offload_generated_to_cpu and self.device.type == "cuda":
+                all_generated_ids.append(generated_ids.detach().cpu())
+                all_generated_mask.append(generated_mask.detach().cpu())
+                all_prompt_end_positions.append(replicated_prompt_end_positions.detach().cpu())
+            else:
+                all_generated_ids.append(generated_ids.detach())
+                all_generated_mask.append(generated_mask.detach())
+                all_prompt_end_positions.append(replicated_prompt_end_positions.detach())
 
-            # Store completion masks for later use
+            # Store completion masks for later use (also offload if enabled)
             for seq_idx in range(total_sequences):
-                all_completion_mask.append(completion_mask[seq_idx, :].detach())
+                if self.offload_generated_to_cpu and self.device.type == "cuda":
+                    all_completion_mask.append(completion_mask[seq_idx, :].detach().cpu())
+                else:
+                    all_completion_mask.append(completion_mask[seq_idx, :].detach())
 
             self.timing_manager.start_timer(f"batch_{batch_idx}_rewards")
             for prompt_idx, (prompt, answer) in enumerate(zip(batch_prompts, batch_answers)):
