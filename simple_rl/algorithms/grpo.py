@@ -142,20 +142,15 @@ class GRPO(BaseAlgorithm):
         self.kl_coef = self.training_config.kl_coef
         self.normalize_rewards = self.training_config.normalize_rewards
 
-        # Create frozen reference model for KL penalty (ONLY if kl_coef > 0)
+        # Create reference model for KL penalty (ONLY if kl_coef > 0)
+        # Keep requires_grad=True (same as policy) for identical kernel selection
+        # We simply won't call optimizer.step() on it
         if self.kl_coef > 0:
             self.ref_policy = copy.deepcopy(self.policy)
             self.ref_policy = self.ref_policy.to(self.device)
-
-            # Freeze reference model
-            for param in self.ref_policy.parameters():
-                param.requires_grad = False
-            self.ref_policy.eval()
-
-            # Verify freezing
-            frozen_params = sum(1 for p in self.ref_policy.parameters() if not p.requires_grad)
-            total_params = sum(1 for _ in self.ref_policy.parameters())
-            assert frozen_params == total_params, "Not all reference parameters frozen"
+            self.ref_policy.eval()  # Keep in eval mode
+            # Note: parameters still have requires_grad=True (same as policy)
+            # This ensures old and ref use identical computation paths
         else:
             self.ref_policy = None
 
@@ -811,7 +806,6 @@ class GRPO(BaseAlgorithm):
 
         # Force eval() for ALL logprob types to ensure identical forward path
         # This prevents training/inference kernel divergence (e.g., Flash Attention behavior)
-        # Gradients still flow for "new" because torch.set_grad_enabled handles that
         model.eval()
         
         # Always disable cache for consistency
@@ -819,9 +813,9 @@ class GRPO(BaseAlgorithm):
             model.model.config.use_cache = False
 
         try:
-            # CRITICAL FIX: Compute ALL with gradients ENABLED for consistent kernels
-            # Then detach old/ref, keep gradients for new
-            # This ensures all three use identical computation path
+            # CRITICAL: Compute ALL with torch.enable_grad() for consistent kernels
+            # Both policy and ref_policy have requires_grad=True (same state)
+            # This ensures old/new/ref use identical computation paths
             with torch.enable_grad():
                 # NO autocast - logprobs must be computed in FP32 for numerical stability
                 log_probs = self._compute_batch_log_probs_vectorized(
@@ -841,7 +835,6 @@ class GRPO(BaseAlgorithm):
 
         self.timing_manager.end_timer(f"compute_{logprob_type}_logprobs")
 
-        # All computed with gradients enabled (consistent kernels)
         # For old/ref: detach to remove gradients
         # For new: keep gradients for backward pass
         if logprob_type in ["old", "ref"]:
@@ -1128,14 +1121,13 @@ class GRPO(BaseAlgorithm):
             ref_threshold = 1e-6
             new_threshold = 1e-6
         
-        # Validate old-ref only if ref_policy exists and should be identical
-        # Note: In episode 0, ref_policy is a deepcopy of policy, but deepcopy with
-        # gradient-enabled context may introduce numerical differences even without training
-        # The critical check is old vs new (same model, should be identical)
+        # Validate old-ref (should be identical with param requires_grad matching)
         if max_diff_old_ref >= ref_threshold:
-            print(f"⚠️  WARNING: Old-Ref diff {max_diff_old_ref:.2e} >= threshold {ref_threshold:.0e}")
-            print(f"   This is expected if ref_policy is a separate model instance (deepcopy).")
-            print(f"   The critical check is Old-New consistency (same model).")
+            print(f"❌ FAILED: Old-Ref diff {max_diff_old_ref:.2e} >= threshold {ref_threshold:.0e}")
+            print(f"   Old and Ref should be identical at episode 0 (both from same initial weights).")
+            raise AssertionError(
+                f"Old and ref log probs differ by {max_diff_old_ref:.2e} (expected < {ref_threshold:.0e})"
+            )
         else:
             print(f"✅ PASSED: Old-Ref diff {max_diff_old_ref:.2e} < threshold {ref_threshold:.0e}")
         
