@@ -809,16 +809,18 @@ class GRPO(BaseAlgorithm):
         prev_mode = model.training
         prev_cache = getattr(model.model.config, "use_cache", None)
 
-        # # Configure model for logprob computation
-        # # For "new", keep training mode; for "old" and "ref", use eval mode
-        # if logprob_type in ["old", "ref"]:
-        #     model.eval()
+        # Force eval() for ALL logprob types to ensure identical forward path
+        # This prevents training/inference kernel divergence (e.g., Flash Attention behavior)
+        # Gradients still flow for "new" because torch.set_grad_enabled handles that
+        model.eval()
+        
         # Always disable cache for consistency
         if prev_cache is not None:
             model.model.config.use_cache = False
 
         try:
             # Compute logprobs with or without gradients
+            # eval() ensures consistent kernels; set_grad_enabled controls gradient flow
             with torch.set_grad_enabled(logprob_type == "new"):
                 # NO autocast - logprobs must be computed in FP32 for numerical stability
                 log_probs = self._compute_batch_log_probs_vectorized(
@@ -833,8 +835,8 @@ class GRPO(BaseAlgorithm):
             # Restore model state
             if prev_cache is not None:
                 model.model.config.use_cache = prev_cache
-            # if logprob_type in ["old", "ref"] and prev_mode:
-            #     model.train()
+            if prev_mode:
+                model.train()
 
         self.timing_manager.end_timer(f"compute_{logprob_type}_logprobs")
 
@@ -1028,32 +1030,34 @@ class GRPO(BaseAlgorithm):
         print(f"  - Total values written: {old_log_probs.numel() * 3} (old, new, ref)")
         print(f"  - INPUTS: Token text for each position is included for all models")
 
-        # Dtype-aware thresholds (BF16 + Flash Attention 2 on CUDA is non-deterministic)
+        # Dtype-aware thresholds
+        # With eval() forced for all logprob types, old/new/ref should be nearly identical
+        # Small differences can still occur due to numerical precision and kernel non-determinism
         model_dtype = next(self.policy.parameters()).dtype
 
         if model_dtype == torch.bfloat16:
-            # BF16 on CUDA: Very relaxed thresholds due to Flash Attention 2 non-determinism
-            # Flash Attention 2 uses atomic operations that cause significant variance
-            # Even with FP32 log probs, the BF16 forward pass produces different logits each time
+            # BF16: Slightly relaxed thresholds due to lower precision
+            # Flash Attention 2 can still have some non-determinism, but eval() greatly reduces it
             ref_threshold = 1e-4
-            new_threshold = 2.0  # Increased from 0.5 to 2.0 to accommodate FA2 variance
+            new_threshold = 1e-4  # Tightened from 2.0 since eval() ensures consistent kernels
         elif model_dtype == torch.float16:
             # FP16: Moderate thresholds
             ref_threshold = 1e-5
-            new_threshold = 5e-2
+            new_threshold = 1e-5  # Tightened from 5e-2 since eval() ensures consistent kernels
         else:
             # FP32: Strict thresholds (original behavior)
             ref_threshold = 1e-6
-            new_threshold = 5e-4
+            new_threshold = 1e-6  # Tightened from 5e-4 since eval() ensures consistent kernels
 
         assert old_ref_diff < ref_threshold, (
             f"Old and ref log probs differ by {old_ref_diff:.2e} (expected < {ref_threshold:.0e}). "
-            f"This indicates dropout is still active or model corruption"
+            f"This indicates model corruption or different model states"
         )
 
         assert old_new_diff < new_threshold, (
             f"Old and new log probs differ by {old_new_diff:.2e} (expected < {new_threshold:.0e}). "
-            f"This indicates dropout is still active or major randomness"
+            f"With eval() enforced, old and new should be nearly identical. "
+            f"This indicates an issue with the unified logprob computation."
         )
 
     def compute_advantages(
