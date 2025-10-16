@@ -221,26 +221,7 @@ class LanguageModel(nn.Module):
         original_seq_len = input_ids.size(1)
         left_pad_removed = 0
 
-        # OPTIMIZATION: Remove left padding before computing log probs to save computation
-        if attention_mask is not None:
-            # Find where content starts for each sequence (first non-zero in mask)
-            first_valid = (attention_mask != 0).int().argmax(dim=1)  # [batch_size]
-            min_left_pad = first_valid.min().item()
-
-            if min_left_pad > 0:
-                # Remove common left padding from all sequences
-                input_ids = input_ids[:, min_left_pad:]
-                attention_mask = attention_mask[:, min_left_pad:]
-                left_pad_removed = min_left_pad
-
-        # Get logits from model (full forward pass with complete context)
-        # Forward pass can be in BF16 (via autocast), but we'll cast to FP32 for log probs
-        logits = self.forward(input_ids, attention_mask=attention_mask)
-
-        # CRITICAL: Cast logits to FP32 BEFORE log_softmax
-        # This ensures log probabilities are ALWAYS computed in FP32 regardless of autocast
-        # Model forward can be BF16 (fast), but log probs must be FP32 (stable)
-        logits = logits.float()
+        logits = self.forward(input_ids, attention_mask=attention_mask).float()
 
         # Shift logits and labels for next token prediction
         shift_logits = logits[:, :-1, :].contiguous()
@@ -264,37 +245,13 @@ class LanguageModel(nn.Module):
                 if attention_mask is not None:
                     shift_attention_mask = shift_attention_mask[:, start_idx:]
 
-        # MPS WORKAROUND: Compute log probs on CPU for large vocab sizes
-        # MPS has numerical precision issues with large vocabulary log_softmax + gather operations
-        # This causes incorrect zero values in computed log probabilities
-        if shift_logits.device.type == 'mps' and shift_logits.size(-1) > 50000:
-            original_device = shift_logits.device
 
-            # Move to CPU for computation
-            shift_logits_cpu = shift_logits.to('cpu')
-            shift_labels_cpu = shift_labels.to('cpu')
+        log_probs_all = F.log_softmax(shift_logits, dim=-1)
+        log_probs = torch.gather(
+            log_probs_all, dim=-1, index=shift_labels.unsqueeze(-1)
+        ).squeeze(-1)
 
-            # Compute on CPU (autocast will keep log_softmax in FP32)
-            log_probs_all = F.log_softmax(shift_logits_cpu, dim=-1)
-            log_probs = torch.gather(
-                log_probs_all, dim=-1, index=shift_labels_cpu.unsqueeze(-1)
-            ).squeeze(-1)
 
-            # Move result back to original device
-            log_probs = log_probs.to(original_device)
-
-            # Clean up CPU tensors
-            del shift_logits_cpu, shift_labels_cpu, log_probs_all
-        else:
-            # Standard computation on device
-            # Note: autocast automatically keeps log_softmax in FP32 for numerical stability
-            log_probs_all = F.log_softmax(shift_logits, dim=-1)
-            log_probs = torch.gather(
-                log_probs_all, dim=-1, index=shift_labels.unsqueeze(-1)
-            ).squeeze(-1)
-
-        # CRITICAL FIX: Mask out padding positions
-        # Set log probs to 0.0 for padding tokens (where attention_mask=0)
         if attention_mask is not None:
             log_probs = log_probs * shift_attention_mask.float()
 

@@ -349,6 +349,157 @@ class GRPO(BaseAlgorithm):
 
         return not_pad * not_after_eos
 
+    def _compute_sequence_log_probs_unified(
+        self,
+        model: Any,
+        generated_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        prompt_end_position: torch.Tensor,
+        completion_mask: torch.Tensor,
+        requires_grad: bool = False,
+    ) -> torch.Tensor:
+        """
+        Unified method to compute log probabilities for ONE sequence.
+
+        Used by old/new/ref to ensure IDENTICAL:
+        - Input processing
+        - Forward pass configuration
+        - Output extraction
+        - Padding/masking logic
+        - Shape and dtype
+
+        Args:
+            model: LanguageModel instance (policy or ref_policy)
+            generated_ids: [seq_len] token IDs
+            attention_mask: [seq_len] attention mask
+            prompt_end_position: scalar tensor (where completion starts)
+            completion_mask: [max_completion_len] binary mask
+            requires_grad: whether to enable gradients
+
+        Returns:
+            [max_completion_len] tensor of log probs (zeros where masked)
+        """
+        max_len = completion_mask.size(0)
+        device = generated_ids.device
+
+        # Fast path: empty completion
+        if int(completion_mask.sum().item()) == 0:
+            return torch.zeros(max_len, device=device, dtype=torch.float32)
+
+        # Compute full sequence log probs
+        # Note: compute_log_probs returns [1, seq_len-1] because it does next-token prediction
+        full_log_probs = model.compute_log_probs(
+            generated_ids.unsqueeze(0),
+            attention_mask=attention_mask.unsqueeze(0),
+        )  # [1, S-1] in fp32
+
+        # Extract completion-aligned log probs
+        # prompt_end_position points to first completion token in generated_ids
+        # full_log_probs[i] predicts generated_ids[i+1], so we need to offset by -1
+        completion_positions = torch.arange(max_len, device=device)
+        source_positions = (prompt_end_position.item() - 1) + completion_positions
+
+        # Clamp and track validity
+        source_positions_clamped = source_positions.clamp(0, full_log_probs.size(1) - 1)
+        valid_mask = source_positions < full_log_probs.size(1)
+
+        # Gather log probs
+        seq_log_probs = full_log_probs[0, source_positions_clamped]
+
+        # Zero out invalid positions (beyond sequence length)
+        seq_log_probs = torch.where(
+            valid_mask,
+            seq_log_probs,
+            torch.tensor(0.0, device=device, dtype=seq_log_probs.dtype)
+        )
+
+        # Apply completion mask (zeros out padding and post-EOS tokens)
+        seq_log_probs = seq_log_probs * completion_mask.to(seq_log_probs.dtype)
+
+        return seq_log_probs
+
+    def _compute_batch_log_probs_vectorized(
+        self,
+        model: Any,
+        generated_ids: List[torch.Tensor],
+        attention_mask: List[torch.Tensor],
+        prompt_end_positions: torch.Tensor,
+        completion_mask: List[torch.Tensor],
+        requires_grad: bool = False,
+    ) -> torch.Tensor:
+        """
+        Fully vectorized batch computation of log probabilities.
+
+        This method processes ALL sequences in parallel without loops.
+        It ensures OLD, NEW, and REF logprobs are computed identically.
+
+        Args:
+            model: LanguageModel instance (policy or ref_policy)
+            generated_ids: List of [seq_len] token ID tensors
+            attention_mask: List of [seq_len] attention mask tensors
+            prompt_end_positions: [batch_size] tensor of prompt end positions
+            completion_mask: List of [completion_len] mask tensors
+            requires_grad: Whether to compute gradients (True for new, False for old/ref)
+
+        Returns:
+            [batch_size, max_completion_len] tensor of log probs (right-padded, no prompts)
+        """
+        batch_size = len(generated_ids)
+        device = generated_ids[0].device
+
+        # Find max completion length for padding
+        max_completion_len = max(mask.size(0) for mask in completion_mask)
+
+        # Pad all sequences to same length for batch processing
+        from torch.nn.utils.rnn import pad_sequence
+
+        # Pad generated_ids and attention_mask
+        padded_ids = pad_sequence(generated_ids, batch_first=True, padding_value=self.policy.tokenizer.pad_token_id)
+        padded_attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+
+        # Pad completion masks to max_completion_len (vectorized, no loop)
+        padded_completion_mask = pad_sequence(completion_mask, batch_first=True, padding_value=0)
+
+        # Compute log probs for entire batch (vectorized)
+        # This returns [batch_size, seq_len-1] in fp32
+        with torch.set_grad_enabled(requires_grad):
+            batch_log_probs = model.compute_log_probs(
+                padded_ids,
+                attention_mask=padded_attention_mask,
+            )  # [B, S-1] in fp32
+
+        # Extract completion portions (vectorized)
+        # Create batch indices and position indices for gathering
+        batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)  # [B, 1]
+        completion_positions = torch.arange(max_completion_len, device=device).unsqueeze(0)  # [1, L]
+
+        # Compute source positions for each sequence
+        # prompt_end_positions[i] points to first completion token in generated_ids[i]
+        # batch_log_probs[i, j] predicts token at position j+1, so offset by -1
+        source_positions = (prompt_end_positions.unsqueeze(1) - 1) + completion_positions  # [B, L]
+
+        # Clamp positions to valid range
+        max_valid_position = batch_log_probs.size(1) - 1
+        source_positions_clamped = source_positions.clamp(0, max_valid_position)
+
+        # Track valid positions (before sequence end)
+        valid_mask = source_positions < batch_log_probs.size(1)  # [B, L]
+
+        # Gather log probs using advanced indexing (fully vectorized)
+        completion_log_probs = batch_log_probs[batch_indices, source_positions_clamped]  # [B, L]
+
+        # Zero out invalid positions (beyond sequence length)
+        completion_log_probs = torch.where(
+            valid_mask,
+            completion_log_probs,
+            torch.zeros(1, device=device, dtype=completion_log_probs.dtype)
+        )
+
+        # Apply completion mask (zeros out padding and post-EOS tokens)
+        completion_log_probs = completion_log_probs * padded_completion_mask
+
+        return completion_log_probs
+
 
     def _generate_grouped_completions(
         self, prompts: List[str]
@@ -495,7 +646,7 @@ class GRPO(BaseAlgorithm):
         memory issues during generation.
 
         Returns:
-            (prompts, completions, rewards, old_log_probs, ref_log_probs, completion_mask,
+            (prompts, completions, rewards, completion_mask,
              format_rewards, correctness_rewards, generated_ids, attention_mask, prompt_end_positions)
         """
         store = self.store_completions if store_outputs is None else store_outputs
@@ -511,8 +662,6 @@ class GRPO(BaseAlgorithm):
         all_rewards = []
         all_format_rewards = []
         all_correctness_rewards = []
-        all_log_probs = []
-        all_ref_log_probs = []
         all_completion_mask = []
 
         all_generated_ids = []
@@ -548,54 +697,9 @@ class GRPO(BaseAlgorithm):
             all_generated_mask.append(generated_mask.detach())
             all_prompt_end_positions.append(replicated_prompt_end_positions.detach())
 
-            self.timing_manager.start_timer(f"batch_{batch_idx}_policy_log_probs")
-            max_completion_len = completion_ids.size(1)
-
-            # Use same autocast config as training for determinism
-            with torch.no_grad():
-                with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
-                    full_log_probs = self.policy.compute_log_probs(
-                        generated_ids,
-                        attention_mask=generated_mask,
-                    )
-
-                device = full_log_probs.device
-                batch_indices = torch.arange(total_sequences, device=device).unsqueeze(1)
-                completion_positions = torch.arange(max_completion_len, device=device).unsqueeze(0)
-                source_positions = (replicated_prompt_end_positions - 1).unsqueeze(1) + completion_positions
-                source_positions = source_positions.clamp(0, full_log_probs.size(1) - 1)
-                valid_mask = source_positions < full_log_probs.size(1)
-                policy_log_probs = full_log_probs[batch_indices, source_positions]
-                policy_log_probs = torch.where(valid_mask, policy_log_probs,
-                                               torch.tensor(0.0, device=device, dtype=policy_log_probs.dtype))
-
-            self.timing_manager.end_timer(f"batch_{batch_idx}_policy_log_probs")
-
-            if self.kl_coef > 0 and self.ref_policy is not None:
-                self.timing_manager.start_timer(f"batch_{batch_idx}_ref_log_probs")
-                with torch.no_grad():
-                    with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
-                        full_ref_log_probs = self.ref_policy.compute_log_probs(
-                            generated_ids,
-                            attention_mask=generated_mask,
-                        )
-                    ref_log_probs = full_ref_log_probs[batch_indices, source_positions]
-                    ref_log_probs = torch.where(valid_mask, ref_log_probs,
-                                                torch.tensor(0.0, device=device, dtype=ref_log_probs.dtype))
-                self.timing_manager.end_timer(f"batch_{batch_idx}_ref_log_probs")
-            else:
-                ref_log_probs = torch.zeros_like(policy_log_probs)
-
-            self.timing_manager.start_timer(f"batch_{batch_idx}_extract_completions")
-            batch_policy_log_probs = policy_log_probs * completion_mask
-            batch_ref_log_probs = ref_log_probs * completion_mask
-
+            # Store completion masks for later use
             for seq_idx in range(total_sequences):
-                all_log_probs.append(batch_policy_log_probs[seq_idx, :].detach())
-                all_ref_log_probs.append(batch_ref_log_probs[seq_idx, :].detach())
                 all_completion_mask.append(completion_mask[seq_idx, :].detach())
-
-            self.timing_manager.end_timer(f"batch_{batch_idx}_extract_completions")
 
             self.timing_manager.start_timer(f"batch_{batch_idx}_rewards")
             for prompt_idx, (prompt, answer) in enumerate(zip(batch_prompts, batch_answers)):
@@ -615,7 +719,7 @@ class GRPO(BaseAlgorithm):
                     all_completions.extend(group_completions)
             self.timing_manager.end_timer(f"batch_{batch_idx}_rewards")
 
-            del generated_ids, generated_mask, completion_ids, policy_log_probs, ref_log_probs
+            del generated_ids, generated_mask, completion_ids
             if self.device.type == "cuda" or (self.device.type == "mps" and self.clear_cache_on_mps):
                 clear_device_cache(self.device)
 
@@ -641,8 +745,6 @@ class GRPO(BaseAlgorithm):
                 all_prompts,
                 all_completions,
                 all_rewards,
-                all_log_probs,
-                all_ref_log_probs,
                 all_completion_mask,
                 all_format_rewards,
                 all_correctness_rewards,
@@ -654,8 +756,6 @@ class GRPO(BaseAlgorithm):
             None,
             None,
             all_rewards,
-            all_log_probs,
-            all_ref_log_probs,
             all_completion_mask,
             all_format_rewards,
             all_correctness_rewards,
@@ -663,6 +763,86 @@ class GRPO(BaseAlgorithm):
             attention_mask,
             prompt_end_positions,
         )
+
+    def compute_logprobs(
+        self,
+        logprob_type: str,  # "old", "ref", or "new"
+        generated_ids: List[torch.Tensor],
+        attention_mask: List[torch.Tensor],
+        prompt_end_positions: torch.Tensor,
+        completion_mask: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Unified method to compute ANY type of logprobs (old, ref, or new).
+
+        This single method ensures all logprob types use IDENTICAL computation.
+
+        Args:
+            logprob_type: Type of logprobs to compute ("old", "ref", or "new")
+            generated_ids: List of [seq_len] token ID tensors
+            attention_mask: List of [seq_len] attention mask tensors
+            prompt_end_positions: [batch_size] tensor of prompt end positions
+            completion_mask: List of [completion_len] mask tensors
+
+        Returns:
+            [batch_size, max_completion_len] tensor of log probs
+        """
+
+        # Start timing
+        self.timing_manager.start_timer(f"compute_{logprob_type}_logprobs")
+
+        # Select model based on type
+        if logprob_type == "ref":
+            if self.kl_coef > 0 and self.ref_policy is not None:
+                model = self.ref_policy
+            else:
+                # If no KL penalty or ref model, return zeros
+                batch_size = len(completion_mask)
+                max_completion_len = max(mask.size(0) for mask in completion_mask)
+                self.timing_manager.end_timer(f"compute_{logprob_type}_logprobs")
+                return torch.zeros(batch_size, max_completion_len, device=self.device)
+        else:
+            # Both "old" and "new" use the policy model
+            model = self.policy
+
+        # Save model state
+        prev_mode = model.training
+        prev_cache = getattr(model.model.config, "use_cache", None)
+
+        # # Configure model for logprob computation
+        # # For "new", keep training mode; for "old" and "ref", use eval mode
+        # if logprob_type in ["old", "ref"]:
+        #     model.eval()
+        # Always disable cache for consistency
+        if prev_cache is not None:
+            model.model.config.use_cache = False
+
+        try:
+            # Compute logprobs with or without gradients
+            with torch.set_grad_enabled(logprob_type == "new"):
+                # NO autocast - logprobs must be computed in FP32 for numerical stability
+                log_probs = self._compute_batch_log_probs_vectorized(
+                    model=model,
+                    generated_ids=generated_ids,
+                    attention_mask=attention_mask,
+                    prompt_end_positions=prompt_end_positions,
+                    completion_mask=completion_mask,
+                    requires_grad=(logprob_type == "new"),
+                )
+        finally:
+            # Restore model state
+            if prev_cache is not None:
+                model.model.config.use_cache = prev_cache
+            # if logprob_type in ["old", "ref"] and prev_mode:
+            #     model.train()
+
+        self.timing_manager.end_timer(f"compute_{logprob_type}_logprobs")
+
+        # Detach for old and ref (frozen), keep gradients for new
+        if logprob_type in ["old", "ref"]:
+            return log_probs.detach()
+        else:
+            return log_probs
 
     def _validate_log_probs_episode_zero(
         self,
@@ -894,8 +1074,6 @@ class GRPO(BaseAlgorithm):
             _,
             _,
             rewards,
-            old_log_probs,
-            ref_log_probs,
             completion_mask,
             format_rewards,
             correctness_rewards,
@@ -906,6 +1084,15 @@ class GRPO(BaseAlgorithm):
             prompts, answers=answers, store_outputs=False
         )
         self.timing_manager.end_timer("trajectory_generation")
+
+        # Compute frozen old/ref logprobs once, right before optimization
+        # Use unified method to ensure IDENTICAL computation for all types
+        old_log_probs = self.compute_logprobs(
+            "old", generated_ids, attention_mask, prompt_end_positions, completion_mask
+        )
+        ref_log_probs = self.compute_logprobs(
+            "ref", generated_ids, attention_mask, prompt_end_positions, completion_mask
+        )
 
         self.timing_manager.start_timer("advantage_computation")
         advantages, advantage_stats = self.compute_advantages(
@@ -950,6 +1137,7 @@ class GRPO(BaseAlgorithm):
         if prev_cache is not None:
             self.policy.model.config.use_cache = False
 
+        
         try:
             for epoch in range(self.update_epochs):
                 indices = torch.randperm(total_sequences, device=self.device)
@@ -964,76 +1152,34 @@ class GRPO(BaseAlgorithm):
                     mb_indices = indices[mb_start:mb_end]
                     mb_advantages = advantages[mb_indices]
 
+                    # Select minibatch data
                     selected_gen_ids = [generated_ids[idx] for idx in mb_indices]
                     selected_attn_mask = [attention_mask[idx] for idx in mb_indices]
-                    selected_old_log_probs = [old_log_probs[idx] for idx in mb_indices]
-                    selected_ref_log_probs = [ref_log_probs[idx] for idx in mb_indices]
                     selected_completion_mask = [completion_mask[idx] for idx in mb_indices]
-                    selected_prompt_end_positions = [prompt_end_positions[idx] for idx in mb_indices]
+                    selected_prompt_end_positions = prompt_end_positions[mb_indices]
+
+                    # Extract minibatch slices from batch tensors
+                    mb_old_log_probs = old_log_probs[mb_indices]
+                    mb_ref_log_probs = ref_log_probs[mb_indices]
 
                     self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_recompute")
 
-                    new_log_probs_list = []
-
-                    # Forward pass with autocast (CUDA only)
-                    # BF16: Faster computation, no gradient scaling needed
-                    # FP16: Would need gradient scaling (handled below)
-                    with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
-                        for seq_idx, (seq_gen_ids, seq_attn_mask, seq_old_log_probs, seq_completion_mask, seq_prompt_end_position) in enumerate(zip(
-                            selected_gen_ids, selected_attn_mask, selected_old_log_probs, selected_completion_mask, selected_prompt_end_positions
-                        )):
-                            max_completion_len = seq_old_log_probs.size(0)
-                            mask_valid = int(seq_completion_mask.sum().item())
-
-                            if mask_valid == 0:
-                                seq_new_log_probs = torch.zeros(max_completion_len, device=seq_old_log_probs.device, dtype=seq_old_log_probs.dtype)
-                            else:
-                                full_log_probs = self.policy.compute_log_probs(
-                                    seq_gen_ids.unsqueeze(0),
-                                    attention_mask=seq_attn_mask.unsqueeze(0),
-                                )
-                                device = full_log_probs.device
-                                completion_positions = torch.arange(max_completion_len, device=device)
-                                source_positions = (seq_prompt_end_position.item() - 1) + completion_positions
-                                source_positions = source_positions.clamp(0, full_log_probs.size(1) - 1)
-                                valid_mask = source_positions < full_log_probs.size(1)
-                                seq_new_log_probs = full_log_probs[0, source_positions]
-                                seq_new_log_probs = torch.where(valid_mask, seq_new_log_probs,
-                                                               torch.tensor(0.0, device=device, dtype=seq_new_log_probs.dtype))
-                            new_log_probs_list.append(seq_new_log_probs)
-
-                    mb_old_log_probs = pad_sequence(
-                        selected_old_log_probs,
-                        batch_first=True,
-                        padding_value=0.0
+                    # NO autocast - logprobs must be computed in FP32 for numerical stability
+                    # Compute new log probs using unified method (same as old/ref)
+                    mb_new_log_probs = self.compute_logprobs(
+                        "new",  # Enable gradients for policy update
+                        selected_gen_ids,
+                        selected_attn_mask,
+                        selected_prompt_end_positions,
+                        selected_completion_mask,
                     )
-                    mb_ref_log_probs = pad_sequence(
-                        selected_ref_log_probs,
-                        batch_first=True,
-                        padding_value=0.0
-                    )
+
+                    # Create padded completion mask to match log probs shape (vectorized, no loop)
                     mb_completion_mask = pad_sequence(
                         selected_completion_mask,
                         batch_first=True,
-                        padding_value=0.0
+                        padding_value=0
                     )
-
-                    target_len = mb_old_log_probs.size(1)
-                    padded_new_log_probs_list = []
-                    for seq_new in new_log_probs_list:
-                        current_len = seq_new.size(0)
-                        if current_len < target_len:
-                            padding = torch.zeros(target_len - current_len, device=seq_new.device, dtype=seq_new.dtype)
-                            padded_seq = torch.cat([seq_new, padding], dim=0)
-                        elif current_len > target_len:
-                            padded_seq = seq_new[:target_len]
-                        else:
-                            padded_seq = seq_new
-                        padded_new_log_probs_list.append(padded_seq)
-
-                    mb_new_log_probs = torch.stack(padded_new_log_probs_list, dim=0)
-                    del new_log_probs_list, padded_new_log_probs_list
-                    mb_new_log_probs = mb_new_log_probs * mb_completion_mask
 
                     self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_recompute")
 
@@ -1044,16 +1190,15 @@ class GRPO(BaseAlgorithm):
 
                     self.optimizer.zero_grad()
 
-                    # Loss computation with autocast (CUDA only)
+                    # Loss computation (NO autocast - already in FP32)
                     self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_loss")
-                    with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
-                        loss, mb_metrics = self.compute_loss(
-                            mb_new_log_probs,
-                            mb_old_log_probs,
-                            mb_advantages,
-                            mb_ref_log_probs,
-                            mb_completion_mask,
-                        )
+                    loss, mb_metrics = self.compute_loss(
+                        mb_new_log_probs,
+                        mb_old_log_probs,
+                        mb_advantages,
+                        mb_ref_log_probs,
+                        mb_completion_mask,
+                    )
                     self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_loss")
 
                     # Backward pass with optional gradient scaling (FP16 only, not BF16)
@@ -1126,8 +1271,8 @@ class GRPO(BaseAlgorithm):
                     del (
                         mb_new_log_probs, loss, mb_old_log_probs, mb_ref_log_probs, mb_advantages,
                         mb_completion_mask,
-                        selected_gen_ids, selected_attn_mask, selected_old_log_probs,
-                        selected_ref_log_probs, selected_completion_mask,
+                        selected_gen_ids, selected_attn_mask, selected_completion_mask,
+                        selected_prompt_end_positions,
                         param_update_norm, relative_param_update, grad_norm_before_clip, grad_norm_post_clip
                     )
                     if self.device.type == "cuda" or (self.device.type == "mps" and self.clear_cache_on_mps):
@@ -1502,7 +1647,7 @@ class GRPO(BaseAlgorithm):
         with torch.no_grad():
             for _ in range(num_episodes):
                 prompts = [f"Test {i}: Calculate {i}*2" for i in range(4)]
-                _, _, rewards, _, _, _, _, _, _, _, _ = self.generate_trajectories(prompts)
+                _, _, rewards, _, _, _, _, _, _ = self.generate_trajectories(prompts)
                 total_rewards.extend(rewards.cpu().numpy())
 
         self.policy.train()

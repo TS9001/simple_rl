@@ -43,8 +43,12 @@ import tarfile
 import shutil
 import json
 import time
+import warnings
 from datetime import datetime
 from pathlib import Path
+
+# Suppress Pydantic warnings from Transformers library
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic._internal._generate_schema")
 
 import torch
 import numpy as np
@@ -836,21 +840,21 @@ def main():
     grpo_config = {
         "algorithm": {
             "name": "grpo",
-            "group_size": 16,  # INCREASED from 8 → 16 for more advantage dynamic range
+            "group_size": 4,  # INCREASED from 8 → 16 for more advantage dynamic range
             "kl_coef": 0.03,  # REDUCED from 0.08 → 0.05 for BF16 stability (less aggressive updates)
             "clip_epsilon": 0.2,
             "normalize_rewards": True,
             "store_completions": False,
         },
         "training": {
-            "batch_size": 16,  # REDUCED from 32 → 16 for BF16 stability (smaller updates)
-            "rollout_batch_size": 4,  # REDUCED from 8 → 4 for BF16 stability (less memory pressure)
+            "batch_size": 8,  # REDUCED from 32 → 16 for BF16 stability (smaller updates)
+            "rollout_batch_size": 8,  # REDUCED from 8 → 4 for BF16 stability (less memory pressure)
             "gradient_clip": 1.0,  # TIGHTENED from 0.1 → 0.05 for BF16 stability (prevent explosion)
-            "max_new_tokens": 512,
+            "max_new_tokens": 256,
             "min_new_tokens": 50,  # LOWERED from 150 → 50 to allow </answer> early stopping
             "temperature": 0.8,
             "num_episodes": 500,
-            "minibatch_size": 64,  # REDUCED from 64 → 32 for BF16 stability (smaller updates)
+            "minibatch_size": 32,  # REDUCED from 64 → 32 for BF16 stability (smaller updates)
             "update_epochs": 1,
             "top_p": 0.9,
             "entropy_coef": 0.005,  # Increased from 0.002 → 0.005 for more exploration
@@ -884,7 +888,7 @@ def main():
         "logging": {
             "log_interval": 1,
             "save_interval": 15,
-            "show_trajectory_progress": True,
+            "show_trajectory_progress": False,
         },
         "validation": {
             "enabled": True,
@@ -918,15 +922,6 @@ def main():
         },
         "timing": {
             "enabled": False,
-        },
-        "debug": {
-            "enabled": False,  # Disabled for production training
-            "log_dir": "debug_logs",
-            "loss": False,
-            "advantages": False,
-            "gradients": False,
-            "generation": False,
-            "alignment": False,
         },
     }
 

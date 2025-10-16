@@ -248,7 +248,7 @@ class TestGRPOIntegration:
         prompts = math_dataset["prompts"][:2]
         answers = math_dataset["answers"][:2]
 
-        rewards, completions, log_probs, ref_log_probs, input_ids = grpo.generate_trajectories(
+        prompts_out, completions, rewards, completion_mask, format_rewards, correctness_rewards, generated_ids, attention_mask, prompt_end_positions = grpo.generate_trajectories(
             prompts=prompts,
             answers=answers,
             store_outputs=True

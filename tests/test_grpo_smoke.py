@@ -240,18 +240,17 @@ class TestGRPOSmoke:
         prompts = tiny_dataset["prompts"]
         answers = tiny_dataset["answers"]
 
-        rewards, completions, log_probs, ref_log_probs, input_ids = grpo.generate_trajectories(
+        prompts_out, completions, rewards, completion_mask, format_rewards, correctness_rewards, generated_ids, attention_mask, prompt_end_positions = grpo.generate_trajectories(
             prompts=prompts,
             answers=answers,
             store_outputs=True
         )
 
         # Check outputs
-        assert len(rewards) == len(prompts) * grpo.group_size
         assert len(completions) == len(prompts) * grpo.group_size
         assert all(isinstance(c, str) for c in completions), "Completions should be strings"
-        assert log_probs.shape[0] == len(prompts) * grpo.group_size
-        assert ref_log_probs.shape[0] == len(prompts) * grpo.group_size
+        assert rewards.shape[0] == len(prompts) * grpo.group_size
+        assert len(completion_mask) == len(prompts) * grpo.group_size
 
     def test_grpo_advantage_computation(self, minimal_grpo_config, device):
         """Test advantage computation."""
@@ -272,11 +271,9 @@ class TestGRPOSmoke:
         # Create mock data
         device_obj = torch.device(device)
         rewards = torch.tensor([1.0, 2.0, 3.0, 4.0], device=device_obj)
-        log_probs = torch.zeros(4, 10, device=device_obj)
-        ref_log_probs = torch.zeros(4, 10, device=device_obj)
 
-        # Compute advantages
-        advantages = grpo.compute_advantages(rewards, log_probs, ref_log_probs)
+        # Compute advantages (no longer needs log_probs or ref_log_probs)
+        advantages, advantage_stats = grpo.compute_advantages(rewards, group_size=2, normalize_within_groups=True)
 
         # Check properties
         assert advantages.shape == (4,)
