@@ -868,7 +868,7 @@ def main():
             "policy_loss_type": "token",  # CHANGED from "token" → "sequence" for better gradients
             "resample_batch_per_episode": True,  # ← CRITICAL: Set to True to disable fixed batch!
             # Memory optimization parameters
-            "logprobs_batch_size": 2,  # Chunk logprob computation to reduce memory usage (None = no chunking)
+            "logprobs_batch_size": 1,  # Chunk logprob computation to reduce memory usage (None = no chunking)
             "offload_generated_to_cpu": True,  # Offload generated sequences to CPU after generation (saves GPU memory)
             # Clipping parameters (all validated in overfit test)
             "kl_estimator": "k3",

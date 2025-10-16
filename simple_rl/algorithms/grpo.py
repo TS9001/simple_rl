@@ -704,6 +704,19 @@ class GRPO(BaseAlgorithm):
                 assert full_generated_text.startswith(prompt_text), (
                     f"Seq {seq_idx}: Generated text doesn't start with prompt"
                 )
+        
+        # CRITICAL: Aggressively delete all intermediate GPU tensors before returning
+        # These intermediate tensors can hold 5-10 GB of GPU memory
+        del generated_ids, generated_mask  # Original generated sequences (before padding)
+        del replicated_prompt_ids, replicated_prompt_mask  # Replicated prompts
+        del batch_prompt_ids, batch_prompt_mask  # Original batch prompts
+        del batch_indices, seq_positions, source_positions, valid_mask, completion_positions
+        del prompt_start_index, prompt_start_index_per_seq
+        del batch_prompt_lengths  # Keep prompt_lengths_per_seq for return
+        
+        # Clear CUDA cache immediately after generation
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
         return {
             "generated_ids": right_padded_ids,
