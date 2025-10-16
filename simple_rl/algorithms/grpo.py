@@ -1293,12 +1293,16 @@ class GRPO(BaseAlgorithm):
 
                     if self.episode == 0 and epoch == 0 and mb_idx == 1:
                         # Validate logprobs consistency (saves debug files on failure)
+                        # Ensure all validation inputs are on GPU
+                        val_gen_ids = [g.to(self.device) if g.device != self.device else g for g in selected_gen_ids]
+                        val_prompt_end = selected_prompt_end_positions.to(self.device) if selected_prompt_end_positions.device != self.device else selected_prompt_end_positions
+                        
                         self._validate_logprobs_episode_zero(
-                            mb_old_log_probs,
-                            mb_new_log_probs,
-                            mb_ref_log_probs,
-                            selected_gen_ids,
-                            selected_prompt_end_positions,
+                            mb_old_log_probs,  # Already on GPU
+                            mb_new_log_probs,  # Already on GPU
+                            mb_ref_log_probs,  # Already on GPU
+                            val_gen_ids,
+                            val_prompt_end,
                         )
 
                     self.optimizer.zero_grad()
