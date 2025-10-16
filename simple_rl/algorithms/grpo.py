@@ -1238,17 +1238,21 @@ class GRPO(BaseAlgorithm):
 
                     mb_end = min(mb_start + self.minibatch_size, total_sequences)
                     mb_indices = indices[mb_start:mb_end]
+                    
+                    # Move indices to CPU for indexing CPU tensors (due to offloading)
+                    mb_indices_cpu = mb_indices.cpu()
+                    
                     mb_advantages = advantages[mb_indices]
 
                     # Ensure advantages are on GPU
                     if mb_advantages.device != self.device:
                         mb_advantages = mb_advantages.to(self.device)
 
-                    # Select minibatch data
-                    selected_gen_ids = [generated_ids[idx] for idx in mb_indices]
-                    selected_attn_mask = [attention_mask[idx] for idx in mb_indices]
-                    selected_completion_mask = [completion_mask[idx] for idx in mb_indices]
-                    selected_prompt_end_positions = prompt_end_positions[mb_indices]
+                    # Select minibatch data (use CPU indices for CPU tensors)
+                    selected_gen_ids = [generated_ids[idx] for idx in mb_indices_cpu]
+                    selected_attn_mask = [attention_mask[idx] for idx in mb_indices_cpu]
+                    selected_completion_mask = [completion_mask[idx] for idx in mb_indices_cpu]
+                    selected_prompt_end_positions = prompt_end_positions[mb_indices_cpu]
 
                     # Extract minibatch slices from batch tensors
                     # Move to GPU if they're on CPU (due to offloading)
@@ -1278,6 +1282,10 @@ class GRPO(BaseAlgorithm):
                         batch_first=True,
                         padding_value=0
                     )
+                    
+                    # Ensure completion mask is on GPU for loss computation
+                    if mb_completion_mask.device != self.device:
+                        mb_completion_mask = mb_completion_mask.to(self.device)
 
                     self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_recompute")
 

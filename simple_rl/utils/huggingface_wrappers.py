@@ -218,18 +218,9 @@ class LanguageModel(nn.Module):
             Log probabilities [batch_size, seq_len-1] or [batch_size, logits_to_keep]
             Note: Padding positions (where attention_mask=0) will have log_prob=0.0
         """
-        # DEBUG: Log tensor shapes for memory debugging
-        print(f"[DEBUG compute_log_probs] input_ids.shape={input_ids.shape}, device={input_ids.device}, dtype={input_ids.dtype}")
-        if attention_mask is not None:
-            print(f"[DEBUG compute_log_probs] attention_mask.shape={attention_mask.shape}, device={attention_mask.device}")
-        print(f"[DEBUG compute_log_probs] BEFORE forward - Memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB, reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
-        
         # MEMORY OPTIMIZATION: Keep logits in BF16, only convert final log_probs to FP32
         # This saves ~75% memory (3 huge FP32 tensors → 2 BF16 + 1 small FP32)
         logits = self.forward(input_ids, attention_mask=attention_mask)  # Keep in model dtype (BF16)
-        
-        print(f"[DEBUG compute_log_probs] logits.shape={logits.shape}, device={logits.device}, dtype={logits.dtype}")
-        print(f"[DEBUG compute_log_probs] AFTER forward - Memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB, reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
 
         # Shift logits and labels for next token prediction
         shift_logits = logits[:, :-1, :].contiguous()
