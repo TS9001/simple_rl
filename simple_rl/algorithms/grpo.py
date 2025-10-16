@@ -482,10 +482,20 @@ class GRPO(BaseAlgorithm):
                     device=device,
                 )
                 
+                # CRITICAL: Immediately offload chunk to CPU to free GPU memory
+                # Only keep one chunk on GPU at a time, accumulate on CPU
+                if self.device.type == "cuda":
+                    chunk_log_probs = chunk_log_probs.cpu()
+                    # Clear CUDA cache after each chunk
+                    torch.cuda.empty_cache()
+                
                 all_completion_log_probs.append(chunk_log_probs)
             
-            # Concatenate all chunks
-            return torch.cat(all_completion_log_probs, dim=0)
+            # Concatenate all chunks (on CPU if offloaded, then move back to GPU)
+            result = torch.cat(all_completion_log_probs, dim=0)
+            if self.device.type == "cuda" and result.device.type == "cpu":
+                result = result.to(device)
+            return result
         else:
             # Process entire batch at once
             return self._compute_chunk_log_probs(
@@ -917,15 +927,6 @@ class GRPO(BaseAlgorithm):
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
-        # CRITICAL: Bypass torch.compile for logprob computation to save memory
-        # torch.compile creates large compiled graphs (10-20 GB overhead)
-        # Temporarily swap the compiled model with the original uncompiled version
-        compiled_model = None
-        if hasattr(model.model, "_orig_mod"):
-            # torch.compile wraps the model, _orig_mod is the original uncompiled model
-            compiled_model = model.model
-            model.model = model.model._orig_mod  # Use original for logprob computation
-        
         try:
             # CRITICAL: Compute ALL with torch.enable_grad() for consistent kernels
             # Both policy and ref_policy have requires_grad=True (same state)
@@ -941,10 +942,6 @@ class GRPO(BaseAlgorithm):
                     requires_grad=True,  # Always True for consistent kernels
                 )
         finally:
-            # Restore compiled model if we bypassed it
-            if compiled_model is not None:
-                model.model = compiled_model
-            
             # Restore model state
             if prev_cache is not None:
                 model.model.config.use_cache = prev_cache
