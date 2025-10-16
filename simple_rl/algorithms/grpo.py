@@ -952,6 +952,7 @@ class GRPO(BaseAlgorithm):
             # Both policy and ref_policy have requires_grad=True (same state)
             # This ensures old/new/ref use identical computation paths
             # (Flash Attention and other kernels can differ based on grad tracking)
+            # MUST use requires_grad=True for ALL types to ensure identical kernel selection
             with torch.enable_grad():
                 log_probs = self._compute_batch_log_probs_vectorized(
                     model=model,
@@ -959,7 +960,7 @@ class GRPO(BaseAlgorithm):
                     attention_mask=attention_mask,
                     prompt_end_positions=prompt_end_positions,
                     completion_mask=completion_mask,
-                    requires_grad=(logprob_type == "new"),  # Only new needs grad for backward
+                    requires_grad=True,  # ALWAYS True for consistent kernels (detach later for old/ref)
                 )
         finally:
             # Restore model state
