@@ -1060,6 +1060,97 @@ class GRPO(BaseAlgorithm):
             f"This indicates an issue with the unified logprob computation."
         )
 
+    def _validate_log_probs_episode_zero_single_sequence(
+        self,
+        generated_ids: List[torch.Tensor],
+        attention_mask: List[torch.Tensor],
+        prompt_end_positions: torch.Tensor,
+        completion_mask: List[torch.Tensor],
+    ) -> None:
+        """
+        Validate log probs by computing sequences ONE-BY-ONE.
+        
+        This eliminates ALL padding differences and isolates the real consistency issue.
+        If old/new/ref still differ here, it's a genuine non-determinism problem.
+        """
+        print("\n" + "="*80)
+        print("SINGLE-SEQUENCE VALIDATION (NO PADDING)")
+        print("="*80)
+        print("Computing each sequence individually to eliminate batch padding artifacts...")
+        print()
+        
+        num_sequences = len(generated_ids)
+        max_diff_old_new = 0.0
+        max_diff_old_ref = 0.0
+        max_diff_seq_idx = 0
+        
+        for seq_idx in range(num_sequences):
+            # Extract single sequence
+            single_gen_ids = [generated_ids[seq_idx]]
+            single_attn_mask = [attention_mask[seq_idx]]
+            single_prompt_end = prompt_end_positions[seq_idx:seq_idx+1]
+            single_completion_mask = [completion_mask[seq_idx]]
+            
+            # Compute old, new, ref for THIS SINGLE SEQUENCE (no padding needed!)
+            old_lp = self.compute_logprobs("old", single_gen_ids, single_attn_mask, single_prompt_end, single_completion_mask)[0]
+            new_lp = self.compute_logprobs("new", single_gen_ids, single_attn_mask, single_prompt_end, single_completion_mask)[0]
+            ref_lp = self.compute_logprobs("ref", single_gen_ids, single_attn_mask, single_prompt_end, single_completion_mask)[0]
+            
+            # Compute differences
+            old_new_diff = (old_lp - new_lp.detach()).abs().max().item()
+            old_ref_diff = (old_lp - ref_lp).abs().max().item()
+            
+            if old_new_diff > max_diff_old_new:
+                max_diff_old_new = old_new_diff
+                max_diff_seq_idx = seq_idx
+            
+            max_diff_old_ref = max(max_diff_old_ref, old_ref_diff)
+            
+            print(f"  Seq {seq_idx+1}/{num_sequences}: Old-New={old_new_diff:.6e}, Old-Ref={old_ref_diff:.6e}")
+        
+        print()
+        print(f"Maximum Old-New diff: {max_diff_old_new:.6e} (sequence {max_diff_seq_idx+1})")
+        print(f"Maximum Old-Ref diff: {max_diff_old_ref:.6e}")
+        print()
+        
+        # Dtype-aware thresholds
+        model_dtype = next(self.policy.parameters()).dtype
+        if model_dtype == torch.bfloat16:
+            ref_threshold = 1e-4
+            new_threshold = 1e-4
+        elif model_dtype == torch.float16:
+            ref_threshold = 1e-5
+            new_threshold = 1e-5
+        else:
+            ref_threshold = 1e-6
+            new_threshold = 1e-6
+        
+        # Validate
+        if max_diff_old_ref >= ref_threshold:
+            print(f"❌ FAILED: Old-Ref diff {max_diff_old_ref:.2e} >= threshold {ref_threshold:.0e}")
+            print(f"   This indicates model corruption or different model states.")
+            raise AssertionError(
+                f"Old and ref log probs differ by {max_diff_old_ref:.2e} (expected < {ref_threshold:.0e})"
+            )
+        else:
+            print(f"✅ PASSED: Old-Ref diff {max_diff_old_ref:.2e} < threshold {ref_threshold:.0e}")
+        
+        if max_diff_old_new >= new_threshold:
+            print(f"❌ FAILED: Old-New diff {max_diff_old_new:.2e} >= threshold {new_threshold:.0e}")
+            print(f"   Even with NO PADDING, old and new differ!")
+            print(f"   This is a genuine non-determinism issue (eval mode, Flash Attention, etc.)")
+            raise AssertionError(
+                f"Old and new log probs differ by {max_diff_old_new:.2e} (expected < {new_threshold:.0e}) "
+                f"even when computed one-by-one with identical inputs"
+            )
+        else:
+            print(f"✅ PASSED: Old-New diff {max_diff_old_new:.2e} < threshold {new_threshold:.0e}")
+        
+        print("="*80)
+        print("✅ ALL SINGLE-SEQUENCE VALIDATIONS PASSED")
+        print("="*80)
+        print()
+
     def compute_advantages(
         self,
         rewards: torch.Tensor,
@@ -1286,9 +1377,13 @@ class GRPO(BaseAlgorithm):
                     self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_recompute")
 
                     if self.episode == 0 and epoch == 0 and mb_idx == 1:
-                        self._validate_log_probs_episode_zero(
-                            mb_old_log_probs, mb_new_log_probs, mb_ref_log_probs,
-                            selected_gen_ids, selected_prompt_end_positions
+                        # Validate by computing sequences ONE-BY-ONE to eliminate padding differences
+                        # This isolates the real consistency issue from batch padding artifacts
+                        self._validate_log_probs_episode_zero_single_sequence(
+                            selected_gen_ids, 
+                            selected_attn_mask,
+                            selected_prompt_end_positions,
+                            selected_completion_mask
                         )
 
                     self.optimizer.zero_grad()

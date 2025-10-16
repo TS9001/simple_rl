@@ -59,13 +59,40 @@ Updated thresholds to reflect that old/new should now be nearly identical:
 
 The ref thresholds (old-ref) remain unchanged since they were already correct.
 
+## Single-Sequence Validation
+
+To properly test the fix and eliminate batch padding artifacts, validation now computes sequences **one-by-one**:
+
+```python
+def _validate_log_probs_episode_zero_single_sequence(...):
+    for seq_idx in range(num_sequences):
+        # Extract SINGLE sequence (no batching, no padding!)
+        single_gen_ids = [generated_ids[seq_idx]]
+        ...
+        
+        # Compute old, new, ref for THIS sequence only
+        old_lp = compute_logprobs("old", single_gen_ids, ...)
+        new_lp = compute_logprobs("new", single_gen_ids, ...)
+        ref_lp = compute_logprobs("ref", single_gen_ids, ...)
+        
+        # Compare - now any difference is REAL, not from padding
+        diff = (old_lp - new_lp).abs().max()
+```
+
+**Why this matters**:
+- Batch processing pads sequences to same length
+- Different batch sizes → different padding → numerical differences in BF16/FP16
+- Single-sequence processing eliminates this confound
+- If old/new still differ here, it's a genuine non-determinism issue
+
 ## Expected Results
 
 After this fix:
 - **Old-Ref diff**: ~0 (unchanged, already working)
-- **Old-New diff**: ~0 (fixed, should now match old-ref diff)
+- **Old-New diff**: ~0 when computed one-by-one (eliminates padding artifacts)
 - All three logprob types use identical forward pass paths
 - Gradients still flow correctly for policy updates
+- Validation accurately identifies real non-determinism vs padding artifacts
 
 ## Testing
 
