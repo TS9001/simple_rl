@@ -917,25 +917,34 @@ class GRPO(BaseAlgorithm):
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
+        # CRITICAL: Bypass torch.compile for logprob computation to save memory
+        # torch.compile creates large compiled graphs (10-20 GB overhead)
+        # Temporarily swap the compiled model with the original uncompiled version
+        compiled_model = None
+        if hasattr(model.model, "_orig_mod"):
+            # torch.compile wraps the model, _orig_mod is the original uncompiled model
+            compiled_model = model.model
+            model.model = model.model._orig_mod  # Use original for logprob computation
+        
         try:
-            # CRITICAL: Disable torch.compile for logprob computation to save memory
-            # torch.compile creates large compiled graphs that can use 10-20 GB
-            # Use torch._dynamo.disable() to temporarily bypass compilation
-            with torch._dynamo.disable():
-                # CRITICAL: Compute ALL with torch.enable_grad() for consistent kernels
-                # Both policy and ref_policy have requires_grad=True (same state)
-                # This ensures old/new/ref use identical computation paths
-                with torch.enable_grad():
-                    # NO autocast - logprobs must be computed in FP32 for numerical stability
-                    log_probs = self._compute_batch_log_probs_vectorized(
-                        model=model,
-                        generated_ids=generated_ids,
-                        attention_mask=attention_mask,
-                        prompt_end_positions=prompt_end_positions,
-                        completion_mask=completion_mask,
-                        requires_grad=True,  # Always True for consistent kernels
-                    )
+            # CRITICAL: Compute ALL with torch.enable_grad() for consistent kernels
+            # Both policy and ref_policy have requires_grad=True (same state)
+            # This ensures old/new/ref use identical computation paths
+            with torch.enable_grad():
+                # NO autocast - logprobs must be computed in FP32 for numerical stability
+                log_probs = self._compute_batch_log_probs_vectorized(
+                    model=model,
+                    generated_ids=generated_ids,
+                    attention_mask=attention_mask,
+                    prompt_end_positions=prompt_end_positions,
+                    completion_mask=completion_mask,
+                    requires_grad=True,  # Always True for consistent kernels
+                )
         finally:
+            # Restore compiled model if we bypassed it
+            if compiled_model is not None:
+                model.model = compiled_model
+            
             # Restore model state
             if prev_cache is not None:
                 model.model.config.use_cache = prev_cache
