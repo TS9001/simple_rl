@@ -879,7 +879,7 @@ def main():
             "policy_log_ratio_clamp_max": 1.5,  # TIGHTENED from 2.0 → 1.5 for BF16 stability
             "advantage_clip_min": -2.0,  # TIGHTENED from -2.0 → -1.5 for BF16 stability
             "advantage_clip_max": 2.0,  # TIGHTENED from 2.0 → 1.5 for BF16 stability
-            "stop_sequences": ["</answer>"],
+            "stop_sequences": None,
         },
         "model": {
             "max_length": 1024,
