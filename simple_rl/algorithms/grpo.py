@@ -819,10 +819,10 @@ class GRPO(BaseAlgorithm):
             model.model.config.use_cache = False
 
         try:
-            # CRITICAL FIX: Always compute with gradients DISABLED for numerical consistency
-            # Even in eval mode, torch.set_grad_enabled(True) can change kernel selection
-            # For "new", we'll enable requires_grad on the result instead
-            with torch.no_grad():
+            # CRITICAL FIX: Compute ALL with gradients ENABLED for consistent kernels
+            # Then detach old/ref, keep gradients for new
+            # This ensures all three use identical computation path
+            with torch.enable_grad():
                 # NO autocast - logprobs must be computed in FP32 for numerical stability
                 log_probs = self._compute_batch_log_probs_vectorized(
                     model=model,
@@ -830,7 +830,7 @@ class GRPO(BaseAlgorithm):
                     attention_mask=attention_mask,
                     prompt_end_positions=prompt_end_positions,
                     completion_mask=completion_mask,
-                    requires_grad=False,  # Always False during computation
+                    requires_grad=True,  # Always True for consistent kernels
                 )
         finally:
             # Restore model state
@@ -841,48 +841,13 @@ class GRPO(BaseAlgorithm):
 
         self.timing_manager.end_timer(f"compute_{logprob_type}_logprobs")
 
-        # All logprobs computed identically with no_grad for consistency
-        # For "new", recompute WITH gradients by calling forward again
-        if logprob_type == "new":
-            # Recompute with gradients enabled (for backward pass)
-            # This ensures old/new are numerically identical at computation time
-            # But new has gradients attached for training
-            log_probs_with_grad = self._recompute_with_gradients(
-                model, generated_ids, attention_mask, prompt_end_positions, completion_mask
-            )
-            return log_probs_with_grad
+        # All computed with gradients enabled (consistent kernels)
+        # For old/ref: detach to remove gradients
+        # For new: keep gradients for backward pass
+        if logprob_type in ["old", "ref"]:
+            return log_probs.detach()
         else:
-            # old/ref: return as-is (already detached from no_grad context)
-            return log_probs
-
-    def _recompute_with_gradients(
-        self,
-        model: Any,
-        generated_ids: List[torch.Tensor],
-        attention_mask: List[torch.Tensor],
-        prompt_end_positions: torch.Tensor,
-        completion_mask: List[torch.Tensor],
-    ) -> torch.Tensor:
-        """
-        Recompute logprobs WITH gradients enabled.
-        
-        This is called only for "new" logprobs after they've been computed
-        once without gradients (for numerical consistency with old/ref).
-        
-        The model is still in eval() mode to ensure consistent kernels.
-        """
-        # Model should still be in eval mode from compute_logprobs
-        # Recompute with gradients enabled
-        with torch.enable_grad():
-            log_probs_with_grad = self._compute_batch_log_probs_vectorized(
-                model=model,
-                generated_ids=generated_ids,
-                attention_mask=attention_mask,
-                prompt_end_positions=prompt_end_positions,
-                completion_mask=completion_mask,
-                requires_grad=True,  # Enable gradients for backward pass
-            )
-        return log_probs_with_grad
+            return log_probs  # Keep gradients for new
 
     def _validate_log_probs_episode_zero(
         self,
