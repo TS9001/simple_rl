@@ -912,6 +912,11 @@ class GRPO(BaseAlgorithm):
         if prev_cache is not None:
             model.model.config.use_cache = False
 
+        # Clear CUDA cache before logprob computation to reduce memory fragmentation
+        # This is especially important with CPU offloading and chunking
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
         try:
             # CRITICAL: Compute ALL with torch.enable_grad() for consistent kernels
             # Both policy and ref_policy have requires_grad=True (same state)
