@@ -23,10 +23,8 @@ from torch.nn.utils.rnn import pad_sequence
 
 from simple_rl.algorithms.base import BaseAlgorithm
 from simple_rl.utils.huggingface_wrappers import LanguageModel
-from simple_rl.utils.device import get_target_device, clear_device_cache
 from simple_rl.utils.optimization import configure_optimizer
 from simple_rl.utils.timing import TimingManager
-from simple_rl.utils.training_config import create_training_config
 from simple_rl.utils.checkpointing import save_checkpoint, load_checkpoint
 from simple_rl.utils.logging_utils import create_logger
 
@@ -54,7 +52,14 @@ class GRPO_Reinforce(BaseAlgorithm):
 
         # Determine target device
         device_config = self.config.get("device", None)
-        self.device = get_target_device(device_config)
+        if device_config:
+            self.device = torch.device(device_config)
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
 
         # Initialize or create model
 
@@ -86,25 +91,23 @@ class GRPO_Reinforce(BaseAlgorithm):
             frozen_params == total_params
         ), f"Not all parameters frozen: {frozen_params}/{total_params}"
 
-        # Use training config utility
-        self.training_config = create_training_config(self.config)
+        algo_config = self.config.get("algorithm", {})
+        training_config = self.config.get("training", {})
 
-        # GRPO-specific parameters (from training config)
-        self.group_size = self.training_config.group_size
-        self.kl_coef = self.training_config.kl_coef
-        self.normalize_rewards = self.training_config.normalize_rewards
-        self.clip_epsilon = self.training_config.clip_epsilon
-        self.store_completions = self.training_config.store_completions
+        self.group_size = algo_config.get("group_size", 4)
+        self.kl_coef = algo_config.get("kl_coef", 0.05)
+        self.normalize_rewards = algo_config.get("normalize_rewards", True)
+        self.clip_epsilon = algo_config.get("clip_epsilon", 0.2)
+        self.store_completions = algo_config.get("store_completions", True)
 
-        # Training parameters (from training config)
-        self.learning_rate = self.training_config.learning_rate
-        self.batch_size = self.training_config.batch_size
-        self.minibatch_size = self.training_config.minibatch_size
-        self.max_new_tokens = self.training_config.max_new_tokens
-        self.temperature = self.training_config.temperature
-        self.top_k = self.training_config.top_k
-        self.top_p = self.training_config.top_p
-        self.gradient_clip = self.training_config.gradient_clip
+        self.learning_rate = training_config.get("learning_rate", 1e-5)
+        self.batch_size = training_config.get("batch_size", 8)
+        self.minibatch_size = training_config.get("minibatch_size", None) or self.batch_size
+        self.max_new_tokens = training_config.get("max_new_tokens", 128)
+        self.temperature = training_config.get("temperature", 0.9)
+        self.top_k = training_config.get("top_k", None)
+        self.top_p = training_config.get("top_p", 0.9)
+        self.gradient_clip = training_config.get("gradient_clip", 1.0)
 
         # Set up training components using utilities
         self.optimizer = configure_optimizer(self.policy, self.config)
@@ -557,7 +560,10 @@ class GRPO_Reinforce(BaseAlgorithm):
                 loss,
                 scaled_loss,
             )
-            clear_device_cache(self.device)
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+            elif self.device.type == "mps":
+                torch.mps.empty_cache()
             self.timing_manager.end_timer("memory_cleanup")
 
         # Gradient clipping on accumulated gradients

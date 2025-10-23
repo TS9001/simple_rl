@@ -18,56 +18,35 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
-from transformers import StoppingCriteria, StoppingCriteriaList
+from transformers import StoppingCriteriaList
 
 from simple_rl.algorithms.base import BaseAlgorithm
 from simple_rl.utils.huggingface_wrappers import LanguageModel
-from simple_rl.utils.device import get_target_device, clear_device_cache
 from simple_rl.utils.optimization import configure_optimizer
 from simple_rl.utils.timing import TimingManager
-from simple_rl.utils.training_config import create_training_config
 from simple_rl.utils.checkpointing import save_checkpoint, load_checkpoint
 from simple_rl.utils.logging_utils import create_logger
+from simple_rl.utils.validators import validate_logprobs_episode_zero
 from simple_rl.utils.kl_divergence import compute_kl_divergence
 from simple_rl.utils.policy_loss import (
     compute_ppo_policy_loss,
     compute_ppo_policy_loss_token_level,
 )
-
-
-class MultiTokenStoppingCriteria(StoppingCriteria):
-    """
-    Stopping criterion that checks for complete multi-token sequences.
-
-    This is more robust than checking single token IDs, especially for
-    sequences like </answer> that may be tokenized into multiple tokens.
-    """
-
-    def __init__(self, stop_sequences: List[str], tokenizer, prompt_length: int):
-        """
-        Args:
-            stop_sequences: List of string sequences to stop on (e.g., ["</answer>"])
-            tokenizer: HuggingFace tokenizer
-            prompt_length: Length of the prompt (to only check generated tokens)
-        """
-        # Normalize to a list of non-empty strings; treat None as disabled
-        self.stop_sequences = [s for s in (stop_sequences or []) if isinstance(s, str) and s]
-        self.tokenizer = tokenizer
-        self.prompt_length = prompt_length
-
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        """Check if any sequence contains a stop sequence in the generated portion."""
-        # Decode only the generated portion (after prompt)
-        for sequence_ids in input_ids:
-            generated_ids = sequence_ids[self.prompt_length:]
-            generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
-
-            # Check if any stop sequence appears in the generated text
-            for stop_seq in self.stop_sequences:
-                if stop_seq in generated_text:
-                    return True
-
-        return False
+from simple_rl.utils.stopping_criteria import MultiTokenStoppingCriteria
+from simple_rl.dto import (
+    TrajectoryBatch,
+    MetricsBuilder,
+    GeneratedCompletionsResult,
+    AdvantageStats,
+    LossMetrics,
+    EpochMetrics,
+    TrainingHistory,
+    ValidationHistory,
+    BatchData,
+    TrainResult,
+    EvaluationResult,
+    CheckpointData,
+)
 
 
 class GRPO(BaseAlgorithm):
@@ -88,101 +67,57 @@ class GRPO(BaseAlgorithm):
         tokenizer: Optional[Any] = None,
         use_wandb: bool = False,
     ):
-        """
-        Initialize GRPO algorithm.
-
-        Args:
-            config: Configuration dictionary
-            batch_reward_fn: Batch reward function
-            model: Optional pre-loaded HuggingFace model
-            tokenizer: Optional pre-loaded HuggingFace tokenizer
-            use_wandb: Whether to use Weights & Biases logging
-        """
         self.config = config or {}
         self.use_wandb = use_wandb
 
-        # Device setup
-        device_config = self.config.get("device", None)
-        self.device = get_target_device(device_config)
-
-        # Initialize model
         if not config:
             raise ValueError("Config must be provided")
 
+        device_config = self.config.get("device", None)
+        if device_config:
+            self.device = torch.device(device_config)
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
+
         self.policy = LanguageModel(config, model=model, tokenizer=tokenizer)
         self.policy = self.policy.to(self.device)
+        self._disable_dropout()
 
-        # Disable ALL dropout for deterministic log probs (critical for PPO/GRPO)
-        # This prevents train/eval mode from affecting log probability computation
-        if hasattr(self.policy.model, 'config'):
-            model_cfg = self.policy.model.config
+        algo_config = self.config.get("algorithm", {})
+        training_config = self.config.get("training", {})
 
-            # Disable attention dropout
-            if hasattr(model_cfg, 'attention_dropout') and model_cfg.attention_dropout > 0:
-                model_cfg.attention_dropout = 0.0
+        self.group_size = algo_config.get("group_size", 4)
+        self.kl_coef = algo_config.get("kl_coef", 0.05)
+        self.normalize_rewards = algo_config.get("normalize_rewards", True)
 
-            # Disable hidden/residual dropout (different models use different names)
-            for attr in ['hidden_dropout', 'hidden_dropout_prob', 'resid_pdrop', 'dropout']:
-                if hasattr(model_cfg, attr):
-                    old_val = getattr(model_cfg, attr)
-                    if old_val > 0:
-                        setattr(model_cfg, attr, 0.0)
-
-        # Directly disable all Dropout modules (more reliable than config)
-        # This ensures dropout is disabled even if config changes don't propagate
-        for _, module in self.policy.model.named_modules():
-            if isinstance(module, torch.nn.Dropout):
-                if module.p > 0:
-                    module.p = 0.0
-
-        # Training config (need this first to check kl_coef)
-        self.training_config = create_training_config(self.config)
-
-        # GRPO parameters
-        self.group_size = self.training_config.group_size
-        self.kl_coef = self.training_config.kl_coef
-        self.normalize_rewards = self.training_config.normalize_rewards
-
-        # Create reference model for KL penalty (ONLY if kl_coef > 0)
-        # Keep requires_grad=True (same as policy) for identical kernel selection
-        # We simply won't call optimizer.step() on it
         if self.kl_coef > 0:
             self.ref_policy = copy.deepcopy(self.policy)
             self.ref_policy = self.ref_policy.to(self.device)
-            self.ref_policy.eval()  # Keep in eval mode
-            # Note: parameters still have requires_grad=True (same as policy)
-            # This ensures old and ref use identical computation paths
+            self.ref_policy.eval()
         else:
             self.ref_policy = None
 
-        # Clipping parameters - support both symmetric and asymmetric clipping
-        self.clip_epsilon = self.training_config.clip_epsilon
-
+        self.clip_epsilon = algo_config.get("clip_epsilon", 0.2)
         if self.clip_epsilon is None:
-            self.clip_epsilon_low = self.training_config.clip_epsilon_low
-            self.clip_epsilon_high = self.training_config.clip_epsilon_high
+            self.clip_epsilon_low = algo_config.get("clip_epsilon_low", 0.2)
+            self.clip_epsilon_high = algo_config.get("clip_epsilon_high", 0.2)
         else:
-            self.clip_epsilon_low = self.training_config.clip_epsilon
-            self.clip_epsilon_high = self.training_config.clip_epsilon
+            self.clip_epsilon_low = self.clip_epsilon
+            self.clip_epsilon_high = self.clip_epsilon
 
-        self.store_completions = self.training_config.store_completions
-        self.update_epochs = self.training_config.update_epochs
+        self.store_completions = algo_config.get("store_completions", True)
+        self.update_epochs = training_config.get("update_epochs", 1)
 
-        # KL divergence estimator configuration
-        # Options: "mc" (Monte Carlo), "k3" (low-variance unbiased), "abs", "mse"
-        self.kl_estimator = self.config.get("training", {}).get("kl_estimator", "k3")
-        # Reduced clamp range to prevent KL explosion: clamp_max=2.0 limits max KL to ~5.4 per token
-        # (vs clamp_max=5.0 which allowed KL up to ~142 per token, causing gradient explosion!)
-        self.kl_clamp_min = self.config.get("training", {}).get("kl_clamp_min", -2.0)
-        self.kl_clamp_max = self.config.get("training", {}).get("kl_clamp_max", 2.0)
-        # KL reduction: "mean" (average per token) or "sum" (total across tokens)
-        self.kl_reduction = self.config.get("training", {}).get("kl_reduction", "mean")
+        self.kl_estimator = training_config.get("kl_estimator", "k3")
+        self.kl_clamp_min = training_config.get("kl_clamp_min", -2.0)
+        self.kl_clamp_max = training_config.get("kl_clamp_max", 2.0)
+        self.kl_reduction = training_config.get("kl_reduction", "mean")
 
-        # Policy loss configuration
-        # Options: "sequence" (traditional PPO, sum over tokens), "token" (normalize by token count)
-        self.policy_loss_type = self.config.get("training", {}).get("policy_loss_type", "token")
-
-        # Select policy loss function based on configuration
+        self.policy_loss_type = training_config.get("policy_loss_type", "token")
         if self.policy_loss_type == "token":
             self._compute_policy_loss_fn = compute_ppo_policy_loss_token_level
         elif self.policy_loss_type == "sequence":
@@ -193,70 +128,41 @@ class GRPO(BaseAlgorithm):
                 f"Choose from: 'sequence', 'token'"
             )
 
-        # Clipping parameters for stability
-        # Note: Proper PPO clipping is done in ratio-space (not log-space) inside policy loss functions
+        self.advantage_clip_min = training_config.get("advantage_clip_min", -3.0)
+        self.advantage_clip_max = training_config.get("advantage_clip_max", 3.0)
 
-        # Advantage clipping (prevents extreme policy updates)
-        self.advantage_clip_min = self.config.get("training", {}).get("advantage_clip_min", -3.0)
-        self.advantage_clip_max = self.config.get("training", {}).get("advantage_clip_max", 3.0)
+        self.batch_size = training_config.get("batch_size", 8)
+        self.minibatch_size = training_config.get("minibatch_size", None) or self.batch_size
+        self.rollout_batch_size = training_config.get("rollout_batch_size", None) or min(2, self.batch_size)
+        self.max_new_tokens = training_config.get("max_new_tokens", 128)
+        self.min_new_tokens = training_config.get("min_new_tokens", 1)
+        self.temperature = training_config.get("temperature", 0.9)
+        self.top_k = training_config.get("top_k", None)
+        self.top_p = training_config.get("top_p", 0.9)
+        self.gradient_clip = training_config.get("gradient_clip", 1.0)
 
-        # Training parameters
-        self.learning_rate = self.training_config.learning_rate
-        self.batch_size = self.training_config.batch_size
-        self.minibatch_size = self.training_config.minibatch_size
-        self.rollout_batch_size = self.training_config.rollout_batch_size
-        self.max_new_tokens = self.training_config.max_new_tokens
-        self.min_new_tokens = self.config.get("training", {}).get("min_new_tokens", 1)
-        self.temperature = self.training_config.temperature
-        self.top_k = self.training_config.top_k
-        self.top_p = self.training_config.top_p
-        self.gradient_clip = self.training_config.gradient_clip
-        
-        # Logprobs batch size for chunked processing (memory optimization)
-        # If None, processes entire batch at once
-        self.logprobs_batch_size = self.config.get("training", {}).get("logprobs_batch_size", None)
-        
-        # CPU offloading for generated sequences (memory optimization)
-        # If True, moves generated sequences to CPU after generation and brings chunks back for logprobs
-        self.offload_generated_to_cpu = self.config.get("training", {}).get("offload_generated_to_cpu", True)
+        self.logprobs_batch_size = training_config.get("logprobs_batch_size", None)
+        self.offload_generated_to_cpu = training_config.get("offload_generated_to_cpu", True)
 
-        # Logger (initialize before optimizer so it can log warmup info)
         self.logger = create_logger(self.config)
         if self.use_wandb:
             self.logger.init_wandb()
 
-        # Optimizer and optional LR scheduler (for warmup)
         self.optimizer, self.lr_scheduler = configure_optimizer(self.policy, self.config, logger=self.logger)
-
-        # Reward function
         self.batch_reward_fn = batch_reward_fn
 
-        # Statistics
         self.total_steps = 0
         self.episode = 0
-        self.current_episode = 0  # Track current episode for reproducible seeding
+        self.current_episode = 0
 
-        # Timing
         self.timing_manager = TimingManager()
-        timing_config = self.config.get("timing", {})
-        self.print_timing = timing_config.get("enabled", False)  # Disabled by default
+        self.print_timing = self.config.get("timing", {}).get("enabled", False)
 
-        # Device-specific optimizations
-        device_opts = self.config.get("device_optimizations", {})
-        self.clear_cache_on_mps = device_opts.get("clear_cache_on_mps", False)  # Default: False (don't clear on MPS)
+        self.clear_cache_on_mps = self.config.get("device_optimizations", {}).get("clear_cache_on_mps", False)
+        self.log_trajectory_progress = self.config.get("logging", {}).get("show_trajectory_progress", False)
 
-        # Progress logging
-        logging_cfg = self.config.get("logging", {})
-        self.log_trajectory_progress = logging_cfg.get("show_trajectory_progress", False)  # Default: False
-
-        # Mixed precision training setup (CUDA only)
-        # Note: BF16 doesn't need gradient scaling (same exponent range as FP32)
-        # FP16 would need GradScaler to prevent gradient underflow
         self.use_amp = self.device.type == "cuda"
-        self.amp_dtype = torch.bfloat16 if self.use_amp else None
 
-        # Gradient scaler (only needed for FP16, not BF16)
-        # BF16 has same exponent range as FP32, so no underflow issues
         model_dtype = next(self.policy.parameters()).dtype
         self.use_grad_scaler = (model_dtype == torch.float16) and self.use_amp
         if self.use_grad_scaler:
@@ -264,15 +170,30 @@ class GRPO(BaseAlgorithm):
         else:
             self.grad_scaler = None
 
-        # Early stopping tokens for generation
         self._setup_stopping_tokens()
 
-    def _setup_stopping_tokens(self):
-        """Set up additional stopping tokens for early termination."""
-        # Read config value (default to ["</answer>"] only when not provided)
-        raw_stop = self.config.get("training", {}).get("stop_sequences", ["</answer>"])
+    def _disable_dropout(self):
+        """Disable all dropout for deterministic log probs."""
+        if hasattr(self.policy.model, 'config'):
+            model_cfg = self.policy.model.config
+            if hasattr(model_cfg, 'attention_dropout') and model_cfg.attention_dropout > 0:
+                model_cfg.attention_dropout = 0.0
 
-        # Normalize and enable/disable multi-token stopping
+            for attr in ['hidden_dropout', 'hidden_dropout_prob', 'resid_pdrop', 'dropout']:
+                if hasattr(model_cfg, attr):
+                    old_val = getattr(model_cfg, attr)
+                    if old_val > 0:
+                        setattr(model_cfg, attr, 0.0)
+
+        for _, module in self.policy.model.named_modules():
+            if isinstance(module, torch.nn.Dropout):
+                if module.p > 0:
+                    module.p = 0.0
+
+    def _setup_stopping_tokens(self):
+        training_config = self.config.get("training", {})
+        raw_stop = training_config.get("stop_sequences", ["</answer>"])
+
         if raw_stop is None:
             self.stop_sequences = []
             self.use_multi_token_stopping = False
@@ -284,11 +205,9 @@ class GRPO(BaseAlgorithm):
                     norm = list(raw_stop)
                 except Exception:
                     norm = []
-            # Keep only non-empty strings
             self.stop_sequences = [s for s in norm if isinstance(s, str) and s]
             self.use_multi_token_stopping = len(self.stop_sequences) > 0
 
-        # Legacy single-token stopping: only when enabled and explicitly using </answer>
         self.answer_end_token_id = None
         if self.use_multi_token_stopping and any(s == "</answer>" for s in self.stop_sequences):
             try:
@@ -296,144 +215,23 @@ class GRPO(BaseAlgorithm):
                 if encoded:
                     self.answer_end_token_id = encoded[-1]
             except Exception:
-                # If encoding fails, just use default EOS
                 pass
 
     def reset_timings(self):
-        """Reset timing data."""
         self.timing_manager.reset_timings()
 
-    def _print_timing_summary(self, title: str):
-        """Print timing summary."""
-        self.timing_manager.print_timing_summary(title)
-
     def _set_episode_seed(self, episode: int, base_seed: int = 42):
-        """
-        Set deterministic random seeds for an episode.
-
-        This ensures that episode N always uses the same random seed,
-        making training fully reproducible even when resuming from checkpoints.
-
-        Args:
-            episode: Current episode number
-            base_seed: Base random seed (default: 42)
-        """
-        # Compute episode-specific seed
-        episode_seed = base_seed + episode
-
-        # Set Python random seed
+        """Set deterministic random seeds for reproducible training."""
         import random
+        episode_seed = base_seed + episode
         random.seed(episode_seed)
-
-        # Set NumPy random seed
         np.random.seed(episode_seed)
-
-        # Set PyTorch random seeds
         torch.manual_seed(episode_seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed(episode_seed)
             torch.cuda.manual_seed_all(episode_seed)
         if torch.backends.mps.is_available():
             torch.mps.manual_seed(episode_seed)
-
-    def _create_completion_mask(self, completion_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Create mask for completion tokens, excluding padding and tokens after EOS.
-
-        Masks out:
-        - PAD tokens (anywhere in sequence)
-        - EOS token and everything after it (including custom stop tokens)
-
-        Args:
-            completion_ids: Token IDs [batch_size, seq_len]
-
-        Returns:
-            Binary mask [batch_size, seq_len] where 1 = valid token, 0 = masked
-        """
-        pad_token_id = self.policy.tokenizer.pad_token_id
-        eos_token_id = self.policy.tokenizer.eos_token_id
-
-        # Mask out padding tokens (but don't stop at them)
-        not_pad = (completion_ids != pad_token_id).float()
-        is_eos = (completion_ids == eos_token_id).int()
-
-        if self.answer_end_token_id is not None:
-            is_answer_end = (completion_ids == self.answer_end_token_id).int()
-            is_eos = is_eos | is_answer_end
-
-        eos_cumsum = is_eos.cumsum(dim=1)
-        not_after_eos = (eos_cumsum == 0).float()
-
-        return not_pad * not_after_eos
-
-    def _compute_sequence_log_probs_unified(
-        self,
-        model: Any,
-        generated_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        prompt_end_position: torch.Tensor,
-        completion_mask: torch.Tensor,
-        requires_grad: bool = False,
-    ) -> torch.Tensor:
-        """
-        Unified method to compute log probabilities for ONE sequence.
-
-        Used by old/new/ref to ensure IDENTICAL:
-        - Input processing
-        - Forward pass configuration
-        - Output extraction
-        - Padding/masking logic
-        - Shape and dtype
-
-        Args:
-            model: LanguageModel instance (policy or ref_policy)
-            generated_ids: [seq_len] token IDs
-            attention_mask: [seq_len] attention mask
-            prompt_end_position: scalar tensor (where completion starts)
-            completion_mask: [max_completion_len] binary mask
-            requires_grad: whether to enable gradients
-
-        Returns:
-            [max_completion_len] tensor of log probs (zeros where masked)
-        """
-        max_len = completion_mask.size(0)
-        device = generated_ids.device
-
-        # Fast path: empty completion
-        if int(completion_mask.sum().item()) == 0:
-            return torch.zeros(max_len, device=device, dtype=torch.float32)
-
-        # Compute full sequence log probs
-        # Note: compute_log_probs returns [1, seq_len-1] because it does next-token prediction
-        full_log_probs = model.compute_log_probs(
-            generated_ids.unsqueeze(0),
-            attention_mask=attention_mask.unsqueeze(0),
-        )  # [1, S-1] in fp32
-
-        # Extract completion-aligned log probs
-        # prompt_end_position points to first completion token in generated_ids
-        # full_log_probs[i] predicts generated_ids[i+1], so we need to offset by -1
-        completion_positions = torch.arange(max_len, device=device)
-        source_positions = (prompt_end_position.item() - 1) + completion_positions
-
-        # Clamp and track validity
-        source_positions_clamped = source_positions.clamp(0, full_log_probs.size(1) - 1)
-        valid_mask = source_positions < full_log_probs.size(1)
-
-        # Gather log probs
-        seq_log_probs = full_log_probs[0, source_positions_clamped]
-
-        # Zero out invalid positions (beyond sequence length)
-        seq_log_probs = torch.where(
-            valid_mask,
-            seq_log_probs,
-            torch.tensor(0.0, device=device, dtype=seq_log_probs.dtype)
-        )
-
-        # Apply completion mask (zeros out padding and post-EOS tokens)
-        seq_log_probs = seq_log_probs * completion_mask.to(seq_log_probs.dtype)
-
-        return seq_log_probs
 
     def _compute_batch_log_probs_vectorized(
         self,
@@ -445,48 +243,23 @@ class GRPO(BaseAlgorithm):
         requires_grad: bool = False,
         keep_gradients: bool = False,
     ) -> torch.Tensor:
-        """
-        Fully vectorized batch computation of log probabilities with chunking support.
-
-        Processes sequences in chunks to reduce memory usage.
-        Uses self.logprobs_batch_size to control chunk size.
-
-        Args:
-            model: LanguageModel instance (policy or ref_policy)
-            generated_ids: List of [seq_len] token ID tensors
-            attention_mask: List of [seq_len] attention mask tensors
-            prompt_end_positions: [batch_size] tensor of prompt end positions
-            completion_mask: List of [completion_len] mask tensors
-            requires_grad: Whether to compute gradients (True for all types for kernel consistency)
-            keep_gradients: Whether to keep gradients (True for new, False for old/ref)
-
-        Returns:
-            [batch_size, max_completion_len] tensor of log probs (right-padded, no prompts)
-        """
+        """Vectorized batch log probability computation with memory-efficient chunking."""
         batch_size = len(generated_ids)
-        # Use model's device, not tensor device (tensors may be on CPU due to offloading)
         device = next(model.model.parameters()).device
-
-        # Find max completion length for padding
         max_completion_len = max(mask.size(0) for mask in completion_mask)
-
-        # Determine chunk size
         chunk_size = self.logprobs_batch_size if self.logprobs_batch_size is not None else batch_size
 
-        # Process in chunks if chunk_size < batch_size
         if chunk_size < batch_size:
             all_completion_log_probs = []
-            
+
             for chunk_start in range(0, batch_size, chunk_size):
                 chunk_end = min(chunk_start + chunk_size, batch_size)
-                
-                # Get chunk
+
                 chunk_gen_ids = generated_ids[chunk_start:chunk_end]
                 chunk_attn_mask = attention_mask[chunk_start:chunk_end]
                 chunk_prompt_end_pos = prompt_end_positions[chunk_start:chunk_end]
                 chunk_completion_mask = completion_mask[chunk_start:chunk_end]
-                
-                # Process chunk
+
                 chunk_log_probs = self._compute_chunk_log_probs(
                     model=model,
                     generated_ids=chunk_gen_ids,
@@ -498,29 +271,18 @@ class GRPO(BaseAlgorithm):
                     device=device,
                 )
 
-                # CRITICAL: Detach to free computation graph immediately (prevents accumulation)
-                # Only detach for old/ref (keep_gradients=False), NOT for new (keep_gradients=True)
-                # This is crucial when using torch.enable_grad() for old/ref logprobs
                 if not keep_gradients:
                     chunk_log_probs = chunk_log_probs.detach()
 
-                # CRITICAL: Immediately offload chunk to CPU to free GPU memory
-                # Only keep one chunk on GPU at a time, accumulate on CPU
                 if self.device.type == "cuda" and self.offload_generated_to_cpu:
                     chunk_log_probs = chunk_log_probs.cpu()
-                    # Clear CUDA cache after each chunk to free gradient graph memory
-                    # (only for old/ref since new doesn't detach)
                     if not keep_gradients:
                         torch.cuda.empty_cache()
 
                 all_completion_log_probs.append(chunk_log_probs)
 
-            # Concatenate all chunks (KEEP ON CPU if offloaded - don't move back!)
-            result = torch.cat(all_completion_log_probs, dim=0)
-            # DON'T move back to GPU! Minibatches will bring slices to GPU as needed
-            return result
+            return torch.cat(all_completion_log_probs, dim=0)
         else:
-            # Process entire batch at once
             result = self._compute_chunk_log_probs(
                 model=model,
                 generated_ids=generated_ids,
@@ -531,8 +293,6 @@ class GRPO(BaseAlgorithm):
                 requires_grad=requires_grad,
                 device=device,
             )
-            # Detach if old/ref (keep_gradients=False) to free computation graph
-            # Keep gradients for new (keep_gradients=True)
             if not keep_gradients:
                 result = result.detach()
             return result
@@ -548,34 +308,22 @@ class GRPO(BaseAlgorithm):
         requires_grad: bool,
         device: torch.device,
     ) -> torch.Tensor:
-        """
-        Compute log probs for a single chunk of sequences.
-        
-        This is the core vectorized computation used by _compute_batch_log_probs_vectorized.
-        """
-        from torch.nn.utils.rnn import pad_sequence
-        
+        """Compute log probs for a single chunk of sequences."""
         chunk_size = len(generated_ids)
 
-        # Move tensors to GPU if they're on CPU (due to offloading)
-        # This is necessary for torch.compile compatibility
         if generated_ids[0].device != device:
             generated_ids = [g.to(device) for g in generated_ids]
             attention_mask = [a.to(device) for a in attention_mask]
             prompt_end_positions = prompt_end_positions.to(device)
             completion_mask = [c.to(device) for c in completion_mask]
 
-        # Pad all sequences to same length for batch processing
         padded_ids = pad_sequence(generated_ids, batch_first=True, padding_value=self.policy.tokenizer.pad_token_id)
         padded_attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
-
-        # Pad completion masks to max_completion_len (vectorized, no loop)
         padded_completion_mask = pad_sequence(completion_mask, batch_first=True, padding_value=0)
-        
-        # Ensure completion mask has correct length
+
         if padded_completion_mask.size(1) < max_completion_len:
             padding = torch.zeros(
-                chunk_size, 
+                chunk_size,
                 max_completion_len - padded_completion_mask.size(1),
                 device=device,
                 dtype=padded_completion_mask.dtype
@@ -584,42 +332,28 @@ class GRPO(BaseAlgorithm):
         elif padded_completion_mask.size(1) > max_completion_len:
             padded_completion_mask = padded_completion_mask[:, :max_completion_len]
 
-        # Compute log probs for chunk (vectorized)
-        # This returns [chunk_size, seq_len-1] in fp32
         with torch.set_grad_enabled(requires_grad):
             chunk_log_probs = model.compute_log_probs(
                 padded_ids,
                 attention_mask=padded_attention_mask,
-            )  # [C, S-1] in fp32
+            )
 
-        # Extract completion portions (vectorized)
-        # Create batch indices and position indices for gathering
-        batch_indices = torch.arange(chunk_size, device=device).unsqueeze(1)  # [C, 1]
-        completion_positions = torch.arange(max_completion_len, device=device).unsqueeze(0)  # [1, L]
+        batch_indices = torch.arange(chunk_size, device=device).unsqueeze(1)
+        completion_positions = torch.arange(max_completion_len, device=device).unsqueeze(0)
+        source_positions = (prompt_end_positions.unsqueeze(1) - 1) + completion_positions
 
-        # Compute source positions for each sequence
-        # prompt_end_positions[i] points to first completion token in generated_ids[i]
-        # chunk_log_probs[i, j] predicts token at position j+1, so offset by -1
-        source_positions = (prompt_end_positions.unsqueeze(1) - 1) + completion_positions  # [C, L]
-
-        # Clamp positions to valid range
         max_valid_position = chunk_log_probs.size(1) - 1
         source_positions_clamped = source_positions.clamp(0, max_valid_position)
+        valid_mask = source_positions < chunk_log_probs.size(1)
 
-        # Track valid positions (before sequence end)
-        valid_mask = source_positions < chunk_log_probs.size(1)  # [C, L]
+        completion_log_probs = chunk_log_probs[batch_indices, source_positions_clamped]
 
-        # Gather log probs using advanced indexing (fully vectorized)
-        completion_log_probs = chunk_log_probs[batch_indices, source_positions_clamped]  # [C, L]
-
-        # Zero out invalid positions (beyond sequence length)
         completion_log_probs = torch.where(
             valid_mask,
             completion_log_probs,
             torch.zeros(1, device=device, dtype=completion_log_probs.dtype)
         )
 
-        # Apply completion mask (zeros out padding and post-EOS tokens)
         completion_log_probs = completion_log_probs * padded_completion_mask
 
         return completion_log_probs
@@ -627,7 +361,7 @@ class GRPO(BaseAlgorithm):
 
     def _generate_grouped_completions(
         self, prompts: List[str]
-    ) -> Dict[str, torch.Tensor]:
+    ) -> GeneratedCompletionsResult:
         """Generate group_size completions for each prompt."""
 
         self.timing_manager.start_timer("batch_tokenization")
@@ -733,29 +467,26 @@ class GRPO(BaseAlgorithm):
                 assert full_generated_text.startswith(prompt_text), (
                     f"Seq {seq_idx}: Generated text doesn't start with prompt"
                 )
-        
-        # CRITICAL: Aggressively delete all intermediate GPU tensors before returning
-        # These intermediate tensors can hold 5-10 GB of GPU memory
-        del generated_ids, generated_mask  # Original generated sequences (before padding)
-        del replicated_prompt_ids, replicated_prompt_mask  # Replicated prompts
-        del batch_prompt_ids, batch_prompt_mask  # Original batch prompts
+
+        del generated_ids, generated_mask
+        del replicated_prompt_ids, replicated_prompt_mask
+        del batch_prompt_ids, batch_prompt_mask
         del batch_indices, seq_positions, source_positions, valid_mask, completion_positions
         del prompt_start_index, prompt_start_index_per_seq
-        del batch_prompt_lengths  # Keep prompt_lengths_per_seq for return
-        
-        # Clear CUDA cache immediately after generation
+        del batch_prompt_lengths
+
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
-        return {
-            "generated_ids": right_padded_ids,
-            "generated_mask": right_padded_mask,
-            "completion_ids": completion_ids,
-            "completion_mask": completion_mask,
-            "completion_texts": completion_texts,
-            "prompt_end_positions": prompt_lengths_per_seq,
-            "total_sequences": total_sequences,
-        }
+        return GeneratedCompletionsResult(
+            generated_ids=right_padded_ids,
+            generated_mask=right_padded_mask,
+            completion_ids=completion_ids,
+            completion_mask=completion_mask,
+            completion_texts=completion_texts,
+            prompt_end_positions=prompt_lengths_per_seq,
+            total_sequences=total_sequences,
+        )
 
 
     def generate_trajectories(
@@ -763,29 +494,7 @@ class GRPO(BaseAlgorithm):
         prompts: List[str],
         answers: Optional[List[str]] = None,
         store_outputs: Optional[bool] = None,
-    ) -> Tuple[
-        Optional[List[str]],
-        Optional[List[str]],
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        """
-        Generate trajectories in batches to avoid OOM.
-
-        Processes prompts in batches of size rollout_batch_size to avoid
-        memory issues during generation.
-
-        Returns:
-            (prompts, completions, rewards, completion_mask,
-             format_rewards, correctness_rewards, generated_ids, attention_mask, prompt_end_positions)
-        """
+    ) -> TrajectoryBatch:
         store = self.store_completions if store_outputs is None else store_outputs
 
         num_prompts = len(prompts)
@@ -822,13 +531,13 @@ class GRPO(BaseAlgorithm):
             self.timing_manager.start_timer(f"batch_{batch_idx}_generation")
             generation = self._generate_grouped_completions(batch_prompts)
             self.timing_manager.end_timer(f"batch_{batch_idx}_generation")
-            generated_ids = generation["generated_ids"]
-            generated_mask = generation["generated_mask"]
-            completion_ids = generation["completion_ids"]
-            completion_mask = generation["completion_mask"]
-            completion_texts = generation["completion_texts"]
-            replicated_prompt_end_positions = generation["prompt_end_positions"]
-            total_sequences = generation["total_sequences"]
+            generated_ids = generation.generated_ids
+            generated_mask = generation.generated_mask
+            completion_ids = generation.completion_ids
+            completion_mask = generation.completion_mask
+            completion_texts = generation.completion_texts
+            replicated_prompt_end_positions = generation.prompt_end_positions
+            total_sequences = generation.total_sequences
 
             # Offload to CPU to save GPU memory (if enabled)
             if self.offload_generated_to_cpu and self.device.type == "cuda":
@@ -866,8 +575,10 @@ class GRPO(BaseAlgorithm):
             self.timing_manager.end_timer(f"batch_{batch_idx}_rewards")
 
             del generated_ids, generated_mask, completion_ids
-            if self.device.type == "cuda" or (self.device.type == "mps" and self.clear_cache_on_mps):
-                clear_device_cache(self.device)
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+            elif self.device.type == "mps" and self.clear_cache_on_mps:
+                torch.mps.empty_cache()
 
             self.timing_manager.end_timer(f"batch_{batch_idx}")
 
@@ -886,94 +597,51 @@ class GRPO(BaseAlgorithm):
         all_correctness_rewards = torch.cat(all_correctness_rewards, dim=0)
         self.timing_manager.end_timer("tensor_stacking")
 
-        if store:
-            return (
-                all_prompts,
-                all_completions,
-                all_rewards,
-                all_completion_mask,
-                all_format_rewards,
-                all_correctness_rewards,
-                generated_ids,
-                attention_mask,
-                prompt_end_positions,
-            )
-        return (
-            None,
-            None,
-            all_rewards,
-            all_completion_mask,
-            all_format_rewards,
-            all_correctness_rewards,
-            generated_ids,
-            attention_mask,
-            prompt_end_positions,
+        return TrajectoryBatch(
+            prompts=all_prompts if store else None,
+            completions=all_completions if store else None,
+            rewards=all_rewards,
+            completion_mask=all_completion_mask,
+            format_rewards=all_format_rewards,
+            correctness_rewards=all_correctness_rewards,
+            generated_ids=generated_ids,
+            attention_mask=attention_mask,
+            prompt_end_positions=prompt_end_positions,
         )
 
     def compute_logprobs(
         self,
-        logprob_type: str,  # "old", "ref", or "new"
+        logprob_type: str,
         generated_ids: List[torch.Tensor],
         attention_mask: List[torch.Tensor],
         prompt_end_positions: torch.Tensor,
         completion_mask: List[torch.Tensor],
     ) -> torch.Tensor:
-        """
-        Unified method to compute ANY type of logprobs (old, ref, or new).
-
-        This single method ensures all logprob types use IDENTICAL computation.
-
-        Args:
-            logprob_type: Type of logprobs to compute ("old", "ref", or "new")
-            generated_ids: List of [seq_len] token ID tensors
-            attention_mask: List of [seq_len] attention mask tensors
-            prompt_end_positions: [batch_size] tensor of prompt end positions
-            completion_mask: List of [completion_len] mask tensors
-
-        Returns:
-            [batch_size, max_completion_len] tensor of log probs
-        """
-
-        # Start timing
+        """Unified method to compute logprobs (old/ref/new) with identical computation."""
         self.timing_manager.start_timer(f"compute_{logprob_type}_logprobs")
 
-        # Select model based on type
         if logprob_type == "ref":
             if self.kl_coef > 0 and self.ref_policy is not None:
                 model = self.ref_policy
             else:
-                # If no KL penalty or ref model, return zeros
                 batch_size = len(completion_mask)
                 max_completion_len = max(mask.size(0) for mask in completion_mask)
                 self.timing_manager.end_timer(f"compute_{logprob_type}_logprobs")
                 return torch.zeros(batch_size, max_completion_len, device=self.device)
         else:
-            # Both "old" and "new" use the policy model
             model = self.policy
 
-        # Save model state
         prev_mode = model.training
         prev_cache = getattr(model.model.config, "use_cache", None)
 
-        # Force eval() for ALL logprob types to ensure identical forward path
-        # This prevents training/inference kernel divergence (e.g., Flash Attention behavior)
         model.eval()
-        
-        # Always disable cache for consistency
         if prev_cache is not None:
             model.model.config.use_cache = False
 
-        # Clear CUDA cache before logprob computation to reduce memory fragmentation
-        # This is especially important with CPU offloading and chunking
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
         try:
-            # CRITICAL: Compute ALL with torch.enable_grad() for consistent kernels
-            # Both policy and ref_policy have requires_grad=True (same state)
-            # This ensures old/new/ref use identical computation paths
-            # (Flash Attention and other kernels can differ based on grad tracking)
-            # MUST use requires_grad=True for ALL types to ensure identical kernel selection
             with torch.enable_grad():
                 log_probs = self._compute_batch_log_probs_vectorized(
                     model=model,
@@ -981,11 +649,10 @@ class GRPO(BaseAlgorithm):
                     attention_mask=attention_mask,
                     prompt_end_positions=prompt_end_positions,
                     completion_mask=completion_mask,
-                    requires_grad=True,  # ALWAYS True for consistent kernels (detach later for old/ref)
-                    keep_gradients=(logprob_type == "new"),  # Only keep gradients for new, detach old/ref
+                    requires_grad=True,
+                    keep_gradients=(logprob_type == "new"),
                 )
         finally:
-            # Restore model state
             if prev_cache is not None:
                 model.model.config.use_cache = prev_cache
             if prev_mode:
@@ -993,82 +660,18 @@ class GRPO(BaseAlgorithm):
 
         self.timing_manager.end_timer(f"compute_{logprob_type}_logprobs")
 
-        # For old/ref: detach to remove gradients
-        # For new: keep gradients for backward pass
         if logprob_type in ["old", "ref"]:
             return log_probs.detach()
         else:
-            return log_probs  # Keep gradients for new
-
-    def _validate_logprobs_episode_zero(
-        self,
-        mb_old_log_probs: torch.Tensor,
-        mb_new_log_probs: torch.Tensor,
-        mb_ref_log_probs: torch.Tensor,
-        selected_gen_ids: List[torch.Tensor] = None,
-        selected_prompt_end_positions: torch.Tensor = None,
-    ) -> None:
-        """
-        Validate that old/new/ref logprobs are consistent (episode 0 check).
-        
-        This ensures the unified logprob computation produces identical results
-        and that gradient flow is set up correctly.
-        """
-        from logprobs_debugger import validate_logprobs, save_logprobs_debug
-        
-        print("\n" + "="*80)
-        print("LOGPROBS VALIDATION - EPISODE 0, MINIBATCH 1")
-        print("="*80)
-        
-        # Validate
-        model_dtype = next(self.policy.parameters()).dtype
-        results = validate_logprobs(
-            mb_old_log_probs,
-            mb_new_log_probs.detach(),  # Detach for comparison
-            mb_ref_log_probs,
-            model_dtype,
-            save_on_fail=True,
-            generated_ids=selected_gen_ids,
-            prompt_end_positions=selected_prompt_end_positions,
-            tokenizer=self.policy.tokenizer,
-            output_dir=".",
-        )
-        
-        # Report results
-        print(f"Old-Ref diff: {results['old_ref_diff']:.6e} (threshold: {results['ref_threshold']:.0e})")
-        print(f"Old-New diff: {results['old_new_diff']:.6e} (threshold: {results['new_threshold']:.0e})")
-        print()
-        
-        if results['old_ref_pass']:
-            print(f"✅ PASSED: Old-Ref consistency check")
-        else:
-            print(f"❌ FAILED: Old-Ref diff {results['old_ref_diff']:.2e} >= threshold {results['ref_threshold']:.0e}")
-            raise AssertionError(
-                f"Old and ref log probs differ by {results['old_ref_diff']:.2e} "
-                f"(expected < {results['ref_threshold']:.0e})"
-            )
-        
-        if results['old_new_pass']:
-            print(f"✅ PASSED: Old-New consistency check")
-        else:
-            print(f"❌ FAILED: Old-New diff {results['old_new_diff']:.2e} >= threshold {results['new_threshold']:.0e}")
-            raise AssertionError(
-                f"Old and new log probs differ by {results['old_new_diff']:.2e} "
-                f"(expected < {results['new_threshold']:.0e})"
-            )
-        
-        print("="*80)
-        print("✅ ALL VALIDATIONS PASSED")
-        print("="*80)
-        print()
+            return log_probs
 
     def compute_advantages(
         self,
         rewards: torch.Tensor,
         group_size: int = 1,
         normalize_within_groups: bool = True
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Compute group-normalized advantages (GRPO's key innovation)."""
+    ) -> Tuple[torch.Tensor, AdvantageStats]:
+        """Compute group-normalized advantages."""
         if normalize_within_groups and group_size > 1:
             batch_size = rewards.shape[0]
             num_groups = batch_size // group_size
@@ -1080,28 +683,25 @@ class GRPO(BaseAlgorithm):
         else:
             advantages_raw = (rewards - rewards.mean()) / (rewards.std() + 0.1)
 
-        # Track statistics before clamping
         adv_min_raw = advantages_raw.min().item()
         adv_max_raw = advantages_raw.max().item()
 
-        # Clamp advantages
         advantages = torch.clamp(advantages_raw, min=self.advantage_clip_min, max=self.advantage_clip_max)
 
-        # Compute clipping statistics
         clamped_low = (advantages_raw < self.advantage_clip_min).sum().item()
         clamped_high = (advantages_raw > self.advantage_clip_max).sum().item()
         total = advantages_raw.numel()
         clamped_low_frac = clamped_low / max(total, 1)
         clamped_high_frac = clamped_high / max(total, 1)
 
-        stats = {
-            "advantages_min_raw": adv_min_raw,
-            "advantages_max_raw": adv_max_raw,
-            "advantages_min": advantages.min().item(),
-            "advantages_max": advantages.max().item(),
-            "advantages_clamped_low_frac": clamped_low_frac,
-            "advantages_clamped_high_frac": clamped_high_frac,
-        }
+        stats = AdvantageStats(
+            advantages_min_raw=adv_min_raw,
+            advantages_max_raw=adv_max_raw,
+            advantages_min=advantages.min().item(),
+            advantages_max=advantages.max().item(),
+            advantages_clamped_low_frac=clamped_low_frac,
+            advantages_clamped_high_frac=clamped_high_frac,
+        )
 
         return advantages, stats
 
@@ -1112,7 +712,7 @@ class GRPO(BaseAlgorithm):
         advantages: torch.Tensor,
         ref_log_probs: torch.Tensor,
         completion_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> Tuple[torch.Tensor, LossMetrics]:
         """Compute GRPO loss with PPO-style clipping and entropy bonus."""
         self.timing_manager.start_timer("loss_computation")
 
@@ -1148,50 +748,45 @@ class GRPO(BaseAlgorithm):
         entropy_coef = self.config.get("training", {}).get("entropy_coef", 0.01)
         loss = policy_loss + self.kl_coef * kl_penalty - entropy_coef * entropy
 
-        metrics = {
-            "policy_loss": policy_loss.item(),
-            "kl_divergence": kl_penalty.item(),
-            "entropy": entropy.item(),
-            "ratio_mean": policy_metrics["ratio_mean"],
-            "ratio_min": policy_metrics["ratio_min"],
-            "ratio_max": policy_metrics["ratio_max"],
-            "ratio_clipped_frac": policy_metrics["ratio_clipped_frac"],
-            "log_ratio_mean": policy_metrics["log_ratio_mean"],
-            "log_ratio_min": policy_metrics["log_ratio_min"],
-            "log_ratio_max": policy_metrics["log_ratio_max"],
-            "tokens_generated": completion_mask.sum().item(),
-            "kl_term": (self.kl_coef * kl_penalty).item(),
-            "entropy_term": (entropy_coef * entropy).item(),
-        }
+        metrics = LossMetrics(
+            policy_loss=policy_loss.item(),
+            kl_divergence=kl_penalty.item(),
+            entropy=entropy.item(),
+            ratio_mean=policy_metrics["ratio_mean"],
+            ratio_min=policy_metrics["ratio_min"],
+            ratio_max=policy_metrics["ratio_max"],
+            ratio_clipped_frac=policy_metrics["ratio_clipped_frac"],
+            log_ratio_mean=policy_metrics["log_ratio_mean"],
+            log_ratio_min=policy_metrics["log_ratio_min"],
+            log_ratio_max=policy_metrics["log_ratio_max"],
+            tokens_generated=completion_mask.sum().item(),
+            kl_term=(self.kl_coef * kl_penalty).item(),
+            entropy_term=(entropy_coef * entropy).item(),
+        )
 
         self.timing_manager.end_timer("loss_computation")
         return loss, metrics
 
-    def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
+    def train_step(self, batch: BatchData) -> Dict[str, float]:
         """Perform GRPO training step with multiple epochs over same trajectories."""
         self.policy.train()
-        prompts = batch["prompts"]
-        answers = batch["answers"]
+        prompts = batch.prompts
+        answers = batch.answers
 
         self.timing_manager.start_timer("trajectory_generation")
-        (
-            _,
-            _,
-            rewards,
-            completion_mask,
-            format_rewards,
-            correctness_rewards,
-            generated_ids,
-            attention_mask,
-            prompt_end_positions,
-        ) = self.generate_trajectories(
+        trajectories = self.generate_trajectories(
             prompts, answers=answers, store_outputs=False
         )
         self.timing_manager.end_timer("trajectory_generation")
 
-        # Compute frozen old/ref logprobs once, right before optimization
-        # Use unified method to ensure IDENTICAL computation for all types
-        # These will be kept on CPU if offloading is enabled
+        rewards = trajectories.rewards
+        completion_mask = trajectories.completion_mask
+        format_rewards = trajectories.format_rewards
+        correctness_rewards = trajectories.correctness_rewards
+        generated_ids = trajectories.generated_ids
+        attention_mask = trajectories.attention_mask
+        prompt_end_positions = trajectories.prompt_end_positions
+
         old_log_probs = self.compute_logprobs(
             "old", generated_ids, attention_mask, prompt_end_positions, completion_mask
         )
@@ -1199,8 +794,6 @@ class GRPO(BaseAlgorithm):
             "ref", generated_ids, attention_mask, prompt_end_positions, completion_mask
         )
 
-        # CRITICAL: Clear CUDA cache after computing old/ref logprobs
-        # This frees GPU memory before starting optimization
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -1224,22 +817,7 @@ class GRPO(BaseAlgorithm):
 
         self.timing_manager.start_timer("optimization")
 
-        epoch_metrics = {
-            "policy_loss": 0.0,
-            "kl_divergence": 0.0,
-            "entropy": 0.0,
-            "ratio_mean": 0.0,
-            "ratio_clipped_frac": 0.0,
-            "ratio_min": 0.0,
-            "ratio_max": 0.0,
-            "log_ratio_mean": 0.0,
-            "log_ratio_min": 0.0,
-            "log_ratio_max": 0.0,
-            "grad_norm": 0.0,
-            "grad_norm_post_clip": 0.0,
-            "grad_clipped_frac": 0.0,
-            "relative_param_update": 0.0,
-        }
+        epoch_metrics = EpochMetrics()
         num_updates = 0
         num_minibatches = (total_sequences + self.minibatch_size - 1) // self.minibatch_size
 
@@ -1260,29 +838,21 @@ class GRPO(BaseAlgorithm):
 
                     mb_end = min(mb_start + self.minibatch_size, total_sequences)
                     mb_indices = indices[mb_start:mb_end]
-                    
-                    # Move indices to CPU for indexing CPU tensors (due to offloading)
                     mb_indices_cpu = mb_indices.cpu()
-                    
-                    mb_advantages = advantages[mb_indices]
 
-                    # Ensure advantages are on GPU
+                    mb_advantages = advantages[mb_indices]
                     if mb_advantages.device != self.device:
                         mb_advantages = mb_advantages.to(self.device)
 
-                    # Select minibatch data (use CPU indices for CPU tensors)
                     selected_gen_ids = [generated_ids[idx] for idx in mb_indices_cpu]
                     selected_attn_mask = [attention_mask[idx] for idx in mb_indices_cpu]
                     selected_completion_mask = [completion_mask[idx] for idx in mb_indices_cpu]
                     selected_prompt_end_positions = prompt_end_positions[mb_indices_cpu]
 
-                    # Extract minibatch slices from batch tensors
-                    # Use CPU indices if tensors are on CPU (due to offloading)
                     indices_for_logprobs = mb_indices_cpu if old_log_probs.device.type == 'cpu' else mb_indices
                     mb_old_log_probs = old_log_probs[indices_for_logprobs]
                     mb_ref_log_probs = ref_log_probs[indices_for_logprobs]
 
-                    # Move to GPU for loss computation
                     if mb_old_log_probs.device != self.device:
                         mb_old_log_probs = mb_old_log_probs.to(self.device)
                     if mb_ref_log_probs.device != self.device:
@@ -1290,51 +860,44 @@ class GRPO(BaseAlgorithm):
 
                     self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_recompute")
 
-                    # NO autocast - logprobs must be computed in FP32 for numerical stability
-                    # Compute new log probs using unified method (same as old/ref)
                     mb_new_log_probs = self.compute_logprobs(
-                        "new",  # Enable gradients for policy update
+                        "new",
                         selected_gen_ids,
                         selected_attn_mask,
                         selected_prompt_end_positions,
                         selected_completion_mask,
                     )
 
-                    # CRITICAL: Ensure new log probs are on GPU (may be on CPU if offloading enabled)
-                    # Must do this BEFORE validation and loss computation
                     if mb_new_log_probs.device != self.device:
                         mb_new_log_probs = mb_new_log_probs.to(self.device)
-
-                    # Create padded completion mask to match log probs shape (vectorized, no loop)
                     mb_completion_mask = pad_sequence(
                         selected_completion_mask,
                         batch_first=True,
                         padding_value=0
                     )
 
-                    # Ensure completion mask is on GPU for loss computation
                     if mb_completion_mask.device != self.device:
                         mb_completion_mask = mb_completion_mask.to(self.device)
 
                     self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_recompute")
 
                     if self.episode == 0 and epoch == 0 and mb_idx == 1:
-                        # Validate logprobs consistency (saves debug files on failure)
-                        # Ensure all validation inputs are on GPU
                         val_gen_ids = [g.to(self.device) if g.device != self.device else g for g in selected_gen_ids]
                         val_prompt_end = selected_prompt_end_positions.to(self.device) if selected_prompt_end_positions.device != self.device else selected_prompt_end_positions
+                        model_dtype = next(self.policy.parameters()).dtype
 
-                        self._validate_logprobs_episode_zero(
-                            mb_old_log_probs,  # Already on GPU
-                            mb_new_log_probs,  # Now on GPU
-                            mb_ref_log_probs,  # Already on GPU
+                        validate_logprobs_episode_zero(
+                            mb_old_log_probs,
+                            mb_new_log_probs,
+                            mb_ref_log_probs,
+                            model_dtype,
+                            self.policy.tokenizer,
                             val_gen_ids,
                             val_prompt_end,
                         )
 
                     self.optimizer.zero_grad()
 
-                    # Loss computation (NO autocast - already in FP32)
                     self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_loss")
                     loss, mb_metrics = self.compute_loss(
                         mb_new_log_probs,
@@ -1345,20 +908,15 @@ class GRPO(BaseAlgorithm):
                     )
                     self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_loss")
 
-                    # Backward pass with optional gradient scaling (FP16 only, not BF16)
                     self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_backward")
                     if self.use_grad_scaler:
-                        # FP16: Scale loss to prevent gradient underflow
                         self.grad_scaler.scale(loss).backward()
                     else:
-                        # BF16/FP32: No scaling needed
                         loss.backward()
                     self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_backward")
 
-                    # Gradient clipping (with scaler support for FP16)
                     self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_clip")
                     if self.use_grad_scaler:
-                        # FP16: Unscale gradients before clipping
                         self.grad_scaler.unscale_(self.optimizer)
 
                     grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
@@ -1380,14 +938,11 @@ class GRPO(BaseAlgorithm):
                         theta_before = torch.nn.utils.parameters_to_vector(self.policy.parameters()).float()
                         theta_norm_before = theta_before.norm().item()
 
-                    # Optimizer step (with scaler support for FP16)
                     self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_update")
                     if self.use_grad_scaler:
-                        # FP16: Scaled optimizer step + scaler update
                         self.grad_scaler.step(self.optimizer)
                         self.grad_scaler.update()
                     else:
-                        # BF16/FP32: Normal optimizer step
                         self.optimizer.step()
 
                     with torch.no_grad():
@@ -1401,14 +956,13 @@ class GRPO(BaseAlgorithm):
 
                     self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_update")
 
-                    for key in epoch_metrics:
-                        if key in mb_metrics:
-                            epoch_metrics[key] += mb_metrics[key]
-
-                    epoch_metrics["grad_norm"] += grad_norm_before_clip.item()
-                    epoch_metrics["grad_norm_post_clip"] += grad_norm_post_clip
-                    epoch_metrics["grad_clipped_frac"] += grad_was_clipped
-                    epoch_metrics["relative_param_update"] += relative_param_update
+                    epoch_metrics.accumulate(
+                        mb_metrics,
+                        grad_norm_before_clip.item(),
+                        grad_norm_post_clip,
+                        grad_was_clipped,
+                        relative_param_update
+                    )
                     num_updates += 1
 
                     self.timing_manager.start_timer(f"epoch_{epoch}_minibatch_{mb_idx}_cleanup")
@@ -1419,8 +973,10 @@ class GRPO(BaseAlgorithm):
                         selected_prompt_end_positions,
                         param_update_norm, relative_param_update, grad_norm_before_clip, grad_norm_post_clip
                     )
-                    if self.device.type == "cuda" or (self.device.type == "mps" and self.clear_cache_on_mps):
-                        clear_device_cache(self.device)
+                    if self.device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    elif self.device.type == "mps" and self.clear_cache_on_mps:
+                        torch.mps.empty_cache()
                     self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}_cleanup")
 
                     self.timing_manager.end_timer(f"epoch_{epoch}_minibatch_{mb_idx}")
@@ -1431,72 +987,43 @@ class GRPO(BaseAlgorithm):
 
         self.timing_manager.end_timer("optimization")
 
-        for key in epoch_metrics:
-            epoch_metrics[key] /= max(1, num_updates)
+        epoch_metrics.average(num_updates)
 
-        metrics = {
-            "total_loss": epoch_metrics["policy_loss"] + self.kl_coef * epoch_metrics["kl_divergence"],
-            "pg_loss": epoch_metrics["policy_loss"],
-            "kl_divergence": epoch_metrics["kl_divergence"],
-            "reward_mean": reward_mean_scalar,
-            "reward_std": reward_std_scalar,
-            "format_reward_mean": format_reward_mean_scalar,
-            "correctness_reward_mean": correctness_reward_mean_scalar,
-            "ratio_mean": epoch_metrics["ratio_mean"],
-            "ratio_min": epoch_metrics["ratio_min"],
-            "ratio_max": epoch_metrics["ratio_max"],
-            "ratio_clipped_frac": epoch_metrics["ratio_clipped_frac"],
-            "log_ratio_mean": epoch_metrics["log_ratio_mean"],
-            "log_ratio_min": epoch_metrics["log_ratio_min"],
-            "log_ratio_max": epoch_metrics["log_ratio_max"],
-            "grad_norm": epoch_metrics["grad_norm"],
-            "grad_norm_post_clip": epoch_metrics["grad_norm_post_clip"],
-            "grad_clipped_frac": epoch_metrics["grad_clipped_frac"],
-            "relative_param_update": epoch_metrics["relative_param_update"],
-            "tokens_generated": total_tokens_scalar,
-            # Advantage statistics (from full batch)
-            "advantages_mean": advantages_mean_scalar,
-            "advantages_std": advantages_std_scalar,
-            "advantages_min_raw": advantage_stats["advantages_min_raw"],
-            "advantages_max_raw": advantage_stats["advantages_max_raw"],
-            "advantages_min": advantage_stats["advantages_min"],
-            "advantages_max": advantage_stats["advantages_max"],
-            "advantages_clamped_low_frac": advantage_stats["advantages_clamped_low_frac"],
-            "advantages_clamped_high_frac": advantage_stats["advantages_clamped_high_frac"],
-        }
+        metrics = MetricsBuilder.build_training_metrics(
+            epoch_metrics=epoch_metrics.to_dict(),
+            reward_mean=reward_mean_scalar,
+            reward_std=reward_std_scalar,
+            format_reward_mean=format_reward_mean_scalar,
+            correctness_reward_mean=correctness_reward_mean_scalar,
+            total_tokens=total_tokens_scalar,
+            advantages_mean=advantages_mean_scalar,
+            advantages_std=advantages_std_scalar,
+            advantage_stats=advantage_stats,
+            kl_coef=self.kl_coef,
+        )
 
         self.total_steps += 1
-        self.logger.log_metrics(metrics, self.total_steps)
+        self.logger.log_metrics(metrics.to_dict(), self.total_steps)
 
         del old_log_probs, ref_log_probs, advantages, completion_mask
         del generated_ids, attention_mask, prompt_end_positions
 
-        if self.device.type == "cuda" or (self.device.type == "mps" and self.clear_cache_on_mps):
-            clear_device_cache(self.device)
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif self.device.type == "mps" and self.clear_cache_on_mps:
+            torch.mps.empty_cache()
 
-        return metrics
+        return metrics.to_dict()
 
     def train(
         self,
         train_data: Dict[str, List[str]],
         val_data: Optional[Dict[str, List[str]]] = None,
         num_episodes: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """
-        Train the model using GRPO.
-
-        Args:
-            train_data: Dict with 'prompts' and 'answers' lists
-            val_data: Optional validation data with same format
-            num_episodes: Number of episodes to train (overrides config)
-
-        Returns:
-            Dictionary of training and validation metrics
-        """
+    ) -> TrainResult:
         import time
         from pathlib import Path
 
-        # Get training parameters from config
         if num_episodes is None:
             num_episodes = self.config['training']['num_episodes']
 
@@ -1505,13 +1032,11 @@ class GRPO(BaseAlgorithm):
         log_interval = self.config['logging']['log_interval']
         save_interval = self.config['logging']['save_interval']
 
-        # Validation parameters
         validation_enabled = self.config.get('validation', {}).get('enabled', False)
         validation_interval = self.config.get('validation', {}).get('interval', 10)
         validation_num_samples = self.config.get('validation', {}).get('num_samples', 20)
         validation_num_demo_examples = self.config.get('validation', {}).get('num_demo_examples', 5)
 
-        # Get generation parameters from config (with defaults)
         training_config = self.config.get('training', {})
         max_new_tokens = training_config.get('max_new_tokens', 128)
         temperature = training_config.get('temperature', 0.9)
@@ -1521,7 +1046,6 @@ class GRPO(BaseAlgorithm):
         train_answers = train_data["answers"]
 
         self.logger.info(f"Starting proper GRPO training for {num_episodes} episodes...")
-        # Show asymmetric clipping if different, otherwise show symmetric
         if self.clip_epsilon_low == self.clip_epsilon_high:
             self.logger.info(f"  - Using PPO clipped objective (clip_epsilon={self.clip_epsilon})")
         else:
@@ -1538,57 +1062,23 @@ class GRPO(BaseAlgorithm):
             self.logger.info(f"    - Evaluating {validation_num_samples} validation samples")
             self.logger.info(f"    - Showing {validation_num_demo_examples} demo examples")
         self.logger.info("=" * 50)
+        training_metrics = TrainingHistory()
+        validation_metrics = ValidationHistory()
 
-        # Training metrics storage
-        training_metrics = {
-            "episode": [],
-            "total_loss": [],
-            "pg_loss": [],
-            "kl_divergence": [],
-            "reward_mean": [],
-            "reward_std": [],
-            "format_reward_mean": [],
-            "correctness_reward_mean": [],
-            "grad_norm": [],
-            "grad_norm_post_clip": [],
-            "grad_clipped_frac": [],
-            "relative_param_update": [],
-            "tokens_generated": [],
-            "episode_time": [],
-            "total_tokens": [],
-            "tokens_per_second": []
-        }
-
-        # Validation metrics storage
-        validation_metrics = {
-            "episode": [],
-            "exact_accuracy": [],
-            "numeric_accuracy": [],
-            "format_compliance": [],
-            "avg_format_score": [],
-            "avg_correctness_score": []
-        }
-
-        # Create checkpoint directory
         checkpoint_dir = Path("checkpoints/grpo_qwen_math")
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # Initialize tracking
         cumulative_tokens = 0
         training_start_time = time.time()
 
-        # Determine starting episode (support resuming from checkpoint)
         start_episode = self.current_episode
         if start_episode > 0:
             self.logger.info(f"\n⏭️  RESUMING FROM EPISODE {start_episode}")
             self.logger.info(f"   Will train episodes {start_episode} to {num_episodes-1}")
             self.logger.info(f"   Scheduler state restored (warmup may already be complete)")
 
-        # Check if we should resample batch each episode (default: False for overfitting tests)
-        # Set to True for real training to sample different batches each episode
         resample_batch = self.config.get('training', {}).get('resample_batch_per_episode', False)
 
-        # Sample initial batch (used for all episodes if resample_batch=False)
         if not resample_batch:
             fixed_batch_indices = np.arange(min(batch_size, len(train_prompts)))
             self.logger.info(f"  - Using FIXED batch (same {len(fixed_batch_indices)} samples every episode for overfitting test)")
@@ -1597,110 +1087,41 @@ class GRPO(BaseAlgorithm):
 
         for episode in range(start_episode, num_episodes):
             self.episode = episode
-            self.current_episode = episode  # Update current episode counter
+            self.current_episode = episode
 
-            # Set deterministic seed for this episode
-            # This ensures episode N always has the same randomness,
-            # making training reproducible even when resuming from checkpoints
             self._set_episode_seed(episode)
-
             episode_start_time = time.time()
 
-            # Sample a batch of problems for this episode
             if resample_batch:
-                # Normal training: sample different batch each episode
                 batch_indices = np.random.choice(len(train_prompts), batch_size, replace=True)
             else:
-                # Overfitting test: use same batch every episode
                 batch_indices = fixed_batch_indices
 
             batch_prompts = [train_prompts[i] for i in batch_indices]
             batch_answers = [train_answers[i] for i in batch_indices]
 
-            # Pass batch to train_step (which handles multiple epochs internally)
-            batch_data = {
-                "prompts": batch_prompts,
-                "answers": batch_answers
-            }
+            batch_data = BatchData(
+                prompts=batch_prompts,
+                answers=batch_answers
+            )
             metrics = self.train_step(batch_data)
 
-            # Calculate episode time
             episode_time = time.time() - episode_start_time
             episode_tokens = metrics.get("tokens_generated", 0)
             cumulative_tokens += episode_tokens
-
-            # Calculate tokens per second for this episode
             tokens_per_sec = episode_tokens / episode_time if episode_time > 0 else 0
+            training_metrics.append(episode, metrics, episode_time, episode_tokens, cumulative_tokens, tokens_per_sec)
 
-            # Store metrics
-            training_metrics["episode"].append(episode)
-            training_metrics["total_loss"].append(metrics["total_loss"])
-            training_metrics["pg_loss"].append(metrics["pg_loss"])
-            training_metrics["kl_divergence"].append(metrics["kl_divergence"])
-            training_metrics["reward_mean"].append(metrics["reward_mean"])
-            training_metrics["reward_std"].append(metrics.get("reward_std", 0.0))
-            training_metrics["format_reward_mean"].append(metrics["format_reward_mean"])
-            training_metrics["correctness_reward_mean"].append(metrics["correctness_reward_mean"])
-            training_metrics["grad_norm"].append(metrics.get("grad_norm", 0.0))
-            training_metrics["grad_norm_post_clip"].append(metrics.get("grad_norm_post_clip", 0.0))
-            training_metrics["grad_clipped_frac"].append(metrics.get("grad_clipped_frac", 0.0))
-            training_metrics["relative_param_update"].append(metrics.get("relative_param_update", 0.0))
-            training_metrics["tokens_generated"].append(metrics.get("tokens_generated", 0))
-            training_metrics["episode_time"].append(episode_time)
-            training_metrics["total_tokens"].append(cumulative_tokens)
-            training_metrics["tokens_per_second"].append(tokens_per_sec)
-
-            # Logging
             if episode % log_interval == 0:
-                current_lr = self.optimizer.param_groups[0]['lr']
-                grad_norm_pre = metrics.get('grad_norm', 0.0)
-                grad_norm_post = metrics.get('grad_norm_post_clip', 0.0)
-                grad_clipped_pct = metrics.get('grad_clipped_frac', 0.0) * 100.0
-                rel_param_update = metrics.get('relative_param_update', 0.0)
+                self._log_training_progress(episode, metrics, episode_tokens, episode_time, tokens_per_sec)
 
-                # PPO ratio metrics
-                ratio_mean = metrics.get('ratio_mean', 1.0)
-                ratio_min = metrics.get('ratio_min', 1.0)
-                ratio_max = metrics.get('ratio_max', 1.0)
-                ratio_clipped_pct = metrics.get('ratio_clipped_frac', 0.0) * 100.0
-
-                # Log ratio metrics (for KL/debugging)
-                log_ratio_mean = metrics.get('log_ratio_mean', 0.0)
-                log_ratio_min = metrics.get('log_ratio_min', 0.0)
-                log_ratio_max = metrics.get('log_ratio_max', 0.0)
-
-                # Advantage metrics (shows if clamping is active)
-                adv_mean = metrics.get('advantages_mean', 0.0)
-                adv_std = metrics.get('advantages_std', 1.0)
-                adv_min_raw = metrics.get('advantages_min_raw', 0.0)
-                adv_max_raw = metrics.get('advantages_max_raw', 0.0)
-                adv_min = metrics.get('advantages_min', 0.0)
-                adv_max = metrics.get('advantages_max', 0.0)
-                adv_clamped_low_pct = metrics.get('advantages_clamped_low_frac', 0.0) * 100.0
-                adv_clamped_high_pct = metrics.get('advantages_clamped_high_frac', 0.0) * 100.0
-
-                self.logger.info(f"Episode {int(episode):3d}")
-                self.logger.info(f"  Loss: Total={metrics['total_loss']:7.4f} | PG={metrics['pg_loss']:7.4f} | KL={metrics['kl_divergence']:7.4f}")
-                self.logger.info(f"  Reward: {metrics['reward_mean']:6.3f} ± {metrics.get('reward_std', 0.0):5.3f} | Fmt={metrics['format_reward_mean']:5.3f} | Correct={metrics['correctness_reward_mean']:5.3f}")
-                self.logger.info(f"  PPO Ratio: μ={ratio_mean:5.3f} [{ratio_min:5.3f}, {ratio_max:5.3f}] | Clipped={ratio_clipped_pct:5.1f}% | ε=[{1-self.clip_epsilon_low:.2f}, {1+self.clip_epsilon_high:.2f}]")
-                self.logger.info(f"  Log Ratio: μ={log_ratio_mean:6.3f} [{log_ratio_min:6.3f}, {log_ratio_max:6.3f}] | Clamp=[{self.kl_clamp_min:.1f}, {self.kl_clamp_max:.1f}]")
-                self.logger.info(f"  Advantages: μ={adv_mean:6.3f} σ={adv_std:5.3f} | Raw=[{adv_min_raw:6.3f}, {adv_max_raw:6.3f}] | Clamped=[{adv_min:6.3f}, {adv_max:6.3f}]")
-                self.logger.info(f"    Clamp: [{self.advantage_clip_min:.1f}, {self.advantage_clip_max:.1f}] | Low={adv_clamped_low_pct:5.1f}% High={adv_clamped_high_pct:5.1f}%")
-                self.logger.info(f"  Gradients: {grad_norm_pre:6.3f}→{grad_norm_post:6.3f} | Clipped={grad_clipped_pct:5.1f}% | Max={self.gradient_clip:.1f}")
-                self.logger.info(f"  Updates: ParamΔ={rel_param_update*100:.4f}% | LR={current_lr:.2e}")
-                self.logger.info(f"  Throughput: Tokens={int(episode_tokens):5d} | Time={episode_time:5.2f}s | Speed={tokens_per_sec:6.1f} tok/s")
-                self.logger.info("")
-
-            # Run validation if enabled and at the right interval
             if validation_enabled and val_data and (episode + 1) % validation_interval == 0:
                 self.logger.info(f"\n{'='*60}")
                 self.logger.info(f"VALIDATION AT EPISODE {episode + 1}")
                 self.logger.info(f"{'='*60}")
 
-                # Import evaluation function
                 from simple_rl.evaluation.gsm8k import evaluate_on_gsm8k, demonstrate_model_responses
 
-                # Run evaluation on validation set
                 val_metrics = evaluate_on_gsm8k(
                     self,
                     val_data["prompts"],
@@ -1719,15 +1140,8 @@ class GRPO(BaseAlgorithm):
                     sample=False,
                 )
 
-                # Store validation metrics
-                validation_metrics["episode"].append(episode + 1)
-                validation_metrics["exact_accuracy"].append(val_metrics['exact_accuracy'])
-                validation_metrics["numeric_accuracy"].append(val_metrics['numeric_accuracy'])
-                validation_metrics["format_compliance"].append(val_metrics['format_compliance'])
-                validation_metrics["avg_format_score"].append(val_metrics['avg_format_score'])
-                validation_metrics["avg_correctness_score"].append(val_metrics['avg_correctness_score'])
+                validation_metrics.append(episode + 1, val_metrics)
 
-                # Demonstrate model responses
                 demonstrate_model_responses(
                     self,
                     val_data["prompts"][:validation_num_demo_examples],
@@ -1742,28 +1156,24 @@ class GRPO(BaseAlgorithm):
 
                 self.logger.info(f"{'='*60}\n")
 
-            # Save checkpoint
             if (episode + 1) % save_interval == 0:
                 checkpoint_path = checkpoint_dir / f"checkpoint_episode_{episode+1}.pt"
-                self.save_checkpoint(str(checkpoint_path))
+                save_checkpoint(self, str(checkpoint_path))
                 self.logger.info(f"  → Saved checkpoint to {checkpoint_path}")
 
-            # Print timing summary periodically and RESET to prevent memory leak
             if self.print_timing and episode > 0 and episode % 10 == 0:
                 self.timing_manager.print_timing_summary(f"Episode {episode} Summary")
-                # CRITICAL: Reset timing data to prevent memory accumulation
                 self.timing_manager.reset_timings()
 
-            # Even if timing printing is disabled, reset every 10 episodes to prevent leak
             if not self.print_timing and episode > 0 and episode % 10 == 0:
                 self.timing_manager.reset_timings()
 
-            # Force cleanup at end of each episode to prevent accumulation
-            if self.device.type in ["cuda", "mps"]:
-                clear_device_cache(self.device)
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+            elif self.device.type == "mps":
+                torch.mps.empty_cache()
             gc.collect()
 
-        # Calculate total training time
         total_training_time = time.time() - training_start_time
         self.logger.info("=" * 50)
         self.logger.info("Training complete!")
@@ -1771,22 +1181,50 @@ class GRPO(BaseAlgorithm):
         self.logger.info(f"Total tokens processed: {cumulative_tokens:,}")
         self.logger.info(f"Average speed: {cumulative_tokens/total_training_time:.1f} tokens/second")
 
-        # Save final model
         final_checkpoint_path = checkpoint_dir / "checkpoint_final.pt"
-        self.save_checkpoint(str(final_checkpoint_path))
+        save_checkpoint(self, str(final_checkpoint_path))
         self.logger.info(f"\n✓ Final model saved to: {final_checkpoint_path}")
 
         if self.print_timing:
             self.timing_manager.print_timing_summary("FINAL TRAINING PERFORMANCE")
 
-        return {
-            "training_metrics": training_metrics,
-            "validation_metrics": validation_metrics,
-            "total_time": total_training_time,
-            "final_reward": training_metrics["reward_mean"][-1] if training_metrics["reward_mean"] else 0.0
-        }
+        return TrainResult(
+            training_metrics=training_metrics.to_dict(),
+            validation_metrics=validation_metrics.to_dict(),
+            total_time=total_training_time,
+            final_reward=training_metrics.reward_mean[-1] if training_metrics.reward_mean else 0.0
+        )
 
-    def evaluate(self, num_episodes: int = 1) -> Dict[str, float]:
+    def _log_training_progress(
+        self,
+        episode: int,
+        metrics: Dict[str, float],
+        episode_tokens: int,
+        episode_time: float,
+        tokens_per_sec: float,
+    ) -> None:
+        """Log training progress for current episode."""
+        current_lr = self.optimizer.param_groups[0]['lr']
+
+        m = metrics
+        ratio_clipped_pct = m['ratio_clipped_frac'] * 100.0
+        grad_clipped_pct = m['grad_clipped_frac'] * 100.0
+        adv_clamped_low_pct = m['advantages_clamped_low_frac'] * 100.0
+        adv_clamped_high_pct = m['advantages_clamped_high_frac'] * 100.0
+
+        self.logger.info(f"Episode {int(episode):3d}")
+        self.logger.info(f"  Loss: Total={m['total_loss']:7.4f} | PG={m['pg_loss']:7.4f} | KL={m['kl_divergence']:7.4f}")
+        self.logger.info(f"  Reward: {m['reward_mean']:6.3f} ± {m['reward_std']:5.3f} | Fmt={m['format_reward_mean']:5.3f} | Correct={m['correctness_reward_mean']:5.3f}")
+        self.logger.info(f"  PPO Ratio: μ={m['ratio_mean']:5.3f} [{m['ratio_min']:5.3f}, {m['ratio_max']:5.3f}] | Clipped={ratio_clipped_pct:5.1f}% | ε=[{1-self.clip_epsilon_low:.2f}, {1+self.clip_epsilon_high:.2f}]")
+        self.logger.info(f"  Log Ratio: μ={m['log_ratio_mean']:6.3f} [{m['log_ratio_min']:6.3f}, {m['log_ratio_max']:6.3f}] | Clamp=[{self.kl_clamp_min:.1f}, {self.kl_clamp_max:.1f}]")
+        self.logger.info(f"  Advantages: μ={m['advantages_mean']:6.3f} σ={m['advantages_std']:5.3f} | Raw=[{m['advantages_min_raw']:6.3f}, {m['advantages_max_raw']:6.3f}] | Clamped=[{m['advantages_min']:6.3f}, {m['advantages_max']:6.3f}]")
+        self.logger.info(f"    Clamp: [{self.advantage_clip_min:.1f}, {self.advantage_clip_max:.1f}] | Low={adv_clamped_low_pct:5.1f}% High={adv_clamped_high_pct:5.1f}%")
+        self.logger.info(f"  Gradients: {m['grad_norm']:6.3f}→{m['grad_norm_post_clip']:6.3f} | Clipped={grad_clipped_pct:5.1f}% | Max={self.gradient_clip:.1f}")
+        self.logger.info(f"  Updates: ParamΔ={m['relative_param_update']*100:.4f}% | LR={current_lr:.2e}")
+        self.logger.info(f"  Throughput: Tokens={int(episode_tokens):5d} | Time={episode_time:5.2f}s | Speed={tokens_per_sec:6.1f} tok/s")
+        self.logger.info("")
+
+    def evaluate(self, num_episodes: int = 1) -> EvaluationResult:
         """Evaluate the policy."""
         self.policy.eval()
         total_rewards = []
@@ -1794,100 +1232,16 @@ class GRPO(BaseAlgorithm):
         with torch.no_grad():
             for _ in range(num_episodes):
                 prompts = [f"Test {i}: Calculate {i}*2" for i in range(4)]
-                _, _, rewards, _, _, _, _, _, _ = self.generate_trajectories(prompts)
-                total_rewards.extend(rewards.cpu().numpy())
+                trajectories = self.generate_trajectories(prompts)
+                total_rewards.extend(trajectories.rewards.cpu().numpy())
 
         self.policy.train()
 
-        return {
-            "eval_reward_mean": np.mean(total_rewards),
-            "eval_reward_std": np.std(total_rewards),
-        }
-
-    def save_checkpoint(self, path: str):
-        """Save model checkpoint."""
-        # Handle case where ref_policy may be None (when kl_coef=0)
-        ref_policy_state = self.ref_policy.state_dict() if self.ref_policy is not None else None
-
-        # Create checkpoint with scheduler and scaler state
-        checkpoint = {
-            "policy_state_dict": self.policy.state_dict(),
-            "ref_policy_state_dict": ref_policy_state,
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.lr_scheduler.state_dict() if self.lr_scheduler is not None else None,
-            "scaler_state_dict": self.grad_scaler.state_dict() if self.grad_scaler is not None else None,
-            "config": self.config,
-            "total_steps": self.total_steps,
-            "episode": self.episode,
-            "current_episode": self.current_episode,
-        }
-
-        torch.save(checkpoint, path)
+        return EvaluationResult(
+            eval_reward_mean=np.mean(total_rewards),
+            eval_reward_std=np.std(total_rewards),
+        )
 
     def load_checkpoint(self, path: str):
-        """Load model checkpoint with smart LR warmup."""
-        checkpoint = load_checkpoint(path, self.device)
-        self.policy.load_state_dict(checkpoint["policy_state_dict"])
-        # Only load ref_policy if it exists and was saved (may be None when kl_coef=0)
-        if self.ref_policy is not None and checkpoint.get("ref_policy_state_dict") is not None:
-            self.ref_policy.load_state_dict(checkpoint["ref_policy_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-
-        # Load gradient scaler state if it exists (for FP16 training)
-        if self.grad_scaler is not None and checkpoint.get("scaler_state_dict") is not None:
-            self.grad_scaler.load_state_dict(checkpoint["scaler_state_dict"])
-
-        # Get LR values for smart warmup decision
-        checkpoint_lr = self.optimizer.param_groups[0]['lr']
-        config_lr = self.config.get("optimizer", {}).get("lr")
-        total_steps = checkpoint.get("total_steps", 0)
-        initial_warmup_steps = self.config.get("optimizer", {}).get("warmup_steps", 30)
-
-        if config_lr is not None:
-            # Smart LR handling based on checkpoint vs config
-            lr_increase_ratio = config_lr / checkpoint_lr if checkpoint_lr > 0 else 1.0
-
-            if config_lr > checkpoint_lr and lr_increase_ratio >= 1.5:
-                # Significant LR increase - use warmup to prevent instability
-                resume_warmup_steps = self.config.get("optimizer", {}).get("resume_warmup_steps", 15)
-
-                # Create a simple linear warmup scheduler
-                from torch.optim.lr_scheduler import LambdaLR
-
-                def warmup_lambda(step):
-                    # Linear warmup from checkpoint_lr to config_lr
-                    if step < resume_warmup_steps:
-                        alpha = step / resume_warmup_steps
-                        target_lr = checkpoint_lr + alpha * (config_lr - checkpoint_lr)
-                        return target_lr / config_lr  # LambdaLR multiplies by base_lr
-                    else:
-                        return 1.0  # Use config_lr
-
-                # Set base LR to config_lr
-                for param_group in self.optimizer.param_groups:
-                    param_group['lr'] = config_lr
-
-                # Create warmup scheduler
-                self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=warmup_lambda)
-
-                # Start at step 0 of warmup
-                self.optimizer.param_groups[0]['lr'] = checkpoint_lr
-
-            elif config_lr != checkpoint_lr:
-                # Small change or decrease - apply immediately, disable scheduler
-                for param_group in self.optimizer.param_groups:
-                    param_group['lr'] = config_lr
-                self.lr_scheduler = None
-
-            else:
-                # Same LR - check if we need to continue warmup or disable scheduler
-                if total_steps >= initial_warmup_steps:
-                    # Past initial warmup - disable scheduler
-                    self.lr_scheduler = None
-                elif self.lr_scheduler is not None and checkpoint.get("scheduler_state_dict") is not None:
-                    # Still in initial warmup phase - restore scheduler
-                    self.lr_scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-
-        self.total_steps = checkpoint.get("total_steps", 0)
-        self.episode = checkpoint.get("episode", 0)
-        self.current_episode = checkpoint.get("current_episode", checkpoint.get("episode", 0))
+        """Load checkpoint from path."""
+        load_checkpoint(self, path)

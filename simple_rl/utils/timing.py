@@ -1,26 +1,19 @@
-"""Timing utilities for performance measurement."""
-
 import time
 from collections import OrderedDict, defaultdict
 from typing import Dict, Any, Optional
 
 
 class TimingManager:
-    """Manager for tracking operation timings and performance metrics."""
-
     def __init__(self):
-        """Initialize timing manager."""
         self.timings = defaultdict(list)
         self.current_timings = {}
         self.timing_enabled = True
 
     def start_timer(self, operation_name: str) -> None:
-        """Start timing an operation."""
         if self.timing_enabled:
             self.current_timings[operation_name] = time.perf_counter()
 
     def end_timer(self, operation_name: str) -> float:
-        """End timing an operation and return elapsed time."""
         if not self.timing_enabled or operation_name not in self.current_timings:
             return 0.0
 
@@ -30,19 +23,16 @@ class TimingManager:
         return elapsed
 
     def reset_timings(self) -> None:
-        """Reset all timing data."""
         self.timings.clear()
         self.current_timings.clear()
 
     def print_timing_summary(self, title: str = "Operation Timings") -> None:
-        """Print a technical timing summary with detailed statistics."""
         if not self.timings:
             return
 
         print(f"\n[TIMING] {title}")
         print("-" * 120)
 
-        # Calculate statistics for each operation
         timing_stats = OrderedDict()
         total_time = 0
         total_calls = 0
@@ -65,19 +55,16 @@ class TimingManager:
                     "p99": sorted(times)[int(len(times) * 0.99)] if len(times) > 1 else max(times),
                 }
 
-        # Sort by total time (descending)
         timing_stats = OrderedDict(
             sorted(timing_stats.items(), key=lambda x: x[1]["total"], reverse=True)
         )
 
-        # Print header
         print(
             f"{'Operation':<25} {'Total(s)':<9} {'Mean(s)':<9} {'Median(s)':<10} {'Min(s)':<8} {'Max(s)':<8} "
             f"{'StdDev(s)':<10} {'Var(s)':<9} {'P95(s)':<8} {'P99(s)':<8} {'Count':<6} {'%Total':<7}"
         )
         print("-" * 120)
 
-        # Print each operation with detailed statistics
         for op_name, stats in timing_stats.items():
             percentage = (stats["total"] / total_time * 100) if total_time > 0 else 0
 
@@ -92,7 +79,6 @@ class TimingManager:
             f"SUMMARY: Total execution time: {total_time:.6f}s | Total operations: {total_calls} | Operations tracked: {len(timing_stats)}"
         )
 
-        # Additional technical metrics
         if len(timing_stats) > 0:
             times_per_op = [stats["mean"] for stats in timing_stats.values()]
             print(
@@ -103,7 +89,6 @@ class TimingManager:
         print()
 
     def get_timing_stats(self) -> Dict[str, Dict[str, float]]:
-        """Get timing statistics as a dictionary."""
         timing_stats = {}
 
         for op_name, times in self.timings.items():
@@ -123,29 +108,3 @@ class TimingManager:
                 }
 
         return timing_stats
-
-
-def time_operation(operation_name: str, timing_manager: Optional[TimingManager] = None):
-    """
-    Decorator to time operations.
-
-    Args:
-        operation_name: Name of the operation to time
-        timing_manager: Timing manager instance (creates one if None)
-
-    Returns:
-        Decorated function
-    """
-    if timing_manager is None:
-        timing_manager = TimingManager()
-
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            timing_manager.start_timer(operation_name)
-            try:
-                result = func(*args, **kwargs)
-                return result
-            finally:
-                timing_manager.end_timer(operation_name)
-        return wrapper
-    return decorator
