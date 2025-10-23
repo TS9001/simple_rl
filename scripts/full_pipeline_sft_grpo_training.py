@@ -1,40 +1,5 @@
 #!/usr/bin/env python3
-"""
-Full SFT + GRPO Training Pipeline
-==================================
-
-This script runs the complete training pipeline:
-1. (Optional) Supervised Fine-Tuning (SFT) with CoT examples
-2. Group Relative Policy Optimization (GRPO) using SFT checkpoint
-3. Evaluation and visualization
-
-Usage:
-    # Local machine:
-    python scripts/full_pipeline_sft_grpo_training.py
-
-    # Remote server (keeps running after SSH disconnect):
-    nohup python -u scripts/full_pipeline_sft_grpo_training.py > training.log 2>&1 &
-
-    # Monitor progress from another terminal:
-    tail -f training.log                    # View log output
-    watch -n 5 cat logs/progress.json       # Watch JSON progress
-    python scripts/monitor_training.py      # Use monitoring script
-
-Remote Server Setup:
-    1. Connect to server: ssh user@server
-    2. Navigate to project: cd /path/to/simple_rl
-    3. Start training: nohup python -u scripts/full_pipeline_sft_grpo_training.py > training.log 2>&1 &
-    4. Get process ID: echo $!
-    5. Disconnect safely: exit
-    6. Reconnect and monitor: tail -f training.log
-    7. Kill if needed: kill <PID>
-
-Output Files:
-    - training.log: Complete console output (all print statements)
-    - logs/training_*.log: Structured logging output
-    - logs/progress.json: Real-time progress tracking (updated every episode)
-    - checkpoints/: Model checkpoints (saved every N episodes)
-"""
+"""Full SFT + GRPO training pipeline."""
 
 import os
 import sys
@@ -47,7 +12,6 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 
-# Suppress Pydantic warnings from Transformers library
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic._internal._generate_schema")
 
 import torch
@@ -57,7 +21,6 @@ import requests
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from simple_rl.algorithms import SFT, GRPO
@@ -80,13 +43,8 @@ from simple_rl.utils.dataset_cache import (
 )
 from simple_rl.utils.logging import setup_logging
 
-# ============================================================
-# Progress Tracking for Remote Monitoring
-# ============================================================
-
-
 class ProgressTracker:
-    """Tracks training progress and writes to JSON file for remote monitoring."""
+    """Tracks training progress and writes to JSON file."""
 
     def __init__(self, log_dir="logs"):
         self.log_dir = Path(log_dir)
@@ -110,12 +68,10 @@ class ProgressTracker:
         self._save()
 
     def update(self, **kwargs):
-        """Update progress with new information."""
         self.progress.update(kwargs)
         self.progress["last_update"] = datetime.now().isoformat()
         self.progress["elapsed_time_seconds"] = int(time.time() - self.start_time)
 
-        # Calculate progress percentage
         if self.progress["total_episodes"] > 0:
             self.progress["progress_percent"] = (
                 self.progress["current_episode"]
@@ -126,7 +82,6 @@ class ProgressTracker:
         self._save()
 
     def update_metrics(self, metrics):
-        """Update latest metrics."""
         self.progress["latest_metrics"] = {
             k: float(v) if isinstance(v, (int, float, np.number)) else v
             for k, v in metrics.items()
@@ -135,7 +90,6 @@ class ProgressTracker:
         self._save()
 
     def add_checkpoint(self, checkpoint_path):
-        """Record a new checkpoint."""
         self.progress["checkpoints"].append(
             {
                 "path": str(checkpoint_path),
@@ -146,39 +100,25 @@ class ProgressTracker:
         self._save()
 
     def set_error(self, error_msg):
-        """Record an error."""
         self.progress["status"] = "error"
         self.progress["error"] = str(error_msg)
         self.progress["last_update"] = datetime.now().isoformat()
         self._save()
 
     def complete(self):
-        """Mark training as complete."""
         self.progress["status"] = "completed"
         self.progress["progress_percent"] = 100.0
         self.progress["last_update"] = datetime.now().isoformat()
         self._save()
 
     def _save(self):
-        """Save progress to JSON file."""
         with open(self.progress_file, "w") as f:
             json.dump(self.progress, f, indent=2)
 
 
-# ============================================================
-# Configuration
-# ============================================================
-
-# Training flags
-RUN_SFT = True  # Set to True to run SFT training, False to load from checkpoint
-
-# Resume training configuration
-CONTINUE_FROM = 0  # Set to episode number to resume from GRPO checkpoint, 0 = start from SFT/base model
-
-# Model configuration
+RUN_SFT = True
+CONTINUE_FROM = 0
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
-
-# System prompt for math formatting
 SYSTEM_PROMPT = """
 Respond in the following format:
 
@@ -190,66 +130,49 @@ Respond in the following format:
 </answer>
 """
 
-# SFT checkpoint path (used when RUN_SFT=False and CONTINUE_FROM=0)
 SFT_CHECKPOINT_PATH = (
     Path("checkpoints/pipeline_stages/01_after_sft") / "sft_complete.pt"
 )
 
-# Check if SFT checkpoint exists when needed
 if not RUN_SFT and CONTINUE_FROM == 0:
     if not SFT_CHECKPOINT_PATH.exists():
         print(f"⚠️  Warning: SFT checkpoint not found at {SFT_CHECKPOINT_PATH}")
         print("   Automatically enabling SFT training (RUN_SFT = True)")
         RUN_SFT = True
 
-# Dataset cache directory (for deterministic loading)
 DATASET_CACHE_DIR = "dataset_cache"
 
 
-# ============================================================
-# Helper Functions
-# ============================================================
-
-
 def download_and_extract_cot_archive(url, extract_path="cot_archive", logger=None):
-    """Download and extract the CoT archive if not already done."""
     archive_path = os.path.join(extract_path, "cot.tar.gz")
     if not os.path.exists(extract_path):
         os.makedirs(extract_path, exist_ok=True)
 
     if not os.path.exists(archive_path):
         if logger:
-
-            logger.info("Downloading CoT archive from reference notebook...")
+            logger.info("Downloading CoT archive...")
         r = requests.get(url, stream=True)
         with open(archive_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
         if logger:
-
             logger.info(f"✓ Downloaded to {archive_path}")
 
-    # Extract the archive if not already extracted
     extract_dir = os.path.join(extract_path, "cot_files")
     if not os.path.exists(extract_dir):
         if logger:
-
             logger.info("Extracting CoT archive...")
         with tarfile.open(archive_path, "r:gz") as tar:
             tar.extractall(path=extract_dir)
         if logger:
-
             logger.info(f"✓ Extracted to {extract_dir}")
 
     return extract_dir
 
 
 def prepare_cot_dataset_for_sft(system_prompt, num_examples=500, logger=None):
-    """
-    Prepare high-quality CoT examples from the reference notebook's dataset.
-    Returns data in the same format as prepare_gsm8k_for_sft().
-    """
+    """Prepare high-quality CoT examples."""
     cot_url = "https://github.com/aburkov/theLMbook/releases/download/v1.0.0/cot.tar.gz"
     extract_dir = download_and_extract_cot_archive(cot_url, logger=logger)
 
@@ -279,11 +202,7 @@ def prepare_cot_dataset_for_sft(system_prompt, num_examples=500, logger=None):
             break
 
     if logger:
-
         logger.info(f"\n✓ Loaded {len(prompts)} high-quality CoT examples")
-    if logger:
-
-        logger.info(f"  These have cleaner reasoning than raw GSM8K")
 
     return {"prompts": prompts, "completions": completions}
 
